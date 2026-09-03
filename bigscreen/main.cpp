@@ -62,9 +62,11 @@
 #include <QColor>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFileInfo>
 #include <QPainter>
 #include <QPixmap>
 #include <QProcess>
+#include <QStandardPaths>
 #include <QTime>
 #include <QUrl>
 #include <QUrlQuery>
@@ -361,18 +363,50 @@ void StartLogin()
     QMetaObject::invokeMethod(g_loginTask.get(), &Task::start, Qt::QueuedConnection);
 }
 
-// Launches the normal desktop Qt Widgets build — a sibling executable in
-// the same directory (BuildConfig.LAUNCHER_APP_BINARY_NAME, "prismlauncher"
-// — the same name Application.cpp already uses for e.g. its updater
-// filename and URL scheme, so this isn't a new assumption) — as a fresh,
-// detached process, then quits BigScreen. QProcess::startDetached (not a
-// QProcess this owns) so the new process keeps running after this one
-// exits; Application's own LocalPeer single-instance check (confirmed
+// Locates the normal desktop Qt Widgets build (BuildConfig.LAUNCHER_APP_BINARY_NAME,
+// "prismlauncher" — the same name Application.cpp already uses for e.g. its
+// updater filename and URL scheme, so this isn't a new assumption). Two
+// candidate locations, tried in order:
+//   1. A sibling executable next to BigScreen's own binary — covers a dev
+//      build (both land in the same build/<config>/ directory) and any
+//      packaging that ships both binaries side by side in one prefix.
+//   2. QStandardPaths::findExecutable(), i.e. a PATH search — covers the
+//      much more common real-world case of BigScreen having been built/
+//      packaged/run completely independently of a system-package desktop
+//      install (e.g. `/usr/bin/prismlauncher` from a distro package, while
+//      BigScreen itself runs from an extracted CI tarball with no relation
+//      to that install location at all — confirmed a real gap, not
+//      hypothetical, since BigScreen's own portable packaging keeps it
+//      self-contained specifically so it *doesn't* need to sit next to
+//      anything).
+// Returns an empty string if neither finds anything runnable.
+QString FindDesktopLauncherBinary()
+{
+    const QString sibling = QDir(QCoreApplication::applicationDirPath()).filePath(BuildConfig.LAUNCHER_APP_BINARY_NAME);
+    if (QFileInfo(sibling).isExecutable())
+        return sibling;
+
+    const QString onPath = QStandardPaths::findExecutable(BuildConfig.LAUNCHER_APP_BINARY_NAME);
+    if (!onPath.isEmpty())
+        return onPath;
+
+    return {};
+}
+
+// Launches the desktop build located by FindDesktopLauncherBinary() as a
+// fresh, detached process, then quits BigScreen. QProcess::startDetached
+// (not a QProcess this owns) so the new process keeps running after this
+// one exits; Application's own LocalPeer single-instance check (confirmed
 // working earlier this session) means the two don't collide even during
 // the brief window both are alive.
 void SwitchToDesktopMode()
 {
-    const QString desktopBinary = QDir(QCoreApplication::applicationDirPath()).filePath(BuildConfig.LAUNCHER_APP_BINARY_NAME);
+    const QString desktopBinary = FindDesktopLauncherBinary();
+    if (desktopBinary.isEmpty()) {
+        SDL_Log("[switch-to-desktop] could not find '%s' next to this binary or on PATH",
+                qUtf8Printable(BuildConfig.LAUNCHER_APP_BINARY_NAME));
+        return;
+    }
     if (!QProcess::startDetached(desktopBinary, {})) {
         SDL_Log("[switch-to-desktop] failed to start '%s'", qUtf8Printable(desktopBinary));
         return;
@@ -879,8 +913,20 @@ void DrawSettingsAppearance()
     // renderFrame, right after UpdateLayoutScale()). No slider widget in
     // the vendored toolkit (same reasoning as DrawMemorySetting's MB
     // presets), so this is a preset picker, same pattern.
+    //
+    // Capped at 100%, not the 80-150% originally offered: UpdateLayoutScale()
+    // always saturates padding to exactly zero on whichever axis is
+    // currently the tighter fit (that's the definition of "fit"), so *any*
+    // multiplier above 1.0 pushes the logical canvas past the window's edge
+    // on that axis — confirmed visually (cards clipped off-screen, top bar
+    // cut off at 150%). Scaling down is always safe (padding only grows).
+    // Making the UI genuinely bigger without cropping anything needs the
+    // canvas itself to stop being hard-locked to a fixed 1280x720/16:9 box
+    // in the first place — the same underlying change needed to stop
+    // letterboxing non-16:9 windows — deferred as its own follow-up rather
+    // than rushed here alongside several other fixes.
     {
-        static const float kScalePresets[] = { 0.8f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f };
+        static const float kScalePresets[] = { 0.7f, 0.8f, 0.9f, 1.0f };
         SettingsObject* settings = APPLICATION->settings();
         const float currentScale = settings->get("BigScreenUIScale").toFloat();
         const std::string valueStr = std::to_string(static_cast<int>(currentScale * 100.0f + 0.5f)) + "%";
@@ -896,6 +942,13 @@ void DrawSettingsAppearance()
             };
         }
     }
+
+    // Applied live (no restart needed) — see the SDL_SetWindowFullscreen()
+    // call in the main render loop, right after UpdateFontScale(), which
+    // compares against the last-applied value each frame and calls it again
+    // only when this setting actually changes.
+    DrawToggleSetting("BigScreenFullscreen", "Fullscreen",
+                       "Run BigScreen as a fullscreen window instead of a resizable desktop window.");
 }
 
 void DrawSettingsWindow()
@@ -1591,9 +1644,21 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
     for (const Action& a : *actions)
         options.emplace_back(a.label, false);
 
+    // BigScreen note: OpenChoiceDialog's own DrawChoiceDialog() only calls
+    // CloseChoiceDialog() automatically on cancel (!is_open) — a genuine
+    // selection (choice >= 0) never closes it by design, since that's also
+    // how checkable multi-select choice dialogs are meant to behave (pick
+    // several, close explicitly). This is a plain single-select menu, so
+    // the callback closes it itself once an action is actually chosen —
+    // without this, picking anything here (e.g. "Edit...", which switches
+    // g_screen) left the menu still open and rendering on top of whatever
+    // screen came next, since DrawChoiceDialog() runs unconditionally every
+    // frame regardless of g_screen.
     OpenChoiceDialog(inst->name().toStdString(), false, std::move(options), [actions](s32 index, const std::string&, bool) {
-        if (index >= 0 && static_cast<size_t>(index) < actions->size())
+        if (index >= 0 && static_cast<size_t>(index) < actions->size()) {
+            CloseChoiceDialog();
             (*actions)[static_cast<size_t>(index)].run();
+        }
     });
 }
 
@@ -1689,10 +1754,15 @@ void ShowAddInstanceMenu()
     ChoiceDialogOptions options;
     options.emplace_back("Vanilla Minecraft", false);
 
+    // See ShowInstanceActionsMenu()'s comment on why this closes the dialog
+    // itself before acting — DrawChoiceDialog() doesn't do it automatically
+    // for a real selection, only for cancel.
     OpenChoiceDialog(StripMnemonic(MW("Add Instanc&e...")).toStdString(), false, std::move(options),
                       [](s32 index, const std::string&, bool) {
-                          if (index == 0)
+                          if (index == 0) {
+                              CloseChoiceDialog();
                               g_pendingAction = StartVanillaInstanceCreation;
+                          }
                       });
 }
 
@@ -2002,10 +2072,20 @@ int main(int argc, char** argv)
         SetScreen(Screen::Console);
     };
 
-    // BigScreen-only setting (Settings > Appearance > Scale) — not a real
-    // desktop key, so registered here rather than in the shared
+    // BigScreen-only settings (Settings > Appearance) — not real desktop
+    // keys, so registered here rather than in the shared
     // Application::init() registerSetting() block.
     APPLICATION->settings()->registerSetting("BigScreenUIScale", 1.0);
+    // Defaults to true (this is meant to run as a kiosk-style "Big Picture"
+    // front-end, not a windowed app) — applied here rather than at
+    // SDL_CreateWindow() above since reading the setting needs
+    // APPLICATION->settings(), which needs Application constructed first,
+    // which needs the SDL window to already exist (BigScreenGui pulls in
+    // OpenGL symbols the Qt side also touches) — SDL_SetWindowFullscreen()
+    // right after creation is visually identical to creating it fullscreen
+    // outright, just very briefly windowed first.
+    APPLICATION->settings()->registerSetting("BigScreenFullscreen", true);
+    SDL_SetWindowFullscreen(window, APPLICATION->settings()->get("BigScreenFullscreen").toBool() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 
     // TEMPORARY diagnostic: BIGSCREEN_AUTOLAUNCH=<instance id> triggers the
     // exact same launch codepath a real "A: Launch" press would, without
@@ -2067,6 +2147,12 @@ int main(int argc, char** argv)
                     g_instanceSettingsTarget = instances->at(0);
                     g_instanceSettingsTab = (name == "instance_settings_java") ? 1 : 0;
                     SetScreen(Screen::InstanceSettings);
+                }
+            } else if (name == "instance_actions") {
+                InstanceList* instances = APPLICATION->instances();
+                if (instances->rowCount() > 0) {
+                    SetScreen(Screen::Instances);
+                    ShowInstanceActionsMenu(instances->at(0));
                 }
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
@@ -2132,17 +2218,20 @@ int main(int argc, char** argv)
 
         UpdateLayoutScale();
         // UpdateLayoutScale() computed the scale that exactly fits BigScreen's
-        // fixed 1280x720 logical layout to the actual window — "Scale" in
-        // Settings > Appearance (BigScreenUIScale, 0.8-1.5x, default 1.0) is
-        // a user multiplier on top of that fit, applied here before
-        // UpdateFontScale() so medium/large fonts (which size themselves via
-        // LayoutScale(), same as every widget dimension) pick it up too, not
-        // just the widget geometry. Padding is recomputed the same way
-        // UpdateLayoutScale() derives it (center the scaled 1280x720 box in
-        // the window) — needed regardless of which axis was the original
-        // fit's constraint, so this doesn't try to replicate that branch.
+        // fixed 1280x720 logical layout to the actual window, saturating
+        // padding to exactly zero on whichever axis is the tighter fit —
+        // "Scale" in Settings > Appearance (BigScreenUIScale, capped at
+        // 100%, see its own comment for why) is a user multiplier *below*
+        // that on top, applied here before UpdateFontScale() so medium/large
+        // fonts (sized via LayoutScale(), same as every widget dimension)
+        // pick it up too, not just the widget geometry. Clamped defensively
+        // to never exceed the fit value even if BigScreenUIScale somehow
+        // holds something above 1.0 (a hand-edited config, an older build's
+        // value) — going higher pushes the canvas past the window's edge on
+        // the constrained axis (confirmed visually: content clipped off-
+        // screen), scaling down is always safe (padding only grows).
         {
-            const float userScale = APPLICATION->settings()->get("BigScreenUIScale").toFloat();
+            const float userScale = std::min(APPLICATION->settings()->get("BigScreenUIScale").toFloat(), 1.0f);
             if (userScale > 0.0f && userScale != 1.0f) {
                 ImGuiFullscreen::g_layout_scale *= userScale;
                 ImGuiFullscreen::g_rcp_layout_scale = 1.0f / ImGuiFullscreen::g_layout_scale;
@@ -2154,6 +2243,20 @@ int main(int argc, char** argv)
             }
         }
         UpdateFontScale();
+
+        // Applies Settings > Appearance > Fullscreen live, the moment it's
+        // toggled, rather than needing a restart — cheap to check every
+        // frame (one settings lookup, one static comparison), and simpler
+        // than threading a "this setting just changed" signal all the way
+        // from DrawToggleSetting() back to here.
+        {
+            static bool lastAppliedFullscreen = APPLICATION->settings()->get("BigScreenFullscreen").toBool();
+            const bool wantFullscreen = APPLICATION->settings()->get("BigScreenFullscreen").toBool();
+            if (wantFullscreen != lastAppliedFullscreen) {
+                lastAppliedFullscreen = wantFullscreen;
+                SDL_SetWindowFullscreen(window, wantFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+            }
+        }
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();

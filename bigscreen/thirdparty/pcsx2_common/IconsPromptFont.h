@@ -30,10 +30,23 @@
 #pragma once
 
 #define ICON_PF_BURGER_MENU "\xe2\x87\xbb"            // U+21FB xbox-menu ("Burger Menu")
-#define ICON_PF_BUTTON_A "\xe2\x86\xa7"                // U+21A7 gamepad-a ("Button Down (A)")
-#define ICON_PF_BUTTON_B "\xe2\x86\xa6"                // U+21A6 gamepad-b ("Button Right (B)")
-#define ICON_PF_BUTTON_X "\xe2\x86\xa4"                // U+21A4 gamepad-x ("Button Left (X)")
-#define ICON_PF_BUTTON_Y "\xe2\x86\xa5"                // U+21A5 gamepad-y ("Button Up (Y)")
+// GetGamepadGlyphs() (ImGuiFullscreen.cpp) uses these four for BOTH the xbox
+// and nintendo branches — both brands print literal "A"/"B"/"X"/"Y" on their
+// face buttons (just at different physical positions), and PromptFont only
+// has one lettered badge glyph per letter, tagged 'xbox' in glyphs.json (no
+// separate 'nintendo' one exists) — so this is the real, branded, round
+// letter-badge glyph, DISTINCT from ICON_PF_BUTTON_DOWN_A/UP_Y/LEFT_X/
+// RIGHT_B below (the unbranded, position-only diamond glyphs GetGamepadGlyphs()
+// falls back to for an undetected controller). An earlier version of this
+// header wrongly aliased these four to the same codepoints as their _DOWN_A/
+// _UP_Y/_LEFT_X/_RIGHT_B counterparts, which made the xbox/nintendo branch
+// and the unknown/generic fallback render identically — Xbox and PlayStation
+// controllers looked the same as "no controller detected" (reported as
+// "always shows universal buttons" regardless of what's actually connected).
+#define ICON_PF_BUTTON_A "\xe2\x87\x93"                // U+21D3 xbox-a ("Button A")
+#define ICON_PF_BUTTON_B "\xe2\x87\x92"                // U+21D2 xbox-b ("Button B")
+#define ICON_PF_BUTTON_X "\xe2\x87\x90"                // U+21D0 xbox-x ("Button X")
+#define ICON_PF_BUTTON_Y "\xe2\x87\x91"                // U+21D1 xbox-y ("Button Y")
 #define ICON_PF_BUTTON_CIRCLE "\xe2\x87\xa2"            // U+21E2 sony-b ("Button Circle")
 #define ICON_PF_BUTTON_CROSS "\xe2\x87\xa3"             // U+21E3 sony-a ("Button Cross")
 #define ICON_PF_BUTTON_SQUARE "\xe2\x87\xa0"            // U+21E0 sony-x ("Button Square")

@@ -2334,8 +2334,13 @@ void ImGuiFullscreen::DrawFileSelector()
 	bool is_open = !WantsToCloseMenu();
 	bool directory_selected = false;
 	bool parent_wanted = false;
+	// BigScreen note: nullptr, not &is_open — see DrawChoiceDialog()'s
+	// comment on the same change. CloseFileSelector() (called from the
+	// "!is_open" branch below) already calls ImGui::CloseCurrentPopup()
+	// itself, so no extra call is needed here the way DrawChoiceDialog()
+	// and DrawMessageDialog() need.
 	if (ImGui::BeginPopupModal(
-			s_file_selector_title.c_str(), &is_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
+			s_file_selector_title.c_str(), nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
 	{
 		ImGui::PushStyleColor(ImGuiCol_Text, UIBackgroundTextColor);
 
@@ -2472,9 +2477,23 @@ void ImGuiFullscreen::DrawChoiceDialog()
 	bool is_open = !WantsToCloseMenu();
 	s32 choice = -1;
 
+	// BigScreen note: p_open is intentionally nullptr here, not &is_open —
+	// passing a bool* is what makes ImGui draw a small mouse-only "X" close
+	// button in the title bar (BeginPopupModal()'s own doc comment: "If
+	// 'p_open' is specified for a modal popup window, the popup will have a
+	// regular close button"), which on a gamepad-only UI just eats gamepad
+	// nav focus without being any easier to use than B (already wired to
+	// WantsToCloseMenu() below). The *is_open-starts-false-closes-the-popup
+	// trick this file relies on elsewhere still works without p_open — it's
+	// reproduced manually via the CloseCurrentPopup() call right below,
+	// keeping the exact same is_open bookkeeping (and therefore the exact
+	// same cancel-callback timing) the rest of this function already had.
 	if (ImGui::BeginPopupModal(
-			s_choice_dialog_title.c_str(), &is_open, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
+			s_choice_dialog_title.c_str(), nullptr, ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove))
 	{
+		if (!is_open)
+			ImGui::CloseCurrentPopup();
+
 		ImGui::PushStyleColor(ImGuiCol_Text, UIBackgroundTextColor);
 
 		BeginMenuButtons();
@@ -2588,10 +2607,21 @@ void ImGuiFullscreen::DrawInputDialog()
 	ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIPrimaryColor);
 	ImGui::PushStyleColor(ImGuiCol_PopupBg, UIPopupBackgroundColor);
 
-	bool is_open = true;
-	if (ImGui::BeginPopupModal(s_input_dialog_title.c_str(), &is_open,
+	// BigScreen note: was `bool is_open = true;`, only ever changed by
+	// clicking BeginPopupModal's own mouse-only close button — the visible
+	// "Cancel" ActiveButton below already handles gamepad cancellation via
+	// A, but B/Escape had no path here at all. Tied to WantsToCloseMenu()
+	// now (same as the other dialogs in this file), p_open is nullptr so
+	// that close button isn't drawn (see DrawChoiceDialog()'s comment), and
+	// the CloseCurrentPopup() call mirrors what the Cancel button already
+	// does explicitly a few lines down.
+	bool is_open = !WantsToCloseMenu();
+	if (ImGui::BeginPopupModal(s_input_dialog_title.c_str(), nullptr,
 			ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar))
 	{
+		if (!is_open)
+			ImGui::CloseCurrentPopup();
+
 		ResetFocusHere();
 		ImGui::TextWrapped("%s", s_input_dialog_message.c_str());
 
@@ -2796,13 +2826,25 @@ void ImGuiFullscreen::DrawMessageDialog()
 	ImGui::PushStyleColor(ImGuiCol_TitleBgActive, UIPrimaryColor);
 	ImGui::PushStyleColor(ImGuiCol_PopupBg, UIPopupBackgroundColor);
 
-	bool is_open = true;
+	// BigScreen note: was `bool is_open = true;`, only ever changed by
+	// clicking BeginPopupModal's own mouse-only close button — no gamepad
+	// B/Escape path existed for this dialog at all. Now tied to
+	// WantsToCloseMenu() (same as DrawChoiceDialog()/DrawFileSelector()
+	// already do), and p_open is nullptr rather than &is_open so that close
+	// button doesn't get drawn in the first place — it just ate gamepad nav
+	// focus without doing anything a gamepad could reach anyway. See the
+	// CloseCurrentPopup() call below for how a modal still closes via B
+	// without ImGui's own p_open mechanism.
+	bool is_open = !WantsToCloseMenu();
 	const u32 flags = ImGuiWindowFlags_NoCollapse | ImGuiWindowFlags_NoResize | ImGuiWindowFlags_NoMove | ImGuiWindowFlags_NoScrollbar |
 					  (s_message_dialog_title.empty() ? ImGuiWindowFlags_NoTitleBar : 0);
 	std::optional<s32> result;
 
-	if (ImGui::BeginPopupModal(win_id, &is_open, flags))
+	if (ImGui::BeginPopupModal(win_id, nullptr, flags))
 	{
+		if (!is_open)
+			ImGui::CloseCurrentPopup();
+
 		BeginMenuButtons();
 		ResetFocusHere();
 
