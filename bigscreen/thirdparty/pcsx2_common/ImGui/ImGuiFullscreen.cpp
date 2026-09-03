@@ -2125,7 +2125,22 @@ bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0
 	const ImGuiID id = window->GetID(title);
 	ImGui::ItemSize(size);
 	if (!ImGui::ItemAdd(bb, id))
+	{
+		// PCSX2's own usage never scrolls this widget (a handful of items
+		// that always fit one screen), so it never hit this path: skipping
+		// the trailing SameLine() below when a later item is clipped
+		// (off-screen) breaks the same-line chain for every item after it,
+		// wrapping them onto a new row instead of continuing the row
+		// off-screen — fine for a plain list, but fatal for BigScreen's
+		// scrollable card rows (Landing/Instances), where "off-screen"
+		// legitimately means "reachable by scrolling right", not "should
+		// wrap". Confirmed empirically: without this, 7 instances in a
+		// narrower-than-content scrolling child rendered as a 3-row wrapped
+		// grid overflowing vertically instead of one scrollable row.
+		ImGui::SameLine();
+		s_menu_button_index++;
 		return false;
+	}
 
 	bool held;
 	bool hovered;

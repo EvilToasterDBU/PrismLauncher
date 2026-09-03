@@ -2342,9 +2342,28 @@ int main(int argc, char** argv)
             action();
         }
 
+        // Gamepad input should only drive BigScreen while its own window
+        // actually has WM focus — otherwise a button press meant for
+        // whatever else is on screen (alt-tabbed away, a Steam overlay, a
+        // different app) also gets processed here, which reads as BigScreen
+        // "stealing" input in the background. Deliberately a *different*
+        // signal from SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS above: that
+        // hint controls whether SDL's joystick subsystem *delivers*
+        // controller events at all (needed because its own internal focus
+        // tracking was unreliable under gamescope — see the comment there),
+        // while this checks the window's actual WM-reported focus before
+        // *acting* on events that did arrive. The two don't conflict: under
+        // gamescope, a dedicated BigScreen session is still the WM-focused
+        // surface, so SDL_WINDOW_INPUT_FOCUS reads true there regardless of
+        // whichever internal joystick quirk the other hint works around.
+        const bool windowFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
-            ImGui_ImplSDL2_ProcessEvent(&event);
+            const bool isControllerEvent = event.type == SDL_CONTROLLERBUTTONDOWN || event.type == SDL_CONTROLLERBUTTONUP ||
+                                            event.type == SDL_CONTROLLERAXISMOTION;
+            if (!isControllerEvent || windowFocused)
+                ImGui_ImplSDL2_ProcessEvent(&event);
             if (event.type == SDL_QUIT)
                 done = true;
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
@@ -2443,7 +2462,12 @@ int main(int argc, char** argv)
         // to any held direction key, gamepad-native or (as here) synthetic,
         // so a held stick deflection repeats at the same rate a held D-pad
         // press would, with no separate repeat logic needed here.
-        if (pad) {
+        // Same reasoning as the controller-event gating above: this reads
+        // the stick's raw current state directly rather than going through
+        // SDL's event queue, so it needs its own explicit focus check —
+        // otherwise stick-driven nav would keep working in the background
+        // even while windowFocused gates every other controller input.
+        if (pad && windowFocused) {
             ImGuiIO& io = ImGui::GetIO();
             constexpr Sint16 kStickDeadZone = 20000; // out of a max 32767 — a firm, deliberate push
             const Sint16 axisX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
