@@ -1,0 +1,137 @@
+name: Build BigScreen
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+on:
+  push:
+    branches: [bigscreen-mode]
+  pull_request:
+    branches: [bigscreen-mode]
+  workflow_dispatch:
+    inputs:
+      build-type:
+        description: Type of build (Debug or Release)
+        type: string
+        default: Release
+
+permissions: {}
+
+jobs:
+  build:
+    name: Build BigScreen (${{ matrix.artifact-name }})
+
+    permissions:
+      contents: read
+      # Required for vcpkg binary cache
+      packages: write
+
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          # Mandatory for now, per the BigScreen plan's v1 scope (Linux/
+          # SteamOS only) — Windows/macOS need their own SDL2/OpenGL
+          # backend wiring that hasn't been done, and
+          # bigscreen/CMakeLists.txt's pkg-config-based SDL2/fmt/OpenGL
+          # lookup assumes a Linux-like environment. Add matrix entries for
+          # those (mirroring build.yml's os/cmake-preset/qt-version) once
+          # that groundwork exists — the rest of this job (setup, configure
+          # with -DLauncher_BUILD_BIGSCREEN=ON, package) is written to be
+          # platform-agnostic already, only the dependency-install step
+          # below is Linux-specific.
+          - os: ubuntu-24.04
+            artifact-name: Linux
+            cmake-preset: linux
+            qt-version: 6.10.2
+
+          - os: ubuntu-24.04-arm
+            artifact-name: Linux-aarch64
+            cmake-preset: linux
+            qt-version: 6.10.2
+
+    runs-on: ${{ matrix.os }}
+
+    env:
+      ARTIFACT_NAME: PrismLauncherBigScreen-${{ matrix.artifact-name }}-Qt6
+      BUILD_PLATFORM: official
+      BUILD_TYPE: ${{ inputs.build-type || 'Release' }}
+      CMAKE_PRESET: ${{ matrix.cmake-preset }}
+
+    steps:
+      ##
+      # SETUP
+      ##
+
+      - name: Checkout
+        uses: actions/checkout@v7
+        with:
+          submodules: true
+
+      # BigScreen still links the full Launcher_logic (the whole Qt Widgets
+      # desktop UI is compiled in, just never shown), so it needs the exact
+      # same Qt/vcpkg setup the desktop build does — reuses the same
+      # composite action build.yml uses.
+      - name: Setup dependencies
+        id: setup-dependencies
+        uses: ./.github/actions/setup-dependencies
+        with:
+          build-type: ${{ env.BUILD_TYPE }}
+          artifact-name: ${{ matrix.artifact-name }}
+          qt-version: ${{ matrix.qt-version }}
+
+      # Not part of the desktop build's own dependency set — only
+      # bigscreen/CMakeLists.txt needs these (SDL2/OpenGL for the window
+      # and input, fmt for the vendored ImGuiFullscreen toolkit). Installed
+      # here rather than added to setup-dependencies/linux so the normal
+      # desktop CI job doesn't pay for packages it never uses.
+      - name: Install BigScreen-specific dependencies
+        run: |
+          sudo apt-get -y update
+          sudo apt-get -y install libsdl2-dev libfmt-dev libgl1-mesa-dev
+
+      ##
+      # BUILD
+      ##
+
+      - name: Configure project
+        run: |
+          cmake --preset "$CMAKE_PRESET" \
+            -D VCPKG_HOST_TRIPLET="$VCPKG_TRIPLET" -D VCPKG_TARGET_TRIPLET="$VCPKG_TRIPLET" \
+            -D Launcher_BUILD_BIGSCREEN=ON
+
+      - name: Run build
+        run: |
+          cmake --build --preset "$CMAKE_PRESET" --config "$BUILD_TYPE" --target prismlauncher_bigscreen
+
+      ##
+      # PACKAGE
+      ##
+
+      # No installer/AppImage yet (unlike the desktop build's packaging
+      # actions) — just the binary plus what it needs to find at runtime,
+      # laid out the way bigscreen/main.cpp's relocatable-resources lookup
+      # and Application::getJarPath() both expect next to the executable
+      # ("resources/" and "jars/" respectively) so this actually runs
+      # correctly once downloaded to a different machine, e.g. the user's
+      # own Steam Deck/SteamOS hardware — not just on the CI runner it was
+      # built on. jars/ (JavaCheck.jar + NewLaunch(Legacy).jar) is already
+      # guaranteed to exist and be complete: prismlauncher_bigscreen's own
+      # CMake target depends on all three (bigscreen/CMakeLists.txt).
+      - name: Package
+        run: |
+          set -euo pipefail
+          stage="PrismLauncherBigScreen-${{ matrix.artifact-name }}"
+          mkdir -p "$stage"
+          cp "build/$BUILD_TYPE/prismlauncher_bigscreen" "$stage/"
+          cp -r bigscreen/resources "$stage/"
+          cp -r build/jars "$stage/"
+          tar -czf "$stage.tar.gz" "$stage"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrismLauncherBigScreen-${{ matrix.artifact-name }}-Qt6
+          path: PrismLauncherBigScreen-${{ matrix.artifact-name }}.tar.gz
+          if-no-files-found: error

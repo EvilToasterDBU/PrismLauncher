@@ -37,9 +37,11 @@
 #include "gui/GuiManager.h"
 
 #include "Application.h"
+#include "BuildConfig.h"
 #include "DesktopServices.h"
 #include "InstanceList.h"
 #include "QObjectPtr.h"
+#include "common/EmuFolders.h"
 #include "core/BigScreenLaunchController.h"
 #include "core/DialogHelpers.h"
 #include "icons/IconList.h"
@@ -57,8 +59,10 @@
 
 #include <QColor>
 #include <QCoreApplication>
+#include <QDir>
 #include <QPainter>
 #include <QPixmap>
+#include <QProcess>
 #include <QTime>
 #include <QUrl>
 #include <QUrlQuery>
@@ -66,6 +70,7 @@
 
 #include <algorithm>
 #include <cstdlib>
+#include <filesystem>
 #include <functional>
 #include <span>
 #include <unordered_map>
@@ -339,6 +344,25 @@ void StartLogin()
     QMetaObject::invokeMethod(g_loginTask.get(), &Task::start, Qt::QueuedConnection);
 }
 
+// Launches the normal desktop Qt Widgets build — a sibling executable in
+// the same directory (BuildConfig.LAUNCHER_APP_BINARY_NAME, "prismlauncher"
+// — the same name Application.cpp already uses for e.g. its updater
+// filename and URL scheme, so this isn't a new assumption) — as a fresh,
+// detached process, then quits BigScreen. QProcess::startDetached (not a
+// QProcess this owns) so the new process keeps running after this one
+// exits; Application's own LocalPeer single-instance check (confirmed
+// working earlier this session) means the two don't collide even during
+// the brief window both are alive.
+void SwitchToDesktopMode()
+{
+    const QString desktopBinary = QDir(QCoreApplication::applicationDirPath()).filePath(BuildConfig.LAUNCHER_APP_BINARY_NAME);
+    if (!QProcess::startDetached(desktopBinary, {})) {
+        SDL_Log("[switch-to-desktop] failed to start '%s'", qUtf8Printable(desktopBinary));
+        return;
+    }
+    g_wantsQuit = true;
+}
+
 // B (gamepad) / Escape (keyboard, on release) — ImGuiFullscreen's own
 // WantsToCloseMenu()/ResetCloseMenuIfNeeded() pair, the same debounced
 // press-detector its own popups (choice dialog, file selector) use to
@@ -354,23 +378,30 @@ void HandleBackButton()
         return;
 
     switch (g_screen) {
-        case Screen::Landing:
+        case Screen::Landing: {
             // Nowhere further back to go — ask before quitting instead.
-            // Uses ImGuiFullscreen's own async dialog (renders across
-            // future frames via EndLayout()'s DrawMessageDialog()) rather
-            // than BigScreenDialogs::Confirm()'s blocking nested QEventLoop
-            // — that helper is meant for callers off the render loop (like
-            // LaunchController's overrides); calling it from here, inside
-            // the frame timer's own callback, would recursively re-enter
-            // this very lambda on every tick of its nested loop.
-            OpenConfirmMessageDialog(
-                "Quit?", "Are you sure you want to quit PrismLauncher BigScreen?",
-                [](bool confirmed) {
-                    if (confirmed)
-                        g_wantsQuit = true;
-                },
-                false, ICON_FA_CHECK " Quit", ICON_FA_XMARK " Cancel");
+            // Three-way choice rather than the plain Yes/No
+            // OpenConfirmMessageDialog this used to be: on a machine that
+            // also has the normal desktop UI installed alongside BigScreen
+            // (the common case — same repo, two executables), "quit" isn't
+            // the only sensible option. Uses the same raw, non-blocking
+            // OpenChoiceDialog as the X/Y instance menus (see
+            // ShowInstanceActionsMenu's comment for why) rather than
+            // BigScreenDialogs::Choose()'s blocking pump loop — this runs
+            // from inside the frame timer's own callback, and that would
+            // recursively re-enter it.
+            ChoiceDialogOptions options;
+            options.emplace_back(std::string(ICON_FA_CHECK) + " Quit", false);
+            options.emplace_back("Switch to Desktop Mode", false);
+            OpenChoiceDialog("Quit?", false, std::move(options), [](s32 index, const std::string&, bool) {
+                if (index == 0) {
+                    g_wantsQuit = true;
+                } else if (index == 1) {
+                    SwitchToDesktopMode();
+                }
+            });
             break;
+        }
         case Screen::Instances:
             SetScreen(Screen::Landing);
             break;
@@ -419,7 +450,7 @@ void DrawBlockingWait()
 
 struct LandingItem {
     const char* icon;
-    const char* title;
+    QString title;
     const char* description;
 };
 
@@ -429,10 +460,20 @@ struct LandingItem {
 // one PCSX2 uses there.
 void DrawLanding(bool& done)
 {
-    static const LandingItem kItems[] = {
+    // "Accounts"/"Settings..." reuse MainWindow.ui's own accountsMenu title
+    // ("&Accounts") and actionSettings text ("Setti&ngs...") so they pick
+    // up the same translation the desktop menu already has. "Instances"
+    // and "Quit" have no real desktop equivalent (the desktop has no
+    // standalone "Instances" label, and closing its one window is just
+    // done via the window manager — there's no dedicated "Quit" menu
+    // entry anywhere to reuse) and stay BigScreen's own English text.
+    // Rebuilt fresh every frame (cheap) rather than a `static` array, since
+    // TR()/MW() need to run after the translator is installed and could
+    // change if the language setting changes mid-session.
+    const LandingItem items[] = {
         { "images/icons/instances.png", "Instances", "Browse and launch your installed Minecraft instances." },
-        { "images/icons/accounts.png", "Accounts", "Manage your logged-in Microsoft and offline accounts." },
-        { "images/icons/settings.png", "Settings", "Change launcher and instance settings." },
+        { "images/icons/accounts.png", StripMnemonic(MW("&Accounts")), "Manage your logged-in Microsoft and offline accounts." },
+        { "images/icons/settings.png", StripMnemonic(MW("Setti&ngs...")), "Change launcher and instance settings." },
         { "images/icons/quit.png", "Quit", "Exit BigScreen and return to the desktop." },
     };
 
@@ -447,23 +488,32 @@ void DrawLanding(bool& done)
             // built-in centering — the reference layout (PCSX2's own home
             // screen) has the row centered as a group, not flush against
             // the left edge, so center it here.
-            const float rowWidth = static_cast<float>(std::size(kItems)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            const float rowWidth = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
             const float availableHeight = ImGui::GetContentRegionAvail().y;
             const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
             ImGui::SetCursorPos(ImVec2(LayoutScale((LAYOUT_SCREEN_WIDTH - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
 
-            for (const LandingItem& item : kItems) {
+            // Dispatched by index, not by matching the (now sometimes
+            // translated, no longer English-guaranteed) title text.
+            for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
+                const LandingItem& item = items[i];
                 GSTexture* icon = GetCachedTexture(item.icon);
-                if (HorizontalMenuItem(icon, item.title, item.description)) {
-                    std::string_view name(item.title);
-                    if (name == "Quit")
-                        done = true;
-                    else if (name == "Instances")
-                        SetScreen(Screen::Instances);
-                    else if (name == "Accounts")
-                        SetScreen(Screen::Accounts);
-                    else if (name == "Settings")
-                        SetScreen(Screen::Settings);
+                const QByteArray titleUtf8 = item.title.toUtf8();
+                if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
+                    switch (i) {
+                        case 0:
+                            SetScreen(Screen::Instances);
+                            break;
+                        case 1:
+                            SetScreen(Screen::Accounts);
+                            break;
+                        case 2:
+                            SetScreen(Screen::Settings);
+                            break;
+                        case 3:
+                            done = true;
+                            break;
+                    }
                 }
             }
             EndNavBar();
@@ -1014,6 +1064,24 @@ void DrawSettings()
 
             ImGui::BeginChild("settings_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
             BeginMenuButtons();
+            // Every QueueResetFocus() call above (tab switch, sub-tab
+            // switch) queues a reset, but nothing was ever *consuming* it
+            // for this window specifically — ImGuiFullscreen's own dialogs
+            // (DrawChoiceDialog, DrawInputDialog, ...) all call this same
+            // ResetFocusHere() right after their own BeginMenuButtons(),
+            // but main.cpp never did for the regular Settings content
+            // list, leaving it to Dear ImGui's own default "focus the
+            // first widget in a newly-focused window" behavior — which
+            // turns out to be unreliable with exactly one focusable
+            // widget (a single-toggle sub-tab like Window's
+            // LaunchMaximized): with 2+ items, an imprecise initial focus
+            // still leaves something to move Up/Down between and
+            // eventually reach the right one, but with only one item and
+            // nothing else to move to, landing outside it at all means
+            // there's no way to ever reach it. Forcing the reset here
+            // deterministically, the same way the built-in dialogs do,
+            // fixes that regardless of item count.
+            ResetFocusHere();
             currentTab.subtabs[g_settingsSubTab].draw();
             EndMenuButtons();
             ImGui::EndChild();
@@ -1343,6 +1411,29 @@ void DrawConsole()
 
 int main(int argc, char** argv)
 {
+    // EmuFolders::Resources defaults to BIGSCREEN_RESOURCES_DIR — an
+    // absolute path baked in at compile time, into *this machine's* source
+    // tree (bigscreen/CMakeLists.txt sets it to
+    // ${CMAKE_CURRENT_SOURCE_DIR}/resources). That's fine for a local dev
+    // build run straight out of build/, but not portable: a binary built
+    // in CI and downloaded to run somewhere else (a packaged release, or
+    // just copied to another machine) would still look for resources on
+    // the CI runner's filesystem and fail to load any icon/font. If a
+    // "resources" directory exists next to the actual running executable,
+    // prefer that instead — CI packaging copies bigscreen/resources/
+    // there. No QCoreApplication exists yet this early to ask for
+    // applicationDirPath(), so this reads /proc/self/exe directly — fine
+    // for v1's Linux-only scope.
+    {
+        std::error_code ec;
+        const std::filesystem::path exePath = std::filesystem::read_symlink("/proc/self/exe", ec);
+        if (!ec) {
+            const std::filesystem::path candidate = exePath.parent_path() / "resources";
+            if (std::filesystem::is_directory(candidate, ec) && !ec)
+                EmuFolders::Resources = candidate.string();
+        }
+    }
+
     // Launcher_logic compiles these Qt resources in (qrc_*.cpp), but a
     // static library's resource initializers only run if something in the
     // final executable actually touches them — the normal launcher/main.cpp
@@ -1492,8 +1583,30 @@ int main(int argc, char** argv)
                 SetScreen(Screen::Accounts);
             else if (name == "settings")
                 SetScreen(Screen::Settings);
+            else if (name == "settings_window") {
+                // Minecraft category (index 3), Window sub-tab (index 0) —
+                // DrawSettingsWindow draws exactly one toggle
+                // (LaunchMaximized), for reproducing "single-item sub-tab
+                // doesn't want to select" headlessly.
+                g_settingsTab = 3;
+                g_settingsSubTab = 0;
+                SetScreen(Screen::Settings);
+            } else if (name == "settings_console") {
+                // Minecraft category, Console sub-tab (index 1) — 4 items,
+                // for comparison against settings_window's single-item case.
+                g_settingsTab = 3;
+                g_settingsSubTab = 1;
+                SetScreen(Screen::Settings);
+            }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
         });
+        for (int i = 1; i <= 5; ++i) {
+            QTimer::singleShot(1500 + i * 400, &app, [i]() {
+                ImGuiContext* ctx = ImGui::GetCurrentContext();
+                SDL_Log("[test-screen] t+%dms: NavId=%u NavWindow=%s", i * 400, ctx->NavId,
+                        ctx->NavWindow ? ctx->NavWindow->Name : "(null)");
+            });
+        }
     }
 
     bool done = false;
