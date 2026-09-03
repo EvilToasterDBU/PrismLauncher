@@ -1213,7 +1213,18 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
         installEventFilter(new ToolTipFilter);
     }
 
-    if (createSetupWizard()) {
+    // --no-window front-ends (BigScreen) never show or dismiss this QDialog
+    // wizard, so letting it trigger here would leave m_status stuck at
+    // StartingUp forever (createSetupWizard() returning true means this
+    // function returns without ever reaching performMainStartupAction(),
+    // which is what sets m_status = Initialized) — reproduced live: a fresh
+    // profile with no accounts.json trips the wizard's own login-required
+    // check (m_accounts->anyAccountIsValid() == false), and the whole app
+    // hangs at "StartingUp" with no error. BigScreen has its own Accounts/
+    // Settings screens for everything the wizard would ask, so skip it
+    // outright in that mode rather than trying to drive a QWidget wizard
+    // headlessly.
+    if (!m_noMainWindow && createSetupWizard()) {
         return;
     }
 

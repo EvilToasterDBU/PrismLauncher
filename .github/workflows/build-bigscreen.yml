@@ -167,6 +167,67 @@ jobs:
             --dst-dir "$stage" \
             "$stage"/bin/* "$QT_PLUGIN_PATH"/*/*.so
 
+          # Never ship glibc/libstdc++ or the graphics/windowing stack in the
+          # bundle — both are meant to come from the host, not the build
+          # machine. lib4bin has no --exclude flag, so this strips them from
+          # the staged shared/lib/ after the fact; sharun's own generated
+          # --library-path always falls back to /usr/lib:/lib once a bundled
+          # candidate is gone (confirmed via LD_DEBUG=libs), so removing a
+          # file here just means "resolve it from the host" instead of
+          # "resolve it from the bundle" — every other bundled library is
+          # untouched.
+          #
+          # Confirmed live (SSH) on real ARM hardware (a rolling-release
+          # Arch Linux ARM build, glibc/Mesa newer than this CI runner's)
+          # that bundling either family breaks the app on a host newer than
+          # the build machine, in two distinct, reproduced ways:
+          #   - glibc/libstdc++: the *host's own* GPU driver
+          #     (/usr/lib/libgallium-<ver>.so, dlopen'd by the host's own
+          #     Mesa EGL/GLX libraries at run time) needs glibc symbol
+          #     versions (e.g. GLIBC_2.43) newer than this runner's glibc
+          #     provides, and glibc's forward compatibility only runs
+          #     *older*-linked code on a *newer* host, never the reverse —
+          #     so an older bundled libm.so.6 sitting ahead of the host's in
+          #     the search path breaks the host's own newer driver. Symptom
+          #     was "SDL_CreateWindow failed: Could not get EGL display" /
+          #     "Could not find a valid EGL device to initialize", which
+          #     turned out to have nothing to do with EGL itself — the real
+          #     failure was several layers underneath, in the GPU driver's
+          #     own dependency resolution.
+          #   - EGL/GL/Wayland stack: these must match the host compositor's
+          #     protocol version and the host GPU driver's ABI, which is
+          #     exactly why Valve's own Steam Runtime (pressure-vessel)
+          #     mounts the host's graphics drivers into its container
+          #     instead of bundling them — bundling an older
+          #     libwayland-client.so.0 here made the host's own (newer)
+          #     libEGL_mesa.so.0 fail with "undefined symbol:
+          #     wl_fixes_interface" (a Wayland protocol interface added
+          #     after this bundle's libwayland-client was built).
+          # Both fixes were verified together on-device: after excluding
+          # both families, the exact same binary/data went from failing at
+          # SDL_CreateWindow every time to opening a real window and
+          # uploading its first texture.
+          rm -f "$stage"/shared/lib/ld-linux-*.so.* \
+                "$stage"/shared/lib/libc.so.6 \
+                "$stage"/shared/lib/libm.so.6 \
+                "$stage"/shared/lib/libpthread.so.0 \
+                "$stage"/shared/lib/libdl.so.2 \
+                "$stage"/shared/lib/librt.so.1 \
+                "$stage"/shared/lib/libstdc++.so.6 \
+                "$stage"/shared/lib/libgcc_s.so.1 \
+                "$stage"/shared/lib/libwayland-client.so.0 \
+                "$stage"/shared/lib/libwayland-egl.so.1 \
+                "$stage"/shared/lib/libwayland-cursor.so.0 \
+                "$stage"/shared/lib/libEGL.so.1 \
+                "$stage"/shared/lib/libGL.so.1 \
+                "$stage"/shared/lib/libGLdispatch.so.0 \
+                "$stage"/shared/lib/libGLX.so.0 \
+                "$stage"/shared/lib/libOpenGL.so.0 \
+                "$stage"/shared/lib/libgbm.so.1 \
+                "$stage"/shared/lib/libdrm.so.2 \
+                "$stage"/shared/lib/libxkbcommon.so.0 \
+                "$stage"/shared/lib/libxkbcommon-x11.so.0
+
           # Must land next to the (hard-linked) binary in bin/ — that's
           # exactly what bigscreen/main.cpp's resource lookup and
           # Application::getJarPath() search for relative to the running
