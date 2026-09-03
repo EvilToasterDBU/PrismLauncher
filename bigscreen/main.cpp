@@ -484,7 +484,23 @@ void HandleBackButton()
 void DrawBlockingWait()
 {
     if (BeginScreen("Please Wait", false)) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "blocking_wait")) {
+        // Every BeginFullscreenColumnWindow(0.0f, 0.0f, ...) call in this
+        // file (not just this one) relies on the vendored function's own
+        // documented behavior for its "end" parameter: <= 0 means
+        // "DisplaySize.x + end", so 0.0f resolves to the real window's
+        // actual right edge — not the fixed 1280 LAYOUT_SCREEN_WIDTH
+        // reference these all used before. That fixed width was the actual
+        // cause of "Scale breaks the layout"/no-16:9-support: at anything
+        // above 1.0x, or on a wider-than-16:9 real window, a column sized
+        // to LayoutScale(1280) either overflowed the real (narrower)
+        // window — clipped by the parent's own bounds — or sat short of
+        // the real (wider) one, leaving unused space. BeginScreen() itself
+        // already passes expand_to_screen_width=true to
+        // BeginFullscreenColumns() for the *outer* window (dynamic,
+        // correct already) — this makes the *inner* content column match
+        // it, instead of quietly reintroducing the same fixed-width
+        // assumption one level down.
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "blocking_wait")) {
             const char* text = "Please wait...";
             const ImVec2 textSize = ImGui::CalcTextSize(text);
             ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - textSize.x) * 0.5f, (ImGui::GetWindowHeight() - textSize.y) * 0.5f));
@@ -535,7 +551,7 @@ void DrawLanding(bool& done)
     }
 
     if (BeginScreen("PrismLauncher BigScreen")) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "landing")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "landing")) {
             BeginNavBar();
             // See DrawSettings' settings_content comment: BeginNavBar(), like
             // BeginMenuButtons(), never consumes a queued focus reset on its
@@ -547,11 +563,19 @@ void DrawLanding(bool& done)
             // each and flow left-to-right via ImGui::SameLine() with no
             // built-in centering — the reference layout (PCSX2's own home
             // screen) has the row centered as a group, not flush against
-            // the left edge, so center it here.
-            const float rowWidth = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            // the left edge, so center it here. Centers within
+            // GetContentRegionAvail() (the real available space in this
+            // now-dynamically-sized column, see BeginFullscreenColumnWindow's
+            // comment above) rather than the fixed LAYOUT_SCREEN_WIDTH
+            // reference — that fixed reference is what caused the row to
+            // run off the right edge at anything above 100% Scale, or on a
+            // real window wider than the 1280 reference.
+            const float rowWidth = LayoutScale(static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH);
+            const float availableWidth = ImGui::GetContentRegionAvail().x;
             const float availableHeight = ImGui::GetContentRegionAvail().y;
             const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
-            ImGui::SetCursorPos(ImVec2(LayoutScale((LAYOUT_SCREEN_WIDTH - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
+            ImGui::SetCursorPos(
+                ImVec2(std::max(0.0f, (availableWidth - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
 
             // Dispatched by index, not by matching the (now sometimes
             // translated, no longer English-guaranteed) title text.
@@ -610,14 +634,18 @@ void DrawQuit(bool& done)
     }
 
     if (BeginScreen("PrismLauncher BigScreen")) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "quit")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "quit")) {
             BeginNavBar();
             ResetFocusHere();
 
-            const float rowWidth = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            // See DrawLanding()'s identical row-centering for why this uses
+            // GetContentRegionAvail() rather than LAYOUT_SCREEN_WIDTH.
+            const float rowWidth = LayoutScale(static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH);
+            const float availableWidth = ImGui::GetContentRegionAvail().x;
             const float availableHeight = ImGui::GetContentRegionAvail().y;
             const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
-            ImGui::SetCursorPos(ImVec2(LayoutScale((LAYOUT_SCREEN_WIDTH - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
+            ImGui::SetCursorPos(
+                ImVec2(std::max(0.0f, (availableWidth - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
 
             for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
                 const LandingItem& item = items[i];
@@ -654,7 +682,7 @@ void DrawAccounts()
     }
 
     if (BeginScreen("Accounts")) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "accounts")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "accounts")) {
             BeginMenuButtons();
             ResetFocusHere();
 
@@ -701,7 +729,7 @@ void DrawAccountLogin()
     SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Cancel" } });
 
     if (BeginScreen("Sign in with Microsoft")) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "account_login")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "account_login")) {
             BeginMenuButtons();
             ResetFocusHere();
             if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Cancel")) {
@@ -914,19 +942,14 @@ void DrawSettingsAppearance()
     // the vendored toolkit (same reasoning as DrawMemorySetting's MB
     // presets), so this is a preset picker, same pattern.
     //
-    // Capped at 100%, not the 80-150% originally offered: UpdateLayoutScale()
-    // always saturates padding to exactly zero on whichever axis is
-    // currently the tighter fit (that's the definition of "fit"), so *any*
-    // multiplier above 1.0 pushes the logical canvas past the window's edge
-    // on that axis — confirmed visually (cards clipped off-screen, top bar
-    // cut off at 150%). Scaling down is always safe (padding only grows).
-    // Making the UI genuinely bigger without cropping anything needs the
-    // canvas itself to stop being hard-locked to a fixed 1280x720/16:9 box
-    // in the first place — the same underlying change needed to stop
-    // letterboxing non-16:9 windows — deferred as its own follow-up rather
-    // than rushed here alongside several other fixes.
+    // Was capped at 100% for a round (values above it clipped cards/the top
+    // bar off-screen) — that was actually caused by every screen's content
+    // column being sized to a fixed 1280-wide reference instead of the
+    // real window (see BeginFullscreenColumnWindow's call sites), which
+    // also broke non-16:9 windows the same way; fixed at the source, so
+    // the full range is back.
     {
-        static const float kScalePresets[] = { 0.7f, 0.8f, 0.9f, 1.0f };
+        static const float kScalePresets[] = { 0.7f, 0.8f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f };
         SettingsObject* settings = APPLICATION->settings();
         const float currentScale = settings->get("BigScreenUIScale").toFloat();
         const std::string valueStr = std::to_string(static_cast<int>(currentScale * 100.0f + 0.5f)) + "%";
@@ -1236,7 +1259,7 @@ void DrawSettings()
     const std::string screenTitle = std::string("Settings \xE2\x80\x94 ") + currentTab.name;
 
     if (BeginScreen(screenTitle.c_str(), true, topTabs)) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "settings")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "settings")) {
             // The sub-tab row is its own non-scrolling child, separate from
             // the settings list below — otherwise (a) NavTab's trailing
             // ImGui::SameLine() (it always calls it, to chain the *next*
@@ -1427,7 +1450,8 @@ void DrawInstanceSettingsCommands()
 {
     SettingsObject* s = g_instanceSettingsTarget->settings();
 
-    DrawToggleSetting("OverrideCommands", "Custom Commands", "Use different custom commands for this instance.", false, s);
+    DrawToggleSetting("OverrideCommands", TR("MinecraftSettingsWidget", "Custom Commands"),
+                       "Use different custom commands for this instance.", false, s);
     if (s->get("OverrideCommands").toBool()) {
         DrawTextSetting("WrapperCommand", StripMnemonic(TR("CustomCommands", "&Wrapper Command")),
                          "Command to wrap the Minecraft launch with (e.g. gamemoderun, mangohud).", false, s);
@@ -1441,7 +1465,7 @@ void DrawInstanceSettingsCommands()
 void DrawInstanceSettingsNotes()
 {
     SettingsObject* s = g_instanceSettingsTarget->settings();
-    DrawTextSetting("notes", "Notes", "Freeform notes about this instance.", false, s);
+    DrawTextSetting("notes", TR("NotesPage", "Notes"), "Freeform notes about this instance.", false, s);
 }
 
 struct InstanceSettingsTab {
@@ -1487,7 +1511,7 @@ void DrawInstanceSettings()
                                      kInstanceSettingsTabs[g_instanceSettingsTab].name;
 
     if (BeginScreen(screenTitle.c_str())) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "instance_settings")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "instance_settings")) {
             // Same non-scrolling tab-row / scrolling-content two-child-window
             // split DrawSettings() uses for its sub-tab row, and for the
             // same reasons (NavTab's own trailing SameLine() would otherwise
@@ -1654,10 +1678,28 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
     // g_screen) left the menu still open and rendering on top of whatever
     // screen came next, since DrawChoiceDialog() runs unconditionally every
     // frame regardless of g_screen.
+    //
+    // CRASH FIX: CloseChoiceDialog() must NOT be called directly from in
+    // here. This lambda *is* s_choice_dialog_callback — DrawChoiceDialog()
+    // is mid-way through invoking it (`s_choice_dialog_callback(choice,
+    // ...)`) when we're running. CloseChoiceDialog() does
+    // `ChoiceDialogCallback().swap(s_choice_dialog_callback)`, which
+    // swaps *this very closure* (including the captured `actions`
+    // shared_ptr) into a temporary that's destroyed at the end of that
+    // statement — while we're still executing inside it. Continuing to
+    // touch `actions` afterwards (the .run() call) was then a
+    // use-after-free, which is exactly what crashed on "Edit..." (and any
+    // other action here) once this fix started actually getting exercised.
+    // Deferred through g_pendingAction instead, same as every other
+    // blocking/stateful action in this file — runs at the very top of the
+    // *next* frame, well outside DrawChoiceDialog()'s own call stack, so
+    // swapping the (by-then-already-returned) callback is safe.
     OpenChoiceDialog(inst->name().toStdString(), false, std::move(options), [actions](s32 index, const std::string&, bool) {
         if (index >= 0 && static_cast<size_t>(index) < actions->size()) {
-            CloseChoiceDialog();
-            (*actions)[static_cast<size_t>(index)].run();
+            g_pendingAction = [actions, index]() {
+                CloseChoiceDialog();
+                (*actions)[static_cast<size_t>(index)].run();
+            };
         }
     });
 }
@@ -1756,12 +1798,18 @@ void ShowAddInstanceMenu()
 
     // See ShowInstanceActionsMenu()'s comment on why this closes the dialog
     // itself before acting — DrawChoiceDialog() doesn't do it automatically
-    // for a real selection, only for cancel.
+    // for a real selection, only for cancel — and why that close has to be
+    // deferred through g_pendingAction rather than called directly from in
+    // here (this lambda *is* s_choice_dialog_callback while it's running;
+    // CloseChoiceDialog() would swap it — and its captures — out from under
+    // itself mid-call).
     OpenChoiceDialog(StripMnemonic(MW("Add Instanc&e...")).toStdString(), false, std::move(options),
                       [](s32 index, const std::string&, bool) {
                           if (index == 0) {
-                              CloseChoiceDialog();
-                              g_pendingAction = StartVanillaInstanceCreation;
+                              g_pendingAction = []() {
+                                  CloseChoiceDialog();
+                                  StartVanillaInstanceCreation();
+                              };
                           }
                       });
 }
@@ -1785,7 +1833,7 @@ void DrawInstances()
     const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
 
     if (BeginScreen("Instances")) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "instances")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "instances")) {
             BeginNavBar();
             ResetFocusHere();
 
@@ -1842,7 +1890,7 @@ void DrawConsole()
     SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Back" } });
 
     if (BeginScreen(title.c_str())) {
-        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "console")) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "console")) {
             BeginMenuButtons();
             ResetFocusHere();
             if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back"))
@@ -1994,9 +2042,21 @@ int main(int argc, char** argv)
         SDL_Log("No gamepad detected — keyboard arrow keys + Enter/Escape also drive ImGui nav.");
     ImGuiFullscreen::ReportGamepadLayout(DetectGamepadLayout(pad));
 
-    const char* glsl_version = "#version 130";
+    // GLES3 (via EGL), not desktop Core GL — real ARM hardware confirmed
+    // this the hard way: requesting SDL_GL_CONTEXT_PROFILE_CORE failed
+    // outright with "Could not find a valid EGL device to initialize"
+    // (SDL_CreateWindow itself never succeeds, so nothing renders at all —
+    // not a missing-library problem as first suspected, a GL profile one).
+    // Many ARM/embedded GPUs only expose GLES through EGL, no desktop GL/
+    // GLX at all. Mesa (this dev machine's own driver, and what SteamOS
+    // uses) supports GLES3+EGL on desktop GPUs too, so standardizing on
+    // GLES3 everywhere — rather than a desktop/GLES runtime fallback,
+    // which Dear ImGui's OpenGL3 backend can't do anyway (IMGUI_IMPL_OPENGL_ES3
+    // selects its GL function loader and GLSL dialect at *compile* time,
+    // see CMakeLists.txt) — is the simpler, more portable single code path.
+    const char* glsl_version = "#version 300 es";
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
-    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
@@ -2141,11 +2201,11 @@ int main(int argc, char** argv)
                 g_settingsTab = 7;
                 g_settingsSubTab = 0;
                 SetScreen(Screen::Settings);
-            } else if (name == "instance_settings" || name == "instance_settings_java") {
+            } else if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands") {
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
                     g_instanceSettingsTarget = instances->at(0);
-                    g_instanceSettingsTab = (name == "instance_settings_java") ? 1 : 0;
+                    g_instanceSettingsTab = (name == "instance_settings_java") ? 1 : (name == "instance_settings_commands") ? 3 : 0;
                     SetScreen(Screen::InstanceSettings);
                 }
             } else if (name == "instance_actions") {
@@ -2218,28 +2278,33 @@ int main(int argc, char** argv)
 
         UpdateLayoutScale();
         // UpdateLayoutScale() computed the scale that exactly fits BigScreen's
-        // fixed 1280x720 logical layout to the actual window, saturating
-        // padding to exactly zero on whichever axis is the tighter fit —
-        // "Scale" in Settings > Appearance (BigScreenUIScale, capped at
-        // 100%, see its own comment for why) is a user multiplier *below*
-        // that on top, applied here before UpdateFontScale() so medium/large
-        // fonts (sized via LayoutScale(), same as every widget dimension)
-        // pick it up too, not just the widget geometry. Clamped defensively
-        // to never exceed the fit value even if BigScreenUIScale somehow
-        // holds something above 1.0 (a hand-edited config, an older build's
-        // value) — going higher pushes the canvas past the window's edge on
-        // the constrained axis (confirmed visually: content clipped off-
-        // screen), scaling down is always safe (padding only grows).
+        // 1280x720 reference layout to the actual window — "Scale" in
+        // Settings > Appearance (BigScreenUIScale) is a user multiplier on
+        // top of that fit, applied here before UpdateFontScale() so medium/
+        // large fonts (sized via LayoutScale(), same as every widget
+        // dimension) pick it up too, not just the widget geometry.
+        //
+        // No padding recompute here (there used to be one, and it's the
+        // reason this whole block used to be capped at 100% — see below):
+        // g_layout_padding_left/top only ever mattered for
+        // BeginFullscreenColumnWindow()/BeginFullscreenColumns() calls that
+        // size themselves to the fixed 1280 reference width instead of the
+        // real window — this file no longer has any of those (every such
+        // call now passes 0.0f, meaning "to the real edge", relying on
+        // BeginFullscreenColumnWindow's own documented end<=0 behavior —
+        // see its first call site's comment). With every screen's content
+        // column already dynamically matching the real window,
+        // over-100% scale no longer pushes anything *past* the window's
+        // own edge the way it used to (confirmed visually at 150%, no
+        // clipping) — content can still visually crowd at extreme scale on
+        // a small window (Landing/Quit's horizontal card rows aren't
+        // wrap-aware), but that's a normal "zoomed in" tradeoff, not the
+        // catastrophic edge-clipping this cap existed to prevent.
         {
-            const float userScale = std::min(APPLICATION->settings()->get("BigScreenUIScale").toFloat(), 1.0f);
+            const float userScale = APPLICATION->settings()->get("BigScreenUIScale").toFloat();
             if (userScale > 0.0f && userScale != 1.0f) {
                 ImGuiFullscreen::g_layout_scale *= userScale;
                 ImGuiFullscreen::g_rcp_layout_scale = 1.0f / ImGuiFullscreen::g_layout_scale;
-                const ImGuiIO& scaleIo = ImGui::GetIO();
-                ImGuiFullscreen::g_layout_padding_left =
-                    (scaleIo.DisplaySize.x - ImGuiFullscreen::LAYOUT_SCREEN_WIDTH * ImGuiFullscreen::g_layout_scale) * 0.5f;
-                ImGuiFullscreen::g_layout_padding_top =
-                    (scaleIo.DisplaySize.y - ImGuiFullscreen::LAYOUT_SCREEN_HEIGHT * ImGuiFullscreen::g_layout_scale) * 0.5f;
             }
         }
         UpdateFontScale();

@@ -24,6 +24,12 @@ target_include_directories(bigscreen_imgui PUBLIC
     ${IMGUI_DIR}/backends
 )
 target_link_libraries(bigscreen_imgui PUBLIC PkgConfig::SDL2 OpenGL::GL)
+# GLES3, not desktop GL — see the matching comment in main.cpp (SDL_GL_CONTEXT_PROFILE_MASK)
+# for why: real ARM hardware only exposes GLES through EGL, no desktop GL/GLX at all, and
+# imgui_impl_opengl3.cpp picks its GL function loader/GLSL dialect via this exact macro at
+# compile time — there's no runtime desktop/GLES switch available. PUBLIC: main.cpp's own
+# glsl_version string ("#version 300 es") and SDL context attributes must agree with this.
+target_compile_definitions(bigscreen_imgui PUBLIC IMGUI_IMPL_OPENGL_ES3)
 
 target_sources(bigscreen_imgui PRIVATE
     ${IMGUI_DIR}/misc/cpp/imgui_stdlib.cpp
