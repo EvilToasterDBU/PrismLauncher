@@ -165,16 +165,11 @@ LaunchDecision LaunchController::decideLaunchMode()
 
     if (state == AccountState::Working) {
         // refresh is in progress, we need to wait for it to finish to proceed.
-        ProgressDialog progDialog(m_parentWidget);
-        progDialog.setSkipButton(true, tr("Abort"));
-
         // TODO: this relies on tasks' synchronous signal dispatching nature
         // TODO: meaning currentTask can't complete and become null while this code is running
         // TODO: this code will produce a race condition when tasks become fully async
         auto task = accountToCheck->currentTask();
-        progDialog.execWithTask(task.get());
-
-        if (task->getState() == State::AbortedByUser) {
+        if (!waitForTask(task.get())) {
             return LaunchDecision::Abort;
         }
 
@@ -385,7 +380,7 @@ void LaunchController::launchInstance()
     const auto* console = qobject_cast<InstanceWindow*>(m_parentWidget);
     const auto showConsole = m_instance->settings()->get("ShowConsole").toBool();
     if (!console && showConsole) {
-        APPLICATION->showInstanceWindow(m_instance);
+        showInstanceConsole();
     }
     connect(m_launcher, &LaunchTask::readyForLaunch, this, &LaunchController::readyForLaunch);
     connect(m_launcher, &LaunchTask::succeeded, this, &LaunchController::onSucceeded);
@@ -466,17 +461,28 @@ void LaunchController::onSucceeded()
 void LaunchController::onFailed(QString reason)
 {
     if (m_instance->settings()->get("ShowConsoleOnError").toBool()) {
-        APPLICATION->showInstanceWindow(m_instance, "console");
+        showInstanceConsole("console");
     }
     emitFailed(std::move(reason));
 }
 
-void LaunchController::onProgressRequested(Task* task) const
+void LaunchController::showInstanceConsole(const QString& page)
+{
+    APPLICATION->showInstanceWindow(m_instance, page);
+}
+
+void LaunchController::onProgressRequested(Task* task)
+{
+    m_launcher->proceed();
+    waitForTask(task);
+}
+
+bool LaunchController::waitForTask(Task* task)
 {
     ProgressDialog progDialog(m_parentWidget);
     progDialog.setSkipButton(true, tr("Abort"));
-    m_launcher->proceed();
     progDialog.execWithTask(task);
+    return task->getState() != State::AbortedByUser;
 }
 
 bool LaunchController::abort()
@@ -487,13 +493,18 @@ bool LaunchController::abort()
     if (!m_launcher->canAbort()) {
         return false;
     }
+    if (confirmKillInstance()) {
+        return m_launcher->abort();
+    }
+    return false;
+}
+
+bool LaunchController::confirmKillInstance()
+{
     auto response = CustomMessageBox::selectable(m_parentWidget, tr("Kill Minecraft?"),
                                                  tr("This can cause the instance to get corrupted and should only be used if Minecraft "
                                                     "is frozen for some reason"),
                                                  QMessageBox::Question, QMessageBox::Yes | QMessageBox::No, QMessageBox::Yes)
                         ->exec();
-    if (response == QMessageBox::Yes) {
-        return m_launcher->abort();
-    }
-    return false;
+    return response == QMessageBox::Yes;
 }

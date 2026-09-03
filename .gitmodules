@@ -4,3 +4,7 @@
 [submodule "cmake/vcpkg"]
 	path = cmake/vcpkg
 	url = https://github.com/microsoft/vcpkg.git
+[submodule "bigscreen/thirdparty/imgui"]
+	path = bigscreen/thirdparty/imgui
+	url = https://github.com/ocornut/imgui.git
+	branch = docking

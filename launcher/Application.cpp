@@ -319,6 +319,8 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
           { { "o", "offline" }, "Launch offline, with given player name (only valid in combination with --launch)", "offline" },
           { "alive", "Write a small '" + liveCheckFile + "' file after the launcher starts" },
           { "show-window", "Show the main launcher window (useful in combination with --launch)" },
+          { "no-window", "Never show the main launcher window, even without --launch (for external front-ends "
+                          "that drive the launcher core directly, e.g. BigScreen)" },
           { { "I", "import" }, "Import instance or resource from specified local path or URL", "url" },
           { "show", "Opens the window for the specified instance (by instance ID)", "show" } });
     // Has to be positional for some OS to handle that properly
@@ -341,6 +343,7 @@ Application::Application(int& argc, char** argv) : QApplication(argc, argv)
 
     m_instanceIdToShowWindowOf = parser.value("show");
     m_showMainWindow = parser.isSet("show-window");
+    m_noMainWindow = parser.isSet("no-window");
 
     for (auto url : parser.values("import")) {
         m_urlsToImport.append(normalizeImportUrl(url));
@@ -1385,11 +1388,14 @@ void Application::performMainStartupAction()
             return;
         }
     }
-    if (!m_mainWindow) {
+    if (!m_mainWindow && !m_noMainWindow) {
         // normal main window
         showMainWindow(false);
         qDebug() << "<> Main window shown.";
     }
+
+    if (m_noMainWindow)
+        return;
 
     // initialize the updater
     if (updaterEnabled()) {
@@ -1535,7 +1541,8 @@ bool Application::launch(MinecraftInstance* instance,
                          LaunchMode mode,
                          MinecraftTarget::Ptr targetToJoin,
                          MinecraftAccountPtr accountToUse,
-                         const QString& offlineName)
+                         const QString& offlineName,
+                         Application::LaunchControllerFactory controllerFactory)
 {
     if (m_updateRunning) {
         qDebug() << "Cannot launch instances while an update is running. Please try again when updates are completed.";
@@ -1549,7 +1556,7 @@ bool Application::launch(MinecraftInstance* instance,
             }
         }
         auto& controller = extras.controller;
-        controller.reset(new LaunchController());
+        controller.reset(controllerFactory ? controllerFactory() : new LaunchController());
         controller->setInstance(instance);
         controller->setLaunchMode(mode);
         controller->setProfiler(profilers().value(instance->settings()->get("Profiler").toString(), nullptr).get());
@@ -1620,7 +1627,15 @@ void Application::subRunningInstance()
 
 bool Application::shouldExitNow() const
 {
-    return m_runningInstances == 0 && m_openWindows == 0;
+    // m_openWindows==0 alone means "no MainWindow/InstanceWindow/etc. is
+    // open" — for the normal Qt UI that's a real signal nothing is left to
+    // do, but for a --no-window front-end (BigScreen) it's *always* true,
+    // since it never creates any of those QWidgets in the first place; its
+    // own render loop is what keeps the process alive between launches, not
+    // a window. Without this check, the process would exit() the instant
+    // any single launched instance finished, even with the front-end still
+    // fully up and other instances possibly still running.
+    return !m_noMainWindow && m_runningInstances == 0 && m_openWindows == 0;
 }
 
 bool Application::updatesAreAllowed()

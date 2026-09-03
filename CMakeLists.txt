@@ -530,5 +530,13 @@ add_subdirectory(buildconfig)
 if(BUILD_TESTING)
     add_subdirectory(tests)
 endif()
+
 # NOTE: this must always be last to appease the CMake deity of quirky install command evaluation order.
 add_subdirectory(launcher)
+
+# Must come after launcher: links against its Launcher_logic target to reuse
+# the core (instances, accounts, launching) without any Qt Widgets UI.
+option(Launcher_BUILD_BIGSCREEN "Build the gamepad-navigable BigScreen front-end" OFF)
+if(Launcher_BUILD_BIGSCREEN)
+    add_subdirectory(bigscreen)
+endif()

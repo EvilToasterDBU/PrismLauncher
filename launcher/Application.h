@@ -215,12 +215,23 @@ class Application : public QApplication {
     void clickedOnDock();
 #endif
 
+   public:
+    // A plain function-pointer parameter type in a Q_SLOT's signature trips
+    // up moc's generated qt_static_metacall (it mis-invokes it as if it
+    // were the pointee type) — a named alias avoids that.
+    using LaunchControllerFactory = LaunchController* (*)();
+
    public slots:
     bool launch(MinecraftInstance* instance,
                 LaunchMode mode = LaunchMode::Normal,
                 std::shared_ptr<MinecraftTarget> targetToJoin = nullptr,
                 shared_qobject_ptr<MinecraftAccount> accountToUse = nullptr,
-                const QString& offlineName = QString());
+                const QString& offlineName = QString(),
+                // Lets a front-end without QWidgets (e.g. BigScreen) supply
+                // its own LaunchController subclass instead of the default
+                // Qt Widgets-dialog-driven one. Normal desktop UI never
+                // passes this, so behavior there is unchanged.
+                LaunchControllerFactory controllerFactory = nullptr);
     bool kill(BaseInstance* instance);
     void closeCurrentWindow();
 
@@ -319,6 +330,10 @@ class Application : public QApplication {
     QList<QUrl> m_urlsToImport;
     QString m_instanceIdToShowWindowOf;
     bool m_showMainWindow = false;
+    // Never show MainWindow, even where performMainStartupAction() would
+    // otherwise do so by default. For external front-ends (e.g. BigScreen)
+    // that drive the launcher core without any Qt Widgets UI of their own.
+    bool m_noMainWindow = false;
     std::unique_ptr<QFile> logFile;
     std::unique_ptr<LogModel> logModel;
 

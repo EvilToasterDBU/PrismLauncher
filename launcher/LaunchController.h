@@ -72,23 +72,52 @@ class LaunchController : public Task {
 
     bool abort() override;
 
+   protected:
+    // Overridable so a front-end without QWidgets (e.g. BigScreen) can
+    // substitute its own UI for these — see bigscreen/core/BigScreenLaunchController.*.
+    // Default implementations are exactly what they always were (QMessageBox
+    // et al, parented to m_parentWidget); overriding does not change
+    // behavior for the normal Qt Widgets UI.
+    virtual bool askPlayDemo() const;
+    virtual QString askOfflineName(const QString& playerName, bool* ok = nullptr);
+    virtual bool reauthenticateAccount(const MinecraftAccountPtr& account, const QString& reason);
+    virtual bool confirmKillInstance();
+    // Called from decideLaunchMode() when an account's token refresh is
+    // already in progress and launch has to wait for it. Default blocks on
+    // the real ProgressDialog (a QDialog::exec()); BigScreen overrides this
+    // since a modal QWidget dialog with a null parent and no way to click
+    // its "Abort" button via gamepad just makes the launch look hung.
+    // Returns false if the wait was aborted (by the user, or however the
+    // override chooses to interpret that) — decideLaunchMode() then aborts
+    // the whole launch, matching the old inline behavior.
+    virtual bool waitForTask(Task* task);
+    // Called when the instance's console should become visible to the user
+    // (on launch, if ShowConsole is set; on failure, if ShowConsoleOnError
+    // is set). Default shows the real InstanceWindow QWidget — BigScreen
+    // overrides this since it has no QWidgets at all and already shows a
+    // console of its own (Screen::Console); without the override, a
+    // genuine native window would pop up over BigScreen's fullscreen SDL
+    // window, and closing *that* stray window was taking the whole
+    // application down with it via Qt's normal window-close handling.
+    virtual void showInstanceConsole(const QString& page = QString());
+
    private:
     void login();
     void launchInstance();
     void decideAccount();
     LaunchDecision decideLaunchMode();
-    bool askPlayDemo() const;
-    QString askOfflineName(const QString& playerName, bool* ok = nullptr);
-    bool reauthenticateAccount(const MinecraftAccountPtr& account, const QString& reason);
 
    private slots:
     void readyForLaunch();
 
     void onSucceeded();
     void onFailed(QString reason);
-    void onProgressRequested(Task* task) const;
+    void onProgressRequested(Task* task);
 
-   private:
+   protected:
+    // protected rather than private so overrides of the dialog methods
+    // above can make informed decisions (e.g. wording an offline-name
+    // prompt around m_actualLaunchMode) — see BigScreenLaunchController.
     LaunchMode m_wantedLaunchMode = LaunchMode::Normal;
     LaunchMode m_actualLaunchMode = LaunchMode::Normal;
     BaseProfilerFactory* m_profiler = nullptr;
