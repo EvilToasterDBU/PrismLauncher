@@ -123,7 +123,7 @@ QString TrimTrailingColon(QString text)
     return text;
 }
 
-enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings };
+enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, Quit };
 
 Screen g_screen = Screen::Landing;
 bool g_wantsQuit = false;
@@ -378,30 +378,20 @@ void HandleBackButton()
         return;
 
     switch (g_screen) {
-        case Screen::Landing: {
-            // Nowhere further back to go — ask before quitting instead.
-            // Three-way choice rather than the plain Yes/No
-            // OpenConfirmMessageDialog this used to be: on a machine that
-            // also has the normal desktop UI installed alongside BigScreen
-            // (the common case — same repo, two executables), "quit" isn't
-            // the only sensible option. Uses the same raw, non-blocking
-            // OpenChoiceDialog as the X/Y instance menus (see
-            // ShowInstanceActionsMenu's comment for why) rather than
-            // BigScreenDialogs::Choose()'s blocking pump loop — this runs
-            // from inside the frame timer's own callback, and that would
-            // recursively re-enter it.
-            ChoiceDialogOptions options;
-            options.emplace_back(std::string(ICON_FA_CHECK) + " Quit", false);
-            options.emplace_back("Switch to Desktop Mode", false);
-            OpenChoiceDialog("Quit?", false, std::move(options), [](s32 index, const std::string&, bool) {
-                if (index == 0) {
-                    g_wantsQuit = true;
-                } else if (index == 1) {
-                    SwitchToDesktopMode();
-                }
-            });
+        case Screen::Landing:
+            // Nowhere further back to go — a dedicated screen (matching
+            // PCSX2's own reference layout — icon cards, not a popup list)
+            // offers quitting or switching to desktop mode instead. A
+            // *screen*, not a dialog: this used to be an OpenChoiceDialog,
+            // but B/Escape on the Landing screen was also still hitting a
+            // leftover raw `if (SDLK_ESCAPE) done = true;` check in the SDL
+            // event loop from before any confirmation existed at all,
+            // instantly quitting and skipping the dialog entirely — that's
+            // now removed, but a real screen (going through the exact same
+            // SetScreen()/HandleBackButton() machinery every other screen
+            // does) doesn't leave room for that class of bug to resurface.
+            SetScreen(Screen::Quit);
             break;
-        }
         case Screen::Instances:
             SetScreen(Screen::Landing);
             break;
@@ -418,6 +408,9 @@ void HandleBackButton()
             SetScreen(Screen::Accounts);
             break;
         case Screen::Settings:
+            SetScreen(Screen::Landing);
+            break;
+        case Screen::Quit:
             SetScreen(Screen::Landing);
             break;
     }
@@ -511,7 +504,60 @@ void DrawLanding(bool& done)
                             SetScreen(Screen::Settings);
                             break;
                         case 3:
+                            // Same confirmation screen B shows — clicking
+                            // this card used to quit instantly with no
+                            // confirmation at all, inconsistent with B's
+                            // own behavior on the very same screen.
+                            SetScreen(Screen::Quit);
+                            break;
+                    }
+                }
+            }
+            EndNavBar();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+}
+
+// B (or clicking "Quit" on Landing) opens this — matches PCSX2's own quit
+// screen (icon cards: Back / Exit / switch UI mode), reusing DrawLanding's
+// own row-of-HorizontalMenuItem-cards layout rather than a popup dialog, at
+// the user's explicit request ("хочу что-то типа такого", with a PCSX2
+// screenshot showing exactly this layout).
+void DrawQuit(bool& done)
+{
+    const LandingItem items[] = {
+        { "images/icons/back.png", "Back", "Return to the previous menu." },
+        { "images/icons/quit.png", "Quit", "Fully exit BigScreen, returning to your desktop." },
+        { "images/icons/desktop.png", "Switch to Desktop Mode", "Exit BigScreen mode, switch to the desktop interface." },
+    };
+
+    SetFullscreenFooterText("A: Select    B: Back");
+
+    if (BeginScreen("PrismLauncher BigScreen")) {
+        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "quit")) {
+            BeginNavBar();
+
+            const float rowWidth = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            const float availableHeight = ImGui::GetContentRegionAvail().y;
+            const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
+            ImGui::SetCursorPos(ImVec2(LayoutScale((LAYOUT_SCREEN_WIDTH - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
+
+            for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
+                const LandingItem& item = items[i];
+                GSTexture* icon = GetCachedTexture(item.icon);
+                const QByteArray titleUtf8 = item.title.toUtf8();
+                if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
+                    switch (i) {
+                        case 0:
+                            SetScreen(Screen::Landing);
+                            break;
+                        case 1:
                             done = true;
+                            break;
+                        case 2:
+                            SwitchToDesktopMode();
                             break;
                     }
                 }
@@ -1583,6 +1629,8 @@ int main(int argc, char** argv)
                 SetScreen(Screen::Accounts);
             else if (name == "settings")
                 SetScreen(Screen::Settings);
+            else if (name == "quit")
+                SetScreen(Screen::Quit);
             else if (name == "settings_window") {
                 // Minecraft category (index 3), Window sub-tab (index 0) —
                 // DrawSettingsWindow draws exactly one toggle
@@ -1641,8 +1689,6 @@ int main(int argc, char** argv)
                 done = true;
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
                 event.window.windowID == SDL_GetWindowID(window))
-                done = true;
-            if (event.type == SDL_KEYDOWN && event.key.keysym.sym == SDLK_ESCAPE && g_screen == Screen::Landing)
                 done = true;
 
             // TEMPORARY diagnostic (see the BigScreen plan): logs every raw
@@ -1746,6 +1792,9 @@ int main(int argc, char** argv)
                     break;
                 case Screen::Settings:
                     DrawSettings();
+                    break;
+                case Screen::Quit:
+                    DrawQuit(done);
                     break;
             }
 
