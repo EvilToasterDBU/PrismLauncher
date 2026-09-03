@@ -255,6 +255,73 @@ bool BeginScreen(const char* title, bool footer = true, std::span<const TopBarTa
     return BeginFullscreenColumns(nullptr, LayoutScale(kTopBarHeight), true, footer);
 }
 
+// A single row of HorizontalMenuItem-style cards that may not all fit the
+// real available width (a fixed 4-up row overflowing at high Scale/on a
+// narrow window, or an instance list wider than 4 items) — draws whichever
+// fit, centered, in a horizontally-scrolling child, plus a left/right
+// chevron in the margin on whichever side has more items currently
+// scrolled out of view.
+//
+// Doesn't track a scroll or selection index itself: Dear ImGui's own nav
+// system already scrolls a child window to keep the moved-to item in view
+// (the same mechanism every vertical list in this file already relies on,
+// just working on the X axis here) — drawItems() just draws every item
+// normally, same as before this existed, and this only wraps that in a
+// sized/scrollable child plus reads back its resulting scroll position
+// for the indicators. id must be unique per call site (becomes the child
+// window's ImGui ID); rowWidth is the *content* width drawItems() will
+// produce (e.g. itemCount * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH, in logical
+// units) — needed up front to decide whether centering or edge-alignment
+// applies, and whether the chevrons should show at all.
+void DrawScrollableCardRow(const char* id, float rowWidthLogical, float rowHeight, const std::function<void()>& drawItems)
+{
+    const float chevronAreaWidth = LayoutScale(36.0f);
+    const float availableWidth = ImGui::GetContentRegionAvail().x;
+    const float rowWidth = LayoutScale(rowWidthLogical);
+    const bool canOverflow = rowWidth > availableWidth - chevronAreaWidth * 2.0f;
+    const float scrollAreaWidth = canOverflow ? (availableWidth - chevronAreaWidth * 2.0f) : availableWidth;
+
+    bool showLeft = false;
+    bool showRight = false;
+
+    if (canOverflow)
+        ImGui::Dummy(ImVec2(chevronAreaWidth, rowHeight));
+
+    if (canOverflow)
+        ImGui::SameLine(0.0f, 0.0f);
+    ImGui::BeginChild(id, ImVec2(scrollAreaWidth, rowHeight), ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
+    // Center when everything fits (matches the pre-scrolling behavior
+    // exactly); flush to the start edge when it doesn't, so there's
+    // nothing but the chevron to imply more content in that direction.
+    ImGui::SetCursorPosX(std::max(0.0f, (scrollAreaWidth - rowWidth) * 0.5f));
+    drawItems();
+    if (canOverflow) {
+        showLeft = ImGui::GetScrollX() > 0.5f;
+        showRight = ImGui::GetScrollX() < ImGui::GetScrollMaxX() - 0.5f;
+    }
+    ImGui::EndChild();
+
+    if (canOverflow) {
+        ImGui::SameLine(0.0f, 0.0f);
+        ImGui::Dummy(ImVec2(chevronAreaWidth, rowHeight));
+    }
+
+    if (showLeft || showRight) {
+        ImDrawList* dl = ImGui::GetWindowDrawList();
+        const ImVec2 windowPos = ImGui::GetWindowPos();
+        const float rowTop = windowPos.y + ImGui::GetCursorPosY() - rowHeight - ImGui::GetScrollY();
+        const float centerY = rowTop + rowHeight * 0.5f;
+        const ImU32 color = ImGui::GetColorU32(ImGuiCol_Text);
+        if (showLeft)
+            dl->AddText(g_large_font.first, g_large_font.second, ImVec2(windowPos.x + LayoutScale(6.0f), centerY - g_large_font.second * 0.5f),
+                        color, ICON_FA_CHEVRON_LEFT);
+        if (showRight)
+            dl->AddText(g_large_font.first, g_large_font.second,
+                        ImVec2(windowPos.x + availableWidth - chevronAreaWidth + LayoutScale(6.0f), centerY - g_large_font.second * 0.5f),
+                        color, ICON_FA_CHEVRON_RIGHT);
+    }
+}
+
 // Instance icons come from Qt's IconList (built-in resource icons and
 // user-added image files alike) as QIcon/QImage — outside ImGuiFullscreen's
 // own file-path texture cache, so BigScreen keeps its own, keyed by the
@@ -563,47 +630,45 @@ void DrawLanding(bool& done)
             // each and flow left-to-right via ImGui::SameLine() with no
             // built-in centering — the reference layout (PCSX2's own home
             // screen) has the row centered as a group, not flush against
-            // the left edge, so center it here. Centers within
-            // GetContentRegionAvail() (the real available space in this
-            // now-dynamically-sized column, see BeginFullscreenColumnWindow's
-            // comment above) rather than the fixed LAYOUT_SCREEN_WIDTH
-            // reference — that fixed reference is what caused the row to
-            // run off the right edge at anything above 100% Scale, or on a
-            // real window wider than the 1280 reference.
-            const float rowWidth = LayoutScale(static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH);
-            const float availableWidth = ImGui::GetContentRegionAvail().x;
+            // the left edge, so center it here (vertically directly;
+            // DrawScrollableCardRow below handles horizontal centering,
+            // and — if the row doesn't fit, e.g. at a high Scale setting
+            // or on a narrow window — falling back to a scrollable row
+            // with "more this way" chevrons instead of running off-screen).
+            const float rowWidthLogical = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
             const float availableHeight = ImGui::GetContentRegionAvail().y;
             const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
-            ImGui::SetCursorPos(
-                ImVec2(std::max(0.0f, (availableWidth - rowWidth) * 0.5f), std::max(0.0f, (availableHeight - rowHeight) * 0.5f)));
+            ImGui::SetCursorPosY(std::max(0.0f, (availableHeight - rowHeight) * 0.5f));
 
             // Dispatched by index, not by matching the (now sometimes
             // translated, no longer English-guaranteed) title text.
-            for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
-                const LandingItem& item = items[i];
-                GSTexture* icon = GetCachedTexture(item.icon);
-                const QByteArray titleUtf8 = item.title.toUtf8();
-                if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
-                    switch (i) {
-                        case 0:
-                            SetScreen(Screen::Instances);
-                            break;
-                        case 1:
-                            SetScreen(Screen::Accounts);
-                            break;
-                        case 2:
-                            SetScreen(Screen::Settings);
-                            break;
-                        case 3:
-                            // Same confirmation screen B shows — clicking
-                            // this card used to quit instantly with no
-                            // confirmation at all, inconsistent with B's
-                            // own behavior on the very same screen.
-                            SetScreen(Screen::Quit);
-                            break;
+            DrawScrollableCardRow("landing_row", rowWidthLogical, rowHeight, [&items]() {
+                for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
+                    const LandingItem& item = items[i];
+                    GSTexture* icon = GetCachedTexture(item.icon);
+                    const QByteArray titleUtf8 = item.title.toUtf8();
+                    if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
+                        switch (i) {
+                            case 0:
+                                SetScreen(Screen::Instances);
+                                break;
+                            case 1:
+                                SetScreen(Screen::Accounts);
+                                break;
+                            case 2:
+                                SetScreen(Screen::Settings);
+                                break;
+                            case 3:
+                                // Same confirmation screen B shows — clicking
+                                // this card used to quit instantly with no
+                                // confirmation at all, inconsistent with B's
+                                // own behavior on the very same screen.
+                                SetScreen(Screen::Quit);
+                                break;
+                        }
                     }
                 }
-            }
+            });
             EndNavBar();
         }
         EndFullscreenColumnWindow();
@@ -1817,7 +1882,6 @@ void ShowAddInstanceMenu()
 void DrawInstances()
 {
     InstanceList* instances = APPLICATION->instances();
-    static constexpr int kItemsPerRow = 4;
 
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
@@ -1840,36 +1904,48 @@ void DrawInstances()
             // No explicit "< Back" card here (B already returns to Landing
             // via HandleBackButton()) — matches the reference: PCSX2's own
             // sub-screens rely on the footer's B hint, not a dedicated card.
-            int column = 0;
 
+            // Single horizontally-scrolling row, not a multi-row grid — a
+            // fixed items-per-row grid meant every row after the first
+            // needed vertical scrolling to reach (easy to lose track of
+            // gamepad nav position in), and didn't adapt to how many
+            // actually fit the real window width the way DrawLanding()'s
+            // row now does. DrawScrollableCardRow handles centering when
+            // everything fits and a scrolling view with "more this way"
+            // chevrons when it doesn't — same as Landing, just with
+            // however many instances there actually are instead of a
+            // fixed 4.
             const int count = instances->count();
-            for (int i = 0; i < count; ++i) {
-                MinecraftInstance* inst = instances->at(i);
-                if (!inst)
-                    continue;
+            const float rowWidthLogical = static_cast<float>(count) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            const float availableHeight = ImGui::GetContentRegionAvail().y;
+            const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
+            ImGui::SetCursorPosY(std::max(0.0f, (availableHeight - rowHeight) * 0.5f));
 
-                if (column > 0 && column % kItemsPerRow == 0)
-                    ImGui::NewLine();
-                ++column;
+            DrawScrollableCardRow("instances_row", rowWidthLogical, rowHeight, [&]() {
+                for (int i = 0; i < count; ++i) {
+                    MinecraftInstance* inst = instances->at(i);
+                    if (!inst)
+                        continue;
 
-                GSTexture* icon = GetInstanceIconTexture(inst);
-                if (!icon)
-                    icon = GetCachedTexture("images/icons/instances.png");
+                    GSTexture* icon = GetInstanceIconTexture(inst);
+                    if (!icon)
+                        icon = GetCachedTexture("images/icons/instances.png");
 
-                const QByteArray nameUtf8 = inst->name().toUtf8();
-                const QString summaryStr = inst->isRunning() ? QObject::tr("Running") : QObject::tr("Ready to launch");
-                const QByteArray summaryUtf8 = summaryStr.toUtf8();
+                    const QByteArray nameUtf8 = inst->name().toUtf8();
+                    const QString summaryStr = inst->isRunning() ? QObject::tr("Running") : QObject::tr("Ready to launch");
+                    const QByteArray summaryUtf8 = summaryStr.toUtf8();
 
-                if (HorizontalMenuItem(icon, nameUtf8.constData(), summaryUtf8.constData()))
-                    LaunchInstance(inst);
+                    if (HorizontalMenuItem(icon, nameUtf8.constData(), summaryUtf8.constData()))
+                        LaunchInstance(inst);
 
-                // X opens the actions menu for whichever card currently has
-                // nav focus — IsItemFocused() reports that for the item
-                // HorizontalMenuItem just submitted, same idiom as any
-                // other ImGui widget.
-                if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
-                    ShowInstanceActionsMenu(inst);
-            }
+                    // X opens the actions menu for whichever card currently
+                    // has nav focus — IsItemFocused() reports that for the
+                    // item HorizontalMenuItem just submitted, same idiom as
+                    // any other ImGui widget.
+                    if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+                        ShowInstanceActionsMenu(inst);
+                }
+            });
 
             EndNavBar();
         }
@@ -2026,6 +2102,21 @@ int main(int argc, char** argv)
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
+    }
+
+    // TEMPORARY diagnostic: logs which video driver SDL actually picked and
+    // what else was available, to tell apart "picked the wrong backend
+    // (e.g. fell back to the headless 'offscreen' one because no Wayland/
+    // X11 session was reachable from wherever this was launched)" from "a
+    // real driver was selected but its own EGL/GL init still failed" — the
+    // literal error text alone doesn't distinguish these, and they need
+    // very different fixes (an invocation/environment problem vs. a real
+    // code bug). Remove once the real ARM EGL failure is understood.
+    {
+        SDL_Log("[video-diag] selected driver: %s", SDL_GetCurrentVideoDriver() ? SDL_GetCurrentVideoDriver() : "(none)");
+        const int numDrivers = SDL_GetNumVideoDrivers();
+        for (int i = 0; i < numDrivers; ++i)
+            SDL_Log("[video-diag] available driver %d: %s", i, SDL_GetVideoDriver(i));
     }
 
     SDL_GameController* pad = nullptr;
