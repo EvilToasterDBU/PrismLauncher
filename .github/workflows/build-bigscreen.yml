@@ -109,24 +109,74 @@ jobs:
       # PACKAGE
       ##
 
-      # No installer/AppImage yet (unlike the desktop build's packaging
-      # actions) — just the binary plus what it needs to find at runtime,
-      # laid out the way bigscreen/main.cpp's relocatable-resources lookup
-      # and Application::getJarPath() both expect next to the executable
-      # ("resources/" and "jars/" respectively) so this actually runs
-      # correctly once downloaded to a different machine, e.g. the user's
-      # own Steam Deck/SteamOS hardware — not just on the CI runner it was
-      # built on. jars/ (JavaCheck.jar + NewLaunch(Legacy).jar) is already
-      # guaranteed to exist and be complete: prismlauncher_bigscreen's own
-      # CMake target depends on all three (bigscreen/CMakeLists.txt).
+      # Same trimming the desktop build's own packaging action does before
+      # bundling Qt plugins (.github/actions/package/linux/action.yml) —
+      # none of these are ever used by BigScreen (no QWidget windows, no
+      # printing, no SQL, no in-app help/designer/qml tooling), so there's
+      # no reason to bundle them into the portable package.
+      - name: Cleanup Qt installation on Linux
+        run: |
+          rm -rf "$QT_PLUGIN_PATH"/printsupport
+          rm -rf "$QT_PLUGIN_PATH"/sqldrivers
+          rm -rf "$QT_PLUGIN_PATH"/help
+          rm -rf "$QT_PLUGIN_PATH"/designer
+          rm -rf "$QT_PLUGIN_PATH"/qmltooling
+          rm -rf "$QT_PLUGIN_PATH"/qmlls
+          rm -rf "$QT_PLUGIN_PATH"/qmllint
+          rm -rf "$QT_PLUGIN_PATH"/platformthemes/libqgtk3.so
+
+      # A true "run from anywhere" package, not just a bare binary+assets
+      # tarball (the previous version of this step) — that only worked on
+      # a machine that happened to already have the exact right Qt/SDL2/fmt
+      # shared libraries installed, which the user's own SteamOS/Deck
+      # hardware won't. `sharun lib4bin` is the same tool, and the same
+      # invocation shape, the desktop build's own portable-tarball packaging
+      # already uses (.github/actions/package/linux/action.yml) — it
+      # resolves every shared library prismlauncher_bigscreen and the
+      # bundled Qt plugins need and copies them alongside the binary, so
+      # the result runs standalone without relying on anything from the
+      # host system's package manager. Already available on PATH: the
+      # shared setup-dependencies action installs it (and mkappimage/
+      # AppImageUpdate, unused here) for every Linux job, BigScreen's
+      # included.
+      #
+      # No cmake --install step first (unlike the desktop build) — BigScreen
+      # has no install() rules of its own yet, so the binary is placed into
+      # a bin/ dir by hand before handing it to sharun.
+      #
+      # --hard-links is required, not optional: bigscreen/main.cpp's
+      # relocatable-resources lookup and Application::getJarPath() both
+      # resolve paths relative to the running executable via
+      # /proc/self/exe / QCoreApplication::applicationDirPath() — sharun's
+      # own docs single out --hard-links as specifically what keeps that
+      # resolving to the real "bin/prismlauncher_bigscreen" path (where our
+      # own resources/jars actually get copied to, below) rather than
+      # somewhere inside sharun's internal shared/ tree. --with-hooks packs
+      # the extra runtime-loaded files some of these libraries need beyond
+      # plain link-time dependencies (Qt plugin manifests etc.).
       - name: Package
         run: |
           set -euo pipefail
           stage="PrismLauncherBigScreen-${{ matrix.artifact-name }}"
-          mkdir -p "$stage"
-          cp "build/$BUILD_TYPE/prismlauncher_bigscreen" "$stage/"
-          cp -r bigscreen/resources "$stage/"
-          cp -r build/jars "$stage/"
+          mkdir -p "$stage/bin"
+          cp "build/$BUILD_TYPE/prismlauncher_bigscreen" "$stage/bin/"
+
+          sharun lib4bin \
+            --hard-links \
+            --with-hooks \
+            --dst-dir "$stage" \
+            "$stage"/bin/* "$QT_PLUGIN_PATH"/*/*.so
+
+          # Must land next to the (hard-linked) binary in bin/ — that's
+          # exactly what bigscreen/main.cpp's resource lookup and
+          # Application::getJarPath() search for relative to the running
+          # executable. jars/ (JavaCheck.jar + NewLaunch(Legacy).jar) is
+          # already guaranteed to exist and be complete:
+          # prismlauncher_bigscreen's own CMake target depends on all three
+          # (bigscreen/CMakeLists.txt).
+          cp -r bigscreen/resources "$stage/bin/"
+          cp -r build/jars "$stage/bin/"
+
           tar -czf "$stage.tar.gz" "$stage"
 
       - name: Upload artifact

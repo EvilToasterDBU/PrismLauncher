@@ -2,6 +2,8 @@
 #include "GuiManager.h"
 
 #include "GS/Renderers/Common/GSDevice.h"
+#include "IconsFontAwesome.h"
+#include "IconsPromptFont.h"
 #include "ImGui/ImGuiFullscreen.h"
 #include "common/Console.h"
 #include "common/EmuFolders.h"
@@ -19,24 +21,28 @@ namespace ImGuiFullscreen {
 
 // Declared in ImGuiFullscreen.h, never defined there: PCSX2's real
 // ImGuiManager.cpp supplies these (context-sensitive controller button
-// hints for the choice/file-selector/input-dialog popups). Minimal v1 text
-// until BigScreen has its own glyph-aware footer hints.
+// hints for the choice/file-selector/input-dialog popups). Built from
+// GetGamepadGlyphs() (real controller-button glyphs, matching whatever
+// gamepad DetectGamepadLayout() found in main.cpp) via the same
+// CreateFooterTextString() every other footer hint in bigscreen/main.cpp
+// goes through, rather than plain "A: Select    B: Cancel" text.
 void GetChoiceDialogHelpText(SmallStringBase& dest)
 {
-    dest.clear();
-    dest.append("A: Select    B: Cancel");
+    const GamepadGlyphs glyphs = GetGamepadGlyphs();
+    const std::pair<const char*, std::string_view> items[] = { { glyphs.confirm(false), "Select" }, { glyphs.cancel(false), "Cancel" } };
+    CreateFooterTextString(dest, items);
 }
 
 void GetFileSelectorHelpText(SmallStringBase& dest)
 {
-    dest.clear();
-    dest.append("A: Select    B: Cancel");
+    GetChoiceDialogHelpText(dest);
 }
 
 void GetInputDialogHelpText(SmallStringBase& dest)
 {
-    dest.clear();
-    dest.append("A: OK    B: Cancel");
+    const GamepadGlyphs glyphs = GetGamepadGlyphs();
+    const std::pair<const char*, std::string_view> items[] = { { glyphs.confirm(false), "OK" }, { glyphs.cancel(false), "Cancel" } };
+    CreateFooterTextString(dest, items);
 }
 
 }  // namespace ImGuiFullscreen
@@ -85,6 +91,46 @@ bool LoadFonts(float scale)
     }
     if (!font)
         return false;
+
+    // Merge Font Awesome + PromptFont glyphs directly into the same font
+    // (MergeMode = true bakes them into the same atlas slot range as the
+    // text font already loaded above), so any ICON_FA_*/ICON_PF_* macro
+    // (IconsFontAwesome.h/IconsPromptFont.h) just works inline in an
+    // ordinary ImGui::Text()/MenuButton() string — same technique
+    // real-world Dear ImGui icon-font integrations use, and the same two
+    // fonts PCSX2's own reference UI ships (resources/fonts/{fa-solid-900,
+    // promptfont}) for exactly this purpose (real controller-button glyphs
+    // and menu icons instead of plain-text "[A]"/"<" placeholders — see
+    // thirdparty/THIRDPARTY.md for provenance/licensing).
+    //
+    // Explicit per-font ranges (not the whole font) keep the baked atlas
+    // small: only the codepoints IconsFontAwesome.h/IconsPromptFont.h
+    // actually name are requested, each confirmed to exist in the
+    // respective font file (see those headers' own comments) and to fit
+    // under 0x10000 (BigScreen's Dear ImGui build uses the default 16-bit
+    // ImWchar — IMGUI_USE_WCHAR32 is off).
+    static const ImWchar promptFontRanges[] = {
+        0x2196, 0x2199, 0x21A2, 0x21A7, 0x21CE, 0x21CE, 0x21E0, 0x21E3, 0x21F7, 0x21F8,
+        0x21FA, 0x21FB, 0x21FD, 0x21FE, 0x227E, 0x227F, 0x2284, 0x2284, 0,
+    };
+    static const ImWchar fontAwesomeRanges[] = {
+        0xF00C, 0xF00D, 0xF016, 0xF016, 0xF053, 0xF054, 0xF077, 0xF078, 0xF07B, 0xF07C,
+        0xF0C8, 0xF0C8, 0xF14A, 0xF14A, 0xF2D3, 0xF2D3, 0xF65E, 0xF65E, 0,
+    };
+
+    ImFontConfig iconCfg;
+    iconCfg.MergeMode = true;
+    iconCfg.OversampleH = 2;
+    iconCfg.OversampleV = 2;
+    iconCfg.GlyphMinAdvanceX = 22.0f * scale;  // render icons at a consistent width, like a monospace glyph
+
+    const std::string promptFontPath = Path::Combine(EmuFolders::Resources, "fonts/promptfont.otf");
+    if (!io.Fonts->AddFontFromFileTTF(promptFontPath.c_str(), 22.0f * scale, &iconCfg, promptFontRanges))
+        Console.Error("Failed to load '%s' — gamepad button glyphs will be missing/blank.", promptFontPath.c_str());
+
+    const std::string fontAwesomePath = Path::Combine(EmuFolders::Resources, "fonts/fa-solid-900.ttf");
+    if (!io.Fonts->AddFontFromFileTTF(fontAwesomePath.c_str(), 22.0f * scale, &iconCfg, fontAwesomeRanges))
+        Console.Error("Failed to load '%s' — menu/file icons will be missing/blank.", fontAwesomePath.c_str());
 
     // v1: one loaded font reused for standard/medium/large — good enough
     // for a navigable placeholder UI; a real distinct medium/large face can

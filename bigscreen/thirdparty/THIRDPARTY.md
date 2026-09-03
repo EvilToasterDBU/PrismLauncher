@@ -17,6 +17,33 @@ needed for Russian and most other Cyrillic-script languages), needed for
 BigScreen to render translated UI text once a non-Latin language is
 selected — see `BigScreenGui::LoadFonts()`.
 
+## fa-solid-900.ttf (`resources/fonts/fa-solid-900.ttf`)
+Font Awesome 7 Free Solid (v7.2.0). Copyright (c) 2026 Fonticons, Inc.
+(https://fontawesome.com), Reserved Font Name "Font Awesome". Licensed SIL
+Open Font License, Version 1.1 (the font-file license Font Awesome Free
+ships — separate from the CC-BY-4.0 icons/CC-BY-4.0 SVGs and MIT code that
+also ship in a full Font Awesome Free download, neither of which BigScreen
+uses). File supplied by the user, sourced from their local PCSX2 AppImage
+install (`resources/fonts/fa-solid-900.ttf` there too — PCSX2's own
+reference "Big Picture" UI, the visual target this project is modeled on,
+ships the same file for the same purpose). Provides the menu/file icon
+glyphs in `thirdparty/pcsx2_common/IconsFontAwesome.h` — every codepoint in
+that header was read directly out of this exact file's own cmap (via
+`fontTools`), not guessed or carried over from an unrelated FA version.
+
+## promptfont.otf (`resources/fonts/promptfont.otf`)
+PromptFont v1.0, by Yukari Hafner (Shinmera) —
+https://codeberg.org/shinmera/promptfont (formerly hosted on GitHub).
+Dual-licensed "(OFL-1.1 OR zlib)"; used here under the SIL Open Font
+License, Version 1.1 (matching the license text the shipped file itself
+carries). File supplied by the user, sourced from their local PCSX2
+AppImage install (same file PCSX2's own reference UI ships, for the same
+purpose: real gamepad-button glyphs instead of plain "[A]"/"[B]" text).
+Provides the controller-button/d-pad glyphs in
+`thirdparty/pcsx2_common/IconsPromptFont.h` — every codepoint in that
+header was cross-checked against PromptFont's own official `glyphs.json`
+manifest (fetched from its Codeberg repo), not guessed.
+
 ## stb_image (`thirdparty/stb/stb_image.h`)
 Single header from https://github.com/nothings/stb, public domain / MIT
 (dual-licensed, see the header's own license block).

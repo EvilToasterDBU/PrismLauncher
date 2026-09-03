@@ -34,6 +34,8 @@
 
 #include "GS/Renderers/Common/GSTexture.h"
 #include "ImGui/ImGuiFullscreen.h"
+#include "IconsPromptFont.h"
+#include "Input/InputManager.h"
 #include "gui/GuiManager.h"
 
 #include "Application.h"
@@ -72,6 +74,7 @@
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
+#include <initializer_list>
 #include <span>
 #include <unordered_map>
 
@@ -154,6 +157,19 @@ void SetScreen(Screen screen)
 {
     g_screen = screen;
     QueueResetFocus(FocusResetType::WindowChanged);
+}
+
+// Thin wrapper over ImGuiFullscreen::SetFullscreenFooterText's icon+label
+// span overload — every call site below builds its hint list as a brace-init
+// list of {icon, label} pairs (icons from ImGuiFullscreen::GetGamepadGlyphs(),
+// which auto-selects Xbox/PlayStation/Nintendo/generic glyphs for whatever
+// controller DetectGamepadLayout() found at startup — see main()) rather
+// than the plain-text "A: Foo    B: Bar" strings used before real
+// controller-button glyphs were available (IconsFontAwesome.h/
+// IconsPromptFont.h).
+void SetFooterHints(std::initializer_list<std::pair<const char*, std::string_view>> items)
+{
+    SetFullscreenFooterText(std::span(items.begin(), items.size()));
 }
 
 constexpr float kTopBarHeight = 60.0f;
@@ -475,7 +491,10 @@ void DrawLanding(bool& done)
         { "images/icons/quit.png", StripMnemonic(MW("Close &Window")), "Exit BigScreen and return to the desktop." },
     };
 
-    SetFullscreenFooterText("A: Select    B: Quit");
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Select" }, { glyphs.cancel(false), "Quit" } });
+    }
 
     if (BeginScreen("PrismLauncher BigScreen")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "landing")) {
@@ -547,7 +566,10 @@ void DrawQuit(bool& done)
         { "images/icons/desktop.png", "Switch to Desktop Mode", "Exit BigScreen mode, switch to the desktop interface." },
     };
 
-    SetFullscreenFooterText("A: Select    B: Back");
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Select" }, { glyphs.cancel(false), "Back" } });
+    }
 
     if (BeginScreen("PrismLauncher BigScreen")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "quit")) {
@@ -588,14 +610,17 @@ void DrawAccounts()
 {
     AccountList* accounts = APPLICATION->accounts();
 
-    SetFullscreenFooterText("A: Set default    B: Back");
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Set default" }, { glyphs.cancel(false), "Back" } });
+    }
 
     if (BeginScreen("Accounts")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "accounts")) {
             BeginMenuButtons();
             ResetFocusHere();
 
-            if (MenuButtonWithoutSummary("< Back"))
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back"))
                 SetScreen(Screen::Landing);
 
             if (MenuButtonWithoutSummary("+ Add Microsoft Account")) {
@@ -635,13 +660,13 @@ void DrawAccounts()
 // scans the QR (or opens the URL) with.
 void DrawAccountLogin()
 {
-    SetFullscreenFooterText("B: Cancel");
+    SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Cancel" } });
 
     if (BeginScreen("Sign in with Microsoft")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "account_login")) {
             BeginMenuButtons();
             ResetFocusHere();
-            if (MenuButtonWithoutSummary("< Cancel")) {
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Cancel")) {
                 if (g_loginTask)
                     g_loginTask->abort();
                 ResetLogin();
@@ -1074,8 +1099,19 @@ int g_settingsSubTab = 0;
 
 void DrawSettings()
 {
-    SetFullscreenFooterText(kSettingsTabs[g_settingsTab].subtabCount > 1 ? "A: Toggle / Change    LB/RB: Category    LT/RT: Tab    B: Back"
-                                                                          : "A: Toggle / Change    LB/RB: Category    B: Back");
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        if (kSettingsTabs[g_settingsTab].subtabCount > 1) {
+            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { ICON_PF_XBOX_LT "/" ICON_PF_XBOX_RT, "Tab" },
+                              { glyphs.cancel(false), "Back" } });
+        } else {
+            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { glyphs.cancel(false), "Back" } });
+        }
+    }
 
     const int tabCount = static_cast<int>(std::size(kSettingsTabs));
 
@@ -1416,7 +1452,13 @@ void DrawInstances()
     InstanceList* instances = APPLICATION->instances();
     static constexpr int kItemsPerRow = 4;
 
-    SetFullscreenFooterText("A: Launch    X: Actions    Y: Add Instance    B: Back");
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Launch" },
+                          { glyphs.west, "Actions" },
+                          { glyphs.north, "Add Instance" },
+                          { glyphs.cancel(false), "Back" } });
+    }
 
     // Guards X/Y the same way HandleBackButton() guards B: don't open a
     // second dialog on top of one that's already open (e.g. Y while the X
@@ -1478,13 +1520,13 @@ void DrawConsole()
 {
     const std::string title = g_consoleInstance ? (g_consoleInstance->name().toStdString() + " — Console") : "Console";
 
-    SetFullscreenFooterText("B: Back");
+    SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Back" } });
 
     if (BeginScreen(title.c_str())) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "console")) {
             BeginMenuButtons();
             ResetFocusHere();
-            if (MenuButtonWithoutSummary("< Back"))
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back"))
                 SetScreen(Screen::Instances);
             EndMenuButtons();
 
@@ -1510,6 +1552,38 @@ void DrawConsole()
 }
 
 }  // namespace
+
+// Maps SDL's own controller-type detection onto ImGuiFullscreen's
+// InputLayout so ImGuiFullscreen::GetGamepadGlyphs() (and therefore every
+// footer hint built from it, below) shows the actual button glyphs printed
+// on whatever's plugged in — Xbox-style A/B/X/Y, PlayStation-style
+// Cross/Circle/Square/Triangle, or Nintendo-style — instead of one
+// hardcoded convention. SDL_GameControllerType has more values than
+// InputLayout distinguishes (individual PS3/PS4/PS5 members, etc.); only
+// the family matters here.
+static InputLayout DetectGamepadLayout(SDL_GameController* pad)
+{
+    if (!pad)
+        return InputLayout::Unknown;
+
+    switch (SDL_GameControllerGetType(pad)) {
+        case SDL_CONTROLLER_TYPE_XBOX360:
+        case SDL_CONTROLLER_TYPE_XBOXONE:
+            return InputLayout::Xbox;
+        case SDL_CONTROLLER_TYPE_PS3:
+        case SDL_CONTROLLER_TYPE_PS4:
+        case SDL_CONTROLLER_TYPE_PS5:
+            return InputLayout::PlayStation;
+        case SDL_CONTROLLER_TYPE_NINTENDO_SWITCH_PRO:
+            return InputLayout::Nintendo;
+        default:
+            // Recognized as a gamepad, just not one of the above families
+            // (Steam Deck's own built-in controls report this way) — falls
+            // back to GetGamepadGlyphs()'s position-based generic icons,
+            // same as Unknown.
+            return InputLayout::Generic;
+    }
+}
 
 int main(int argc, char** argv)
 {
@@ -1559,6 +1633,29 @@ int main(int argc, char** argv)
     Q_INIT_RESOURCE(flat_white);
     Q_INIT_RESOURCE(shaders);
 
+    // Must be set before SDL_Init() — both are read once when the joystick
+    // subsystem starts up.
+    //
+    // SDL defaults joystick/gamecontroller event delivery to OFF whenever
+    // the app's window doesn't have SDL's own notion of input focus — a
+    // sensible default for a normal desktop app sharing the screen with
+    // others, but wrong for BigScreen: it's meant to be the sole,
+    // exclusive fullscreen UI (launched via a Steam shortcut, gamescope,
+    // or directly), and gamescope's nested-compositor focus handling is a
+    // known source of SDL never seeing itself as "focused" even while
+    // it's the only thing visible — silently dropping every single
+    // controller event with no error, which looks exactly like "the
+    // gamepad doesn't respond to buttons at all" while keyboard/mouse
+    // (routed differently, through the window system rather than this
+    // focus gate) can still work.
+    SDL_SetHint(SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS, "1");
+    // Steam Deck's (and other SteamOS handhelds') built-in controls need
+    // this HIDAPI driver to show up as a normal SDL_GameController at all;
+    // explicit rather than relying on SDL_HINT_JOYSTICK_HIDAPI's own
+    // default in case a particular SDL2 build ships with it off.
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
+    SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAMDECK, "1");
+
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
@@ -1576,6 +1673,7 @@ int main(int argc, char** argv)
     }
     if (!pad)
         SDL_Log("No gamepad detected — keyboard arrow keys + Enter/Escape also drive ImGui nav.");
+    ImGuiFullscreen::ReportGamepadLayout(DetectGamepadLayout(pad));
 
     const char* glsl_version = "#version 130";
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
