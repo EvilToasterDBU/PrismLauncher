@@ -167,8 +167,8 @@ jobs:
             --dst-dir "$stage" \
             "$stage"/bin/* "$QT_PLUGIN_PATH"/*/*.so
 
-          # Never ship glibc/libstdc++ or the graphics/windowing stack in the
-          # bundle — both are meant to come from the host, not the build
+          # Never ship libstdc++/libgcc_s or the graphics/windowing stack in
+          # the bundle — both are meant to come from the host, not the build
           # machine. lib4bin has no --exclude flag, so this strips them from
           # the staged shared/lib/ after the fact; sharun's own generated
           # --library-path always falls back to /usr/lib:/lib once a bundled
@@ -180,20 +180,12 @@ jobs:
           # Confirmed live (SSH) on real ARM hardware (a rolling-release
           # Arch Linux ARM build, glibc/Mesa newer than this CI runner's)
           # that bundling either family breaks the app on a host newer than
-          # the build machine, in two distinct, reproduced ways:
-          #   - glibc/libstdc++: the *host's own* GPU driver
-          #     (/usr/lib/libgallium-<ver>.so, dlopen'd by the host's own
-          #     Mesa EGL/GLX libraries at run time) needs glibc symbol
-          #     versions (e.g. GLIBC_2.43) newer than this runner's glibc
-          #     provides, and glibc's forward compatibility only runs
-          #     *older*-linked code on a *newer* host, never the reverse —
-          #     so an older bundled libm.so.6 sitting ahead of the host's in
-          #     the search path breaks the host's own newer driver. Symptom
-          #     was "SDL_CreateWindow failed: Could not get EGL display" /
-          #     "Could not find a valid EGL device to initialize", which
-          #     turned out to have nothing to do with EGL itself — the real
-          #     failure was several layers underneath, in the GPU driver's
-          #     own dependency resolution.
+          # the build machine:
+          #   - libstdc++/libgcc_s: nothing exotic here, just an old
+          #     GLIBCXX_x.y.z symbol version — dlopen()'d native libraries
+          #     (e.g. /usr/lib/libopenal.so) built against the host's newer
+          #     libstdc++ failed with "GLIBCXX_3.4.35 not found" against the
+          #     bundle's older one.
           #   - EGL/GL/Wayland stack: these must match the host compositor's
           #     protocol version and the host GPU driver's ABI, which is
           #     exactly why Valve's own Steam Runtime (pressure-vessel)
@@ -203,16 +195,40 @@ jobs:
           #     libEGL_mesa.so.0 fail with "undefined symbol:
           #     wl_fixes_interface" (a Wayland protocol interface added
           #     after this bundle's libwayland-client was built).
-          # Both fixes were verified together on-device: after excluding
-          # both families, the exact same binary/data went from failing at
-          # SDL_CreateWindow every time to opening a real window and
-          # uploading its first texture.
-          rm -f "$stage"/shared/lib/ld-linux-*.so.* \
-                "$stage"/shared/lib/libc.so.6 \
-                "$stage"/shared/lib/libm.so.6 \
-                "$stage"/shared/lib/libpthread.so.0 \
-                "$stage"/shared/lib/libdl.so.2 \
-                "$stage"/shared/lib/librt.so.1 \
+          #
+          # libc.so.6/libpthread/libdl/librt and ld-linux-*.so.* itself are
+          # deliberately *not* in this list, unlike an earlier version of
+          # this fix — sharun's own bundled loader (confirmed by reading its
+          # source) only ever looks for the ELF interpreter *inside* the
+          # bundle, by exact filename, with no host fallback at all:
+          # deleting it here doesn't make anything fall back to the host,
+          # it just makes the whole package fail to start with "Interpreter
+          # not found!" (reproduced live). And the interpreter is not an
+          # ordinary dependency either: ld.so and libc.so.6 share private,
+          # unversioned internal ABI and must come from the exact same
+          # glibc build — confirmed live that pairing this bundle's own
+          # ld.so with the host's newer libc.so.6 (leaving ld.so bundled,
+          # deleting only libc.so.6) segfaults immediately (core dump), so
+          # both must always travel together, and since ld.so can only ever
+          # be the bundled one, libc.so.6/libpthread/libdl/librt stay
+          # bundled too.
+          #
+          # That still leaves the *original* bug this whole exclusion list
+          # exists for — the host's own GPU driver
+          # (/usr/lib/libgallium-<ver>.so, dlopen'd by the host's Mesa EGL
+          # libraries at run time) needing a newer glibc symbol
+          # (GLIBC_2.43) than this runner's glibc provides. Confirmed live
+          # that the fix doesn't need the *whole* glibc family excluded,
+          # just the one file the driver actually complained about:
+          # excluding only libm.so.6 (which resolves to the host's, newer,
+          # copy — itself still compatible with the bundled libc.so.6 it
+          # depends on, since regular GLIBC_x.y symbol versioning, unlike
+          # ld.so/libc.so.6's private ABI, *is* forward-compatible) was
+          # enough on its own to take the exact same binary/data from
+          # "Could not get EGL display" every time to opening a real window
+          # and uploading its first texture, with the bundled ld.so/libc.so.6
+          # pair otherwise completely untouched.
+          rm -f "$stage"/shared/lib/libm.so.6 \
                 "$stage"/shared/lib/libstdc++.so.6 \
                 "$stage"/shared/lib/libgcc_s.so.1 \
                 "$stage"/shared/lib/libwayland-client.so.0 \
