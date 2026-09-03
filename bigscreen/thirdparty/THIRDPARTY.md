@@ -4,6 +4,19 @@
 Git submodule, `docking` branch, upstream https://github.com/ocornut/imgui.
 License: MIT (see `thirdparty/imgui/LICENSE.txt`).
 
+## Roboto-Medium.ttf (`resources/fonts/Roboto-Medium.ttf`)
+Copied from `thirdparty/imgui/misc/fonts/Roboto-Medium.ttf` (Dear ImGui
+bundles it as a sample font) into `resources/` so it loads through the same
+`EmuFolders::Resources`-relative path as every other BigScreen asset,
+independent of the submodule's own internal layout. Google's Roboto,
+licensed Apache License 2.0. Used instead of Dear ImGui's default
+(`ProggyClean`, a tiny fixed-size bitmap font covering only Basic Latin) —
+Roboto is a real scalable TTF with Cyrillic coverage (confirmed via
+`fontTools`: 275/304 codepoints in the Cyrillic Unicode block, everything
+needed for Russian and most other Cyrillic-script languages), needed for
+BigScreen to render translated UI text once a non-Latin language is
+selected — see `BigScreenGui::LoadFonts()`.
+
 ## stb_image (`thirdparty/stb/stb_image.h`)
 Single header from https://github.com/nothings/stb, public domain / MIT
 (dual-licensed, see the header's own license block).

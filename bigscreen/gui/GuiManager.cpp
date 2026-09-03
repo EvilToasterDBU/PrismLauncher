@@ -3,6 +3,9 @@
 
 #include "GS/Renderers/Common/GSDevice.h"
 #include "ImGui/ImGuiFullscreen.h"
+#include "common/Console.h"
+#include "common/EmuFolders.h"
+#include "common/Path.h"
 
 #include "imgui.h"
 
@@ -53,9 +56,33 @@ bool LoadFonts(float scale)
     // LAYOUT_{MEDIUM,LARGE}_FONT_SIZE and ImGuiManager::GetFontSizeStandard()
     // below. This just needs to load one scalable font source; modern Dear
     // ImGui bakes whatever pixel sizes are actually requested on demand.
+    //
+    // Roboto instead of Dear ImGui's default (ProggyClean, a tiny
+    // fixed-size bitmap font, Basic Latin only) — needed once a non-English
+    // language is selected (see TranslationsModel, applied automatically at
+    // Application startup same as the desktop build): without real
+    // Cyrillic/etc. glyphs, translated text would render as boxes/nothing
+    // regardless of the translation itself working correctly. Roboto
+    // covers the Cyrillic block (confirmed via fontTools — see
+    // thirdparty/THIRDPARTY.md); GetGlyphRangesCyrillic() bakes Basic Latin
+    // + Cyrillic glyphs into the atlas up front so both render immediately
+    // without a reload when the language changes.
+    const std::string fontPath = Path::Combine(EmuFolders::Resources, "fonts/Roboto-Medium.ttf");
+    const ImWchar* glyphRanges = io.Fonts->GetGlyphRangesCyrillic();
+
     ImFontConfig cfg;
-    cfg.SizePixels = 22.0f * scale;
-    ImFont* font = io.Fonts->AddFontDefault(&cfg);
+    cfg.OversampleH = 2;
+    cfg.OversampleV = 2;
+    ImFont* font = io.Fonts->AddFontFromFileTTF(fontPath.c_str(), 22.0f * scale, &cfg, glyphRanges);
+    if (!font) {
+        // Fall back to the built-in bitmap font rather than failing to
+        // start at all if the TTF couldn't be read for some reason — no
+        // Cyrillic, but still a usable (English) UI.
+        Console.Error("Failed to load '%s', falling back to the default font (no Cyrillic support)", fontPath.c_str());
+        ImFontConfig fallbackCfg;
+        fallbackCfg.SizePixels = 22.0f * scale;
+        font = io.Fonts->AddFontDefault(&fallbackCfg);
+    }
     if (!font)
         return false;
 

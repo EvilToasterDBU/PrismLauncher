@@ -9,17 +9,32 @@
 #include "tasks/Task.h"
 #include "ui/dialogs/MSALoginDialog.h"
 
+#include <QCoreApplication>
+
 std::function<void(MinecraftInstance*)> BigScreenLaunchController::onShowConsole;
+
+namespace {
+// This class's own tr() would use "BigScreenLaunchController" as the
+// translation context — a brand-new class with no translations of its own.
+// Every string below is copied verbatim from LaunchController.cpp's
+// original prompts (the ones these methods override), which already have
+// real, existing translations under the "LaunchController" context — this
+// looks those up directly instead, so BigScreen picks up the same
+// translations the desktop UI already has for this exact wording.
+QString LC(const char* sourceText)
+{
+    return QCoreApplication::translate("LaunchController", sourceText);
+}
+}  // namespace
 
 bool BigScreenLaunchController::askPlayDemo() const
 {
-    const std::string message = m_accountToUse
-        ? tr("This account does not own Minecraft.\nYou need to purchase the game first to play the full "
-             "version.\n\nDo you want to play the demo?")
-              .toStdString()
-        : tr("No account was selected for launch.\n\nDo you want to play the demo?").toStdString();
-    return BigScreenDialogs::Confirm(tr("Play demo?").toStdString(), message, false, tr("Play Demo").toStdString(),
-                                      tr("Cancel").toStdString());
+    QString message = m_accountToUse
+        ? LC("This account does not own Minecraft.\nYou need to purchase the game first to play the full version.")
+        : LC("No account was selected for launch.");
+    message += LC("\n\nDo you want to play the demo?");
+    return BigScreenDialogs::Confirm(LC("Play demo?").toStdString(), message.toStdString(), false, LC("Play Demo").toStdString(),
+                                      LC("Cancel").toStdString());
 }
 
 QString BigScreenLaunchController::askOfflineName(const QString& playerName, bool* ok)
@@ -27,27 +42,27 @@ QString BigScreenLaunchController::askOfflineName(const QString& playerName, boo
     if (ok != nullptr)
         *ok = false;
 
-    QString title = tr("Player name");
+    QString title = LC("Player name");
     QString message;
     switch (m_actualLaunchMode) {
         case LaunchMode::Normal:
             Q_ASSERT(false);
             return {};
         case LaunchMode::Demo:
-            message = tr("Choose your demo mode player name");
+            message = LC("Choose your demo mode player name");
             break;
         case LaunchMode::Offline:
             if (m_wantedLaunchMode == LaunchMode::Normal) {
                 const auto netErr = m_accountToUse->accountData()->networkError;
                 if (Net::isServerError(netErr)) {
-                    title = tr("Auth servers offline");
-                    message = tr("The Minecraft authentication servers are currently unavailable, launching in offline mode.\n\n");
+                    title = LC("Auth servers offline");
+                    message = LC("The Minecraft authentication servers are currently unavailable, launching in offline mode.\n\n");
                 } else {
-                    title = tr("No internet connection");
-                    message = tr("You are not connected to the Internet, launching in offline mode.\n\n");
+                    title = LC("No internet connection");
+                    message = LC("You are not connected to the Internet, launching in offline mode.\n\n");
                 }
             }
-            message += tr("Choose your offline mode player name");
+            message += LC("Choose your offline mode player name");
             break;
     }
 
@@ -66,9 +81,9 @@ QString BigScreenLaunchController::askOfflineName(const QString& playerName, boo
 
 bool BigScreenLaunchController::reauthenticateAccount(const MinecraftAccountPtr& account, const QString& reason)
 {
-    const bool wantsReauth = BigScreenDialogs::Confirm(tr("Account refresh failed").toStdString(),
-                                                        tr("%1. Do you want to reauthenticate this account?").arg(reason).toStdString(),
-                                                        true);
+    const bool wantsReauth = BigScreenDialogs::Confirm(
+        LC("Account refresh failed").toStdString(), LC("%1. Do you want to reauthenticate this account?").arg(reason).toStdString(),
+        true);
     if (!wantsReauth || account->accountType() != AccountType::MSA)
         return false;
 
@@ -95,10 +110,14 @@ bool BigScreenLaunchController::reauthenticateAccount(const MinecraftAccountPtr&
 
 bool BigScreenLaunchController::confirmKillInstance()
 {
+    // "Kill"/"Cancel" as the button labels (rather than generic Yes/No) are
+    // BigScreen's own choice — the desktop equivalent uses plain
+    // QMessageBox::Yes/No here, so there's no existing translation for
+    // those two specifically to reuse.
     return BigScreenDialogs::Confirm(
-        tr("Kill Minecraft?").toStdString(),
-        tr("This can cause the instance to get corrupted and should only be used if Minecraft is frozen for some reason").toStdString(),
-        false, tr("Kill").toStdString(), tr("Cancel").toStdString());
+        LC("Kill Minecraft?").toStdString(),
+        LC("This can cause the instance to get corrupted and should only be used if Minecraft is frozen for some reason").toStdString(),
+        false, "Kill", "Cancel");
 }
 
 bool BigScreenLaunchController::waitForTask(Task* task)

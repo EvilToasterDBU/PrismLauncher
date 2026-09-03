@@ -56,6 +56,7 @@
 #include "settings/SettingsObject.h"
 
 #include <QColor>
+#include <QCoreApplication>
 #include <QPainter>
 #include <QPixmap>
 #include <QTime>
@@ -72,6 +73,50 @@
 using namespace ImGuiFullscreen;
 
 namespace {
+
+// A plain tr() call in this file would use "main" as its context (this
+// translation unit has no enclosing QObject class), which has no
+// translations of its own. Wherever a BigScreen string is copied verbatim
+// (or near-verbatim — see individual call sites) from an existing desktop
+// widget, this looks it up under THAT widget's own translation context
+// instead, so BigScreen picks up the same translation the desktop UI
+// already has for that wording, rather than always falling back to
+// English. `context` is the class named in the owning .ui file's <class>
+// tag (not necessarily the same as the page's .cpp filename — e.g. Java
+// settings live in JavaSettingsWidget.ui, not JavaPage.ui) or the
+// enclosing C++ class for a plain tr() call. Qt's own '&' mnemonic markers
+// (e.g. "&Launch") are part of the exact source string translations are
+// keyed on, so they're passed through here and stripped separately (see
+// StripMnemonic) — BigScreen has no keyboard-mnemonic underlining to
+// preserve them for.
+QString TR(const char* context, const char* sourceText)
+{
+    return QCoreApplication::translate(context, sourceText);
+}
+
+QString MW(const char* sourceText)
+{
+    return TR("MainWindow", sourceText);
+}
+
+// Removes a Qt '&' mnemonic marker for display — none of the strings this
+// is used on contain a literal "&&", so a plain removal is sufficient.
+QString StripMnemonic(QString text)
+{
+    return text.remove(QChar('&'));
+}
+
+// Cosmetic-only, applied *after* TR()/MW() resolve: several desktop labels
+// this reuses are trailing-colon field labels (e.g. "Username:") from a
+// form layout BigScreen doesn't have (title + separate summary line
+// instead) — stripping the colon here doesn't touch the source text TR()
+// looks up, so it doesn't affect whether the lookup succeeds.
+QString TrimTrailingColon(QString text)
+{
+    if (text.endsWith(QChar(':')))
+        text.chop(1);
+    return text;
+}
 
 enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings };
 
@@ -525,11 +570,13 @@ void DrawAccountLogin()
 // only when the widget reports a change. invert flips both directions, for
 // keys that are phrased negatively (e.g. "...Disabled") but read more
 // naturally as a positive toggle in a menu ("Enable ...").
-void DrawToggleSetting(const char* key, const char* title, const char* summary, bool invert = false)
+void DrawToggleSetting(const char* key, const QString& title, const QString& summary, bool invert = false)
 {
     SettingsObject* settings = APPLICATION->settings();
     bool value = settings->get(key).toBool() != invert;
-    if (ToggleButton(title, summary, &value))
+    const QByteArray titleUtf8 = title.toUtf8();
+    const QByteArray summaryUtf8 = summary.toUtf8();
+    if (ToggleButton(titleUtf8.constData(), summaryUtf8.constData(), &value))
         settings->set(key, value != invert);
 }
 
@@ -538,14 +585,16 @@ void DrawToggleSetting(const char* key, const char* title, const char* summary, 
 // uses for its MB presets. The actual blocking Choose() call is deferred to
 // the top of the next frame via g_pendingAction (see its comment) — this
 // function itself only ever runs mid-frame.
-void DrawChoiceSetting(const char* key, const char* title, const char* summary, const std::vector<std::string>& options)
+void DrawChoiceSetting(const char* key, const QString& title, const QString& summary, const std::vector<std::string>& options)
 {
     SettingsObject* settings = APPLICATION->settings();
     const QString current = settings->get(key).toString();
     const std::string valueStr = current.isEmpty() ? std::string("(default)") : current.toStdString();
 
-    if (MenuButtonWithValue(title, summary, valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = std::string(title), options]() {
+    const QByteArray titleUtf8 = title.toUtf8();
+    const QByteArray summaryUtf8 = summary.toUtf8();
+    if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
+        g_pendingAction = [key = std::string(key), title = title.toStdString(), options]() {
             const auto choice = BigScreenDialogs::Choose(title, options);
             if (choice && *choice >= 0 && *choice < static_cast<int>(options.size()))
                 APPLICATION->settings()->set(QString::fromStdString(key), QString::fromStdString(options[*choice]));
@@ -558,7 +607,7 @@ void DrawChoiceSetting(const char* key, const char* title, const char* summary, 
 // picker: current value shown on the button, tap opens a choice dialog
 // (BigScreenDialogs::Choose, same deferred pattern as DrawChoiceSetting
 // above) listing fixed MB steps.
-void DrawMemorySetting(const char* key, const char* title, const char* summary)
+void DrawMemorySetting(const char* key, const QString& title, const QString& summary)
 {
     static const int kPresetsMb[] = { 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240, 12288 };
 
@@ -566,8 +615,10 @@ void DrawMemorySetting(const char* key, const char* title, const char* summary)
     const int currentMb = settings->get(key).toInt();
     const std::string valueStr = std::to_string(currentMb) + " MB";
 
-    if (MenuButtonWithValue(title, summary, valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = std::string(title)]() {
+    const QByteArray titleUtf8 = title.toUtf8();
+    const QByteArray summaryUtf8 = summary.toUtf8();
+    if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
+        g_pendingAction = [key = std::string(key), title = title.toStdString()]() {
             std::vector<std::string> labels;
             for (const int mb : kPresetsMb)
                 labels.push_back(std::to_string(mb) + " MB");
@@ -591,7 +642,7 @@ void DrawMemorySetting(const char* key, const char* title, const char* summary)
 // wraps) already gets a controller-usable on-screen keyboard for free on
 // those platforms; this just needed confirming, not building. Unverified on
 // real Steam Deck hardware — no way to test that from here.
-void DrawTextSetting(const char* key, const char* title, const char* summary)
+void DrawTextSetting(const char* key, const QString& title, const QString& summary)
 {
     SettingsObject* settings = APPLICATION->settings();
     const QString current = settings->get(key).toString();
@@ -600,8 +651,10 @@ void DrawTextSetting(const char* key, const char* title, const char* summary)
     // See DrawChoiceSetting above — InputString() blocks by pumping frames,
     // so it can't be called from here (mid-frame); deferred via
     // g_pendingAction to run outside any frame instead.
-    if (MenuButtonWithValue(title, summary, valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = std::string(title), summary = std::string(summary),
+    const QByteArray titleUtf8 = title.toUtf8();
+    const QByteArray summaryUtf8 = summary.toUtf8();
+    if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
+        g_pendingAction = [key = std::string(key), title = title.toStdString(), summary = summary.toStdString(),
                             currentStr = current.toStdString()]() {
             const auto result = BigScreenDialogs::InputString(title, summary, currentStr);
             if (result)
@@ -612,13 +665,40 @@ void DrawTextSetting(const char* key, const char* title, const char* summary)
 
 // One draw function per sub-tab — each just a handful of items, unlike the
 // old single scrolling wall of ~17 rows.
+// Every DrawSettings* function below passes TR()/MW()-resolved desktop
+// wording as title/description wherever a good match exists in the
+// mapping researched against launcher/ui/pages/**/*.ui and their widgets
+// (context = the class named in that .ui's <class> tag, e.g. Java settings
+// live in JavaSettingsWidget.ui so their context is "JavaSettingsWidget",
+// not "JavaPage" — MinecraftPage/AppearancePage are themselves just thin
+// subclasses of MinecraftSettingsWidget/AppearanceWidget with no .ui of
+// their own). Only one is truly byte-for-byte verbatim to begin with
+// (MaxMemAlloc's description) — everywhere else, BigScreen's own English
+// wording was adjusted here to *match* the desktop's exact source text,
+// specifically so this lookup succeeds instead of silently falling back to
+// English. Rich-text (HTML) desktop tooltips are deliberately NOT reused
+// for descriptions (ImGui would render the literal "<html>..." tags as
+// text) — those keep a plain-text BigScreen-authored description instead,
+// noted inline. Settings with no reasonable desktop match at all
+// (ProxyAddr/Port, JvmArgs's description, Language, Rename's dialog, ...)
+// keep their original BigScreen-only text, which has no existing
+// translation to pick up regardless of context.
 void DrawSettingsGeneral()
 {
-    DrawToggleSetting("ModMetadataDisabled", "Enable Mod Metadata", "Fetch and store metadata (mod platform info) for installed mods.", true);
-    DrawToggleSetting("ModDependenciesDisabled", "Enable Mod Dependencies", "Automatically resolve and install mod dependencies.", true);
-    DrawToggleSetting("ShowModIncompat", "Warn About Incompatible Mods", "Show a warning when a mod may be incompatible with the instance.");
-    DrawToggleSetting("DownloadsDirWatchRecursive", "Watch Downloads Folder Recursively", "Also watch subfolders of the downloads directory for new mod files.");
-    DrawToggleSetting("MoveModsFromDownloadsDir", "Move Mods From Downloads", "Move (instead of copy) mod files found in the downloads directory.");
+    DrawToggleSetting("ModMetadataDisabled", TR("LauncherPage", "Keep track of mod metadata"),
+                       TR("LauncherPage", "Store version information provided by mod providers (like Modrinth or CurseForge) for mods."),
+                       true);
+    DrawToggleSetting("ModDependenciesDisabled", TR("LauncherPage", "Install dependencies automatically"),
+                       TR("LauncherPage", "Automatically detect, install, and update mod dependencies."), true);
+    DrawToggleSetting("ShowModIncompat", TR("LauncherPage", "Detect and show mod incompatibilities (experimental)"),
+                       TR("LauncherPage",
+                          "Currently this just shows mods which are not marked as compatible with the current Minecraft version."));
+    DrawToggleSetting(
+        "DownloadsDirWatchRecursive", StripMnemonic(TR("LauncherPage", "Check &subfolders for blocked mods")),
+        TR("LauncherPage", "When enabled, in addition to the downloads folder, its sub folders will also be searched when looking for "
+                            "resources (e.g. when looking for blocked mods on CurseForge)."));
+    DrawToggleSetting("MoveModsFromDownloadsDir", TR("LauncherPage", "Move blocked mods instead of copying them"),
+                       TR("LauncherPage", "When enabled, it will move blocked resources instead of copying them."));
 }
 
 void DrawSettingsAppearance()
@@ -626,102 +706,162 @@ void DrawSettingsAppearance()
     // Affects the normal Qt Widgets desktop UI's look, not BigScreen's own
     // rendering (which always uses its own fixed dark ImGuiFullscreen theme)
     // — still a real setting worth exposing for anyone who switches back
-    // and forth between the two front-ends.
-    DrawChoiceSetting("ApplicationTheme", "Desktop Theme", "Color theme used by the normal (non-BigScreen) launcher window.",
-                       { "system", "dark", "bright" });
-    DrawToggleSetting("EnableCat", "Enable the Cat", "Show the launcher's cat easter egg (desktop UI only).");
+    // and forth between the two front-ends. AppearanceWidget's own "Theme:"
+    // label has no matching description text, so the summary stays
+    // BigScreen's own.
+    DrawChoiceSetting("ApplicationTheme", TrimTrailingColon(TR("AppearanceWidget", "Theme:")),
+                       "Color theme used by the normal (non-BigScreen) launcher window.", { "system", "dark", "bright" });
+    DrawToggleSetting("EnableCat", TR("AppearanceWidget", "Enable cat"),
+                       "Show the launcher's cat easter egg (desktop UI only).");
 }
 
 void DrawSettingsWindow()
 {
-    DrawToggleSetting("LaunchMaximized", "Launch Maximized", "Start Minecraft's window maximized.");
+    DrawToggleSetting("LaunchMaximized", TR("MinecraftSettingsWidget", "Start Minecraft maximized"),
+                       "Start Minecraft's window maximized.");
 }
 
 void DrawSettingsConsole()
 {
-    DrawToggleSetting("ShowConsole", "Show Console On Launch", "Open the console window automatically when an instance launches.");
-    DrawToggleSetting("ShowConsoleOnError", "Show Console On Error", "Open the console window automatically if an instance crashes.");
-    DrawToggleSetting("AutoCloseConsole", "Auto-Close Console", "Close the console window automatically when the game exits successfully.");
-    DrawToggleSetting("ConsoleOverflowStop", "Stop Logging On Overflow", "Stop appending new lines once the console's line limit is reached.");
+    DrawToggleSetting("ShowConsole", TR("MinecraftSettingsWidget", "When the game is launched, show the console window"),
+                       "Open the console window automatically when an instance launches.");
+    DrawToggleSetting("ShowConsoleOnError", TR("MinecraftSettingsWidget", "When the game crashes, show the console window"),
+                       "Open the console window automatically if an instance crashes.");
+    DrawToggleSetting("AutoCloseConsole", TR("MinecraftSettingsWidget", "When the game quits, hide the console window"),
+                       "Close the console window automatically when the game exits successfully.");
+    DrawToggleSetting("ConsoleOverflowStop", StripMnemonic(TR("LauncherPage", "&Stop logging when log overflows")),
+                       "Stop appending new lines once the console's line limit is reached.");
 }
 
 void DrawSettingsInstances()
 {
-    DrawToggleSetting("SkipModpackUpdatePrompt", "Skip Modpack Update Prompt", "Don't ask before updating a modpack-managed instance.");
-    DrawToggleSetting("DownloadGameFilesDuringInstanceCreation", "Predownload Game Files",
-                       "Download game files while creating a new instance instead of on first launch.");
+    // Desktop's checkbox is the inverted phrasing of this key (checked =
+    // "suggest update" = SkipModpackUpdatePrompt *false*) — same pattern as
+    // ModMetadataDisabled/ModDependenciesDisabled above, hence invert=true.
+    DrawToggleSetting("SkipModpackUpdatePrompt",
+                       TR("LauncherPage", "Suggest to update an existing instance during modpack installation"),
+                       TR("LauncherPage", "When creating a new modpack instance, suggest updating an existing instance instead."), true);
+    DrawToggleSetting(
+        "DownloadGameFilesDuringInstanceCreation", TR("LauncherPage", "Download game files during instance creation"),
+        TR("LauncherPage", "Downloads required game files while creating the instance. Disable this to skip the initial download and "
+                            "fetch files when the instance is launched instead."));
 }
 
 void DrawSettingsMemory()
 {
-    DrawMemorySetting("MinMemAlloc", "Minimum Memory Allocation", "The minimum amount of memory Minecraft is allowed to use.");
-    DrawMemorySetting("MaxMemAlloc", "Maximum Memory Allocation", "The maximum amount of memory Minecraft is allowed to use.");
+    // Titles use "Usage" (desktop's own wording) instead of "Allocation";
+    // MinMemAlloc's description also switches to the desktop's shorter
+    // wording so it picks up the existing translation — MaxMemAlloc's was
+    // already byte-for-byte identical to begin with.
+    DrawMemorySetting("MinMemAlloc", TrimTrailingColon(StripMnemonic(TR("JavaSettingsWidget", "M&inimum Memory Usage:"))),
+                       TR("JavaSettingsWidget", "The amount of memory Minecraft is started with."));
+    DrawMemorySetting("MaxMemAlloc", TrimTrailingColon(StripMnemonic(TR("JavaSettingsWidget", "Ma&ximum Memory Usage:"))),
+                       TR("JavaSettingsWidget", "The maximum amount of memory Minecraft is allowed to use."));
 }
 
 void DrawSettingsJavaAdvanced()
 {
-    DrawToggleSetting("AutomaticJavaDownload", "Automatic Java Download", "Automatically download a compatible Java version if needed.");
-    DrawToggleSetting("IgnoreJavaCompatibility", "Ignore Java Compatibility Warnings",
-                       "Allow launching with a Java version PrismLauncher considers incompatible.");
-    DrawTextSetting("JvmArgs", "Extra JVM Arguments", "Additional arguments passed to the Java virtual machine.");
+    DrawToggleSetting("AutomaticJavaDownload", StripMnemonic(TR("JavaSettingsWidget", "Auto-download &Mojang Java")),
+                       TR("JavaSettingsWidget", "Automatically downloads and selects the Java build recommended by Mojang."));
+    DrawToggleSetting("IgnoreJavaCompatibility", TR("JavaSettingsWidget", "Skip Java compatibility checks"),
+                       TR("JavaSettingsWidget",
+                          "If enabled, the launcher will not check if an instance is compatible with the selected Java version."));
+    // "Java Arguments" is a QGroupBox title on the desktop side (the
+    // actual text field has no label/description of its own), so only the
+    // title is reused here.
+    DrawTextSetting("JvmArgs", StripMnemonic(TR("JavaSettingsWidget", "Java Argumen&ts")),
+                     "Additional arguments passed to the Java virtual machine.");
 }
 
 void DrawSettingsPerformance()
 {
-    DrawToggleSetting("EnableFeralGamemode", "Feral GameMode", "Request performance optimizations from GameMode while playing (Linux only).");
-    DrawToggleSetting("EnableMangoHud", "MangoHud Overlay", "Show the MangoHud performance overlay while playing.");
-    DrawToggleSetting("UseDiscreteGpu", "Prefer Discrete GPU", "Hint the system to use the discrete GPU, if there is one.");
-    DrawToggleSetting("UseZink", "Force Zink Renderer", "Force the Zink OpenGL-over-Vulkan renderer.");
+    // These three have HTML-rich-text tooltips on the desktop side (e.g.
+    // "<html><body><p>Enable Feral Interactive's GameMode...</p></body>
+    // </html>") — reused for the title only; descriptions stay BigScreen's
+    // own plain text rather than leaking raw HTML tags into the ImGui UI.
+    DrawToggleSetting("EnableFeralGamemode", TR("MinecraftSettingsWidget", "Enable Feral GameMode"),
+                       "Request performance optimizations from GameMode while playing (Linux only).");
+    DrawToggleSetting("EnableMangoHud", TR("MinecraftSettingsWidget", "Enable MangoHud"),
+                       "Show the MangoHud performance overlay while playing.");
+    DrawToggleSetting("UseDiscreteGpu", TR("MinecraftSettingsWidget", "Use discrete GPU"),
+                       "Hint the system to use the discrete GPU, if there is one.");
+    // UseZink's tooltip is plain text (unlike the three above), so both
+    // title and description are reused.
+    DrawToggleSetting("UseZink", TR("MinecraftSettingsWidget", "Use Zink"),
+                       TR("MinecraftSettingsWidget",
+                          "Use Zink, a Mesa OpenGL driver that implements OpenGL on top of Vulkan. Performance may vary depending on the "
+                          "situation. Note: If no suitable Vulkan driver is found, software rendering will be used."));
 }
 
 void DrawSettingsCommands()
 {
-    DrawTextSetting("WrapperCommand", "Wrapper Command", "Command to wrap the Minecraft launch with (e.g. gamemoderun, mangohud).");
-    DrawTextSetting("PreLaunchCommand", "Pre-Launch Command", "Command to run before Minecraft starts.");
-    DrawTextSetting("PostExitCommand", "Post-Exit Command", "Command to run after Minecraft exits.");
+    DrawTextSetting("WrapperCommand", StripMnemonic(TR("CustomCommands", "&Wrapper Command")),
+                     "Command to wrap the Minecraft launch with (e.g. gamemoderun, mangohud).");
+    DrawTextSetting("PreLaunchCommand", StripMnemonic(TR("CustomCommands", "&Pre-launch Command")),
+                     "Command to run before Minecraft starts.");
+    DrawTextSetting("PostExitCommand", StripMnemonic(TR("CustomCommands", "P&ost-exit Command")),
+                     "Command to run after Minecraft exits.");
 }
 
 void DrawSettingsProxy()
 {
-    DrawChoiceSetting("ProxyType", "Proxy Type", "Type of proxy to route network requests through.", { "Default", "None", "SOCKS5", "HTTP" });
+    DrawChoiceSetting("ProxyType", TR("ProxyPage", "Type"), "Type of proxy to route network requests through.",
+                       { "Default", "None", "SOCKS5", "HTTP" });
     DrawTextSetting("ProxyAddr", "Proxy Address", "Hostname or IP address of the proxy server.");
     DrawTextSetting("ProxyPort", "Proxy Port", "Port number of the proxy server.");
-    DrawTextSetting("ProxyUser", "Proxy Username", "Username for proxy authentication, if required.");
-    DrawTextSetting("ProxyPass", "Proxy Password", "Password for proxy authentication, if required.");
+    DrawTextSetting("ProxyUser", TrimTrailingColon(StripMnemonic(TR("ProxyPage", "&Username:"))),
+                     "Username for proxy authentication, if required.");
+    DrawTextSetting("ProxyPass", TrimTrailingColon(StripMnemonic(TR("ProxyPage", "&Password:"))),
+                     "Password for proxy authentication, if required.");
 }
 
 void DrawSettingsLanguage()
 {
     // The desktop Language page builds its list dynamically from whatever
-    // translation files TranslationsModel finds at runtime; duplicating
-    // that discovery here for a picker isn't worth it yet, so this is a
-    // fixed list of the more common ones. Empty string (shown as "System")
-    // is PrismLauncher's own default meaning "follow the system locale".
+    // translation files TranslationsModel finds at runtime, and has no
+    // static "Language" label to reuse at all (LanguageSelectionWidget is
+    // the whole page — confirmed no matching source string exists);
+    // duplicating that discovery here for a picker isn't worth it yet, so
+    // this stays a fixed list of the more common ones, entirely
+    // BigScreen's own text. Empty string (shown as "System") is
+    // PrismLauncher's own default meaning "follow the system locale".
     DrawChoiceSetting("Language", "Language", "Language used throughout the launcher.",
                        { "en_US", "ru_RU", "de_DE", "fr_FR", "es_ES", "zh_CN", "ja_JP", "pt_BR" });
 }
 
 void DrawSettingsServicesBehavior()
 {
-    DrawToggleSetting("FallbackMRBlockedMods", "Fall Back For Blocked Mods",
+    DrawToggleSetting("FallbackMRBlockedMods", TR("APIPage", "Enable fallback to Modrinth for blocked mods"),
                        "Try downloading a mod from Modrinth if a CurseForge download is blocked.");
-    DrawToggleSetting("MetaRefreshOnLaunch", "Refresh Metadata On Launch", "Check for updated version metadata every time an instance launches.");
+    DrawToggleSetting("MetaRefreshOnLaunch", TR("APIPage", "Refresh on launch"),
+                       "Check for updated version metadata every time an instance launches.");
 }
 
 void DrawSettingsServicesApiKeys()
 {
-    DrawTextSetting("ModrinthToken", "Modrinth API Token", "Personal access token for the Modrinth API.");
-    DrawTextSetting("FlameKeyOverride", "CurseForge API Key", "Override for the CurseForge (Flame) API key.");
-    DrawTextSetting("TechnicClientID", "Technic Client ID", "Client ID used for Technic platform API requests.");
-    DrawTextSetting("PastebinCustomAPIBase", "Custom Pastebin API URL", "Base URL for a self-hosted or alternate Pastebin-compatible service.");
+    // These are generic section labels on the desktop side ("Modrinth",
+    // "CurseForge", ...) rather than "X API Token" — kept alongside
+    // BigScreen's own fuller description, which does the disambiguating.
+    DrawTextSetting("ModrinthToken", StripMnemonic(TR("APIPage", "Mod&rinth")),
+                     "Personal access token for the Modrinth API.");
+    DrawTextSetting("FlameKeyOverride", StripMnemonic(TR("APIPage", "&CurseForge")),
+                     "Override for the CurseForge (Flame) API key.");
+    DrawTextSetting("TechnicClientID", StripMnemonic(TR("APIPage", "&Technic")),
+                     "Client ID used for Technic platform API requests.");
+    DrawTextSetting("PastebinCustomAPIBase", StripMnemonic(TR("APIPage", "Base &URL")),
+                     "Base URL for a self-hosted or alternate Pastebin-compatible service.");
 }
 
 void DrawSettingsTools()
 {
-    DrawTextSetting("JProfilerPath", "JProfiler Path", "Path to the JProfiler executable, for the JProfiler launch profiler.");
-    DrawTextSetting("JVisualVMPath", "JVisualVM Path", "Path to the JVisualVM executable, for the JVisualVM launch profiler.");
-    DrawTextSetting("MCEditPath", "MCEdit Path", "Path to the MCEdit executable, for editing worlds.");
-    DrawTextSetting("JsonEditor", "JSON Editor Path", "Path to an external editor used for editing JSON files.");
+    DrawTextSetting("JProfilerPath", StripMnemonic(TR("ExternalToolsPage", "J&Profiler")),
+                     "Path to the JProfiler executable, for the JProfiler launch profiler.");
+    DrawTextSetting("JVisualVMPath", StripMnemonic(TR("ExternalToolsPage", "&VisualVM")),
+                     "Path to the JVisualVM executable, for the JVisualVM launch profiler.");
+    DrawTextSetting("MCEditPath", StripMnemonic(TR("ExternalToolsPage", "&MCEdit")),
+                     "Path to the MCEdit executable, for editing worlds.");
+    DrawTextSetting("JsonEditor", StripMnemonic(TR("ExternalToolsPage", "&Text Editor")),
+                     TR("ExternalToolsPage", "Used to edit component JSON files."));
 }
 
 struct SettingsSubTab {
@@ -927,18 +1067,27 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
     };
     auto actions = std::make_shared<std::vector<Action>>();
 
+    // Labels below use MW() with MainWindow.ui's exact action text
+    // (including its '&' mnemonic, stripped for display by StripMnemonic)
+    // where one exists, so the menu item picks up the same translation the
+    // desktop's own right-click menu already has for it.
     if (inst->isRunning()) {
+        // No desktop equivalent for this one (opening BigScreen's own
+        // Console screen isn't a concept the desktop UI has).
         actions->push_back({ "Open Console", [inst]() {
                                  g_consoleInstance = inst;
                                  SetScreen(Screen::Console);
                              } });
-        actions->push_back({ "Kill", [inst]() {
+        actions->push_back({ StripMnemonic(MW("&Kill")).toStdString(), [inst]() {
                                  g_pendingAction = [inst]() { APPLICATION->kill(inst); };
                              } });
     } else if (inst->canLaunch()) {
-        actions->push_back({ "Launch", [inst]() { LaunchInstance(inst); } });
+        actions->push_back({ StripMnemonic(MW("&Launch")).toStdString(), [inst]() { LaunchInstance(inst); } });
     }
 
+    // "Rename" here has no desktop dialog to match (the desktop version
+    // edits the name inline in the instance list instead of via a popup),
+    // so this text stays BigScreen's own.
     actions->push_back({ "Rename", [inst]() {
                              g_pendingAction = [inst]() {
                                  const auto result =
@@ -947,23 +1096,35 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
                                      inst->setName(*result);
                              };
                          } });
-    actions->push_back({ "Change Group", [inst]() {
+    actions->push_back({ StripMnemonic(MW("&Change Group...")).toStdString(), [inst]() {
                              g_pendingAction = [inst]() {
                                  const QString currentGroup = APPLICATION->instances()->getInstanceGroup(inst->id());
-                                 const auto result = BigScreenDialogs::InputString("Change Group", "Enter a group name (blank for none)",
+                                 const auto result = BigScreenDialogs::InputString(MW("Group name").toStdString(),
+                                                                                    MW("Enter a new group name.").toStdString(),
                                                                                     currentGroup.toStdString());
                                  if (result)
                                      APPLICATION->instances()->setInstanceGroup(inst->id(), result->simplified());
                              };
                          } });
-    actions->push_back({ "View Instance Folder", [inst]() { DesktopServices::openPath(inst->instanceRoot()); } });
+    actions->push_back({ StripMnemonic(MW("&Folder")).toStdString(), [inst]() { DesktopServices::openPath(inst->instanceRoot()); } });
 
     if (!inst->isRunning()) {
-        actions->push_back({ "Delete", [inst]() {
+        actions->push_back({ StripMnemonic(MW("Dele&te")).toStdString(), [inst]() {
                                  g_pendingAction = [inst]() {
-                                     const std::string message =
-                                         "Permanently delete \"" + inst->name().toStdString() + "\"?\nThis cannot be undone.";
-                                     if (!BigScreenDialogs::Confirm("Delete Instance", message, false, "Delete", "Cancel"))
+                                     // Matches MainWindow::on_actionDeleteInstance_triggered()'s
+                                     // confirmation text exactly (%2 is its
+                                     // "and its N registered shortcut(s)"
+                                     // clause — always empty here, since
+                                     // BigScreen doesn't have a shortcuts
+                                     // concept), so it picks up the same
+                                     // translation.
+                                     const QString message =
+                                         MW("You are about to delete \"%1\"%2.\n"
+                                            "This may be permanent and will completely delete the instance.\n\n"
+                                            "Are you sure?")
+                                             .arg(inst->name(), QString());
+                                     if (!BigScreenDialogs::Confirm(MW("Confirm Deletion").toStdString(), message.toStdString(), false,
+                                                                     "Delete", "Cancel"))
                                          return;
                                      const QString id = inst->id();
                                      if (!APPLICATION->instances()->trashInstance(id))
@@ -994,13 +1155,18 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
 // larger) browsing UIs, deferred like the rest of M5.
 void StartVanillaInstanceCreation()
 {
+    // "Add Instanc&e..." is actionAddInstance's exact text in MainWindow.ui
+    // — reused (mnemonic stripped) as the title for every dialog this whole
+    // flow shows, so they all pick up the same existing translation.
+    const std::string dialogTitle = StripMnemonic(MW("Add Instanc&e...")).toStdString();
+
     Meta::VersionList::Ptr versionList = APPLICATION->metadataIndex()->get("net.minecraft");
     if (!versionList->isLoaded()) {
         Task::Ptr loadTask = versionList->getLoadTask();
         loadTask->start();
         BigScreenDialogs::WaitForTask(loadTask.get());
         if (!versionList->isLoaded()) {
-            BigScreenDialogs::Confirm("Add Instance", "Failed to load the Minecraft version list. Check your internet connection.", false,
+            BigScreenDialogs::Confirm(dialogTitle, "Failed to load the Minecraft version list. Check your internet connection.", false,
                                        "OK", "OK");
             return;
         }
@@ -1038,7 +1204,7 @@ void StartVanillaInstanceCreation()
         versionLoadTask->start();
         BigScreenDialogs::WaitForTask(versionLoadTask.get());
         if (!chosenVersion->isLoaded()) {
-            BigScreenDialogs::Confirm("Add Instance", "Failed to load version " + chosenVersion->descriptor().toStdString() + ".", false,
+            BigScreenDialogs::Confirm(dialogTitle, "Failed to load version " + chosenVersion->descriptor().toStdString() + ".", false,
                                        "OK", "OK");
             return;
         }
@@ -1057,7 +1223,7 @@ void StartVanillaInstanceCreation()
     BigScreenDialogs::WaitForTask(task.get());
 
     if (!task->wasSuccessful())
-        BigScreenDialogs::Confirm("Add Instance", "Failed to create instance: " + task->failReason().toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to create instance: " + task->failReason().toStdString(), false, "OK", "OK");
 }
 
 // Y on the Instances screen opens this. Only one real creation method is
@@ -1070,10 +1236,11 @@ void ShowAddInstanceMenu()
     ChoiceDialogOptions options;
     options.emplace_back("Vanilla Minecraft", false);
 
-    OpenChoiceDialog("Add Instance", false, std::move(options), [](s32 index, const std::string&, bool) {
-        if (index == 0)
-            g_pendingAction = StartVanillaInstanceCreation;
-    });
+    OpenChoiceDialog(StripMnemonic(MW("Add Instanc&e...")).toStdString(), false, std::move(options),
+                      [](s32 index, const std::string&, bool) {
+                          if (index == 0)
+                              g_pendingAction = StartVanillaInstanceCreation;
+                      });
 }
 
 void DrawInstances()
@@ -1308,6 +1475,24 @@ int main(int argc, char** argv)
             }
             SDL_Log("[autolaunch] launching %s", qUtf8Printable(id));
             APPLICATION->launch(inst, LaunchMode::Normal, nullptr, nullptr, QString(), &BigScreenLaunchController::create);
+        });
+    }
+
+    // TEMPORARY diagnostic: BIGSCREEN_TEST_SCREEN=<landing|instances|
+    // accounts|settings> jumps straight to that screen shortly after
+    // startup, without needing input to navigate there — for visually
+    // checking font/translation rendering via a screenshot. Remove once
+    // that's confirmed.
+    if (const char* screenName = std::getenv("BIGSCREEN_TEST_SCREEN")) {
+        const std::string name = screenName;
+        QTimer::singleShot(1500, &app, [name]() {
+            if (name == "instances")
+                SetScreen(Screen::Instances);
+            else if (name == "accounts")
+                SetScreen(Screen::Accounts);
+            else if (name == "settings")
+                SetScreen(Screen::Settings);
+            SDL_Log("[test-screen] jumped to %s", name.c_str());
         });
     }
 
