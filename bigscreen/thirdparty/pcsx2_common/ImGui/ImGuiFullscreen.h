@@ -302,7 +302,12 @@ namespace ImGuiFullscreen
 	{
 		None,
 		Numeric,
-		IPAddress
+		IPAddress,
+		// BigScreen note: added locally (not in PCSX2's original) — masks
+		// the InputText field with ImGuiInputTextFlags_Password rather than
+		// filtering characters, for password-like fields (e.g. Settings'
+		// proxy password). See DrawInputDialog()'s flags setup.
+		Password
 	};
 
 	void OpenInputStringDialog(

@@ -74,10 +74,13 @@ struct BlockingGuard {
 };
 
 // Returns the entered text, or nullopt if cancelled/closed without input.
+// isPassword masks the input field (asterisks) as it's typed — for
+// password-like fields (e.g. Settings' proxy password).
 std::optional<QString> InputString(const std::string& title,
                                     const std::string& message,
                                     const std::string& defaultValue,
-                                    const std::string& okButtonText = "OK");
+                                    const std::string& okButtonText = "OK",
+                                    bool isPassword = false);
 
 // Returns the user's choice; if closed without answering, returns
 // defaultValue. yesButtonText/noButtonText let a two-choice prompt use

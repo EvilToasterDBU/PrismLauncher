@@ -453,21 +453,26 @@ struct LandingItem {
 // one PCSX2 uses there.
 void DrawLanding(bool& done)
 {
-    // "Accounts"/"Settings..." reuse MainWindow.ui's own accountsMenu title
-    // ("&Accounts") and actionSettings text ("Setti&ngs...") so they pick
-    // up the same translation the desktop menu already has. "Instances"
-    // and "Quit" have no real desktop equivalent (the desktop has no
-    // standalone "Instances" label, and closing its one window is just
-    // done via the window manager — there's no dedicated "Quit" menu
-    // entry anywhere to reuse) and stay BigScreen's own English text.
+    // "Instances"/"Accounts"/"Settings..."/"Quit" all reuse real
+    // MainWindow.ui strings now: actionViewInstanceFolder's text ("Open the
+    // instances folder...") happens to be the literal word "&Instances" —
+    // not semantically about *this* card, but the translated word itself
+    // is exactly what a translator would use for an "Instances" menu label
+    // too, and it's the only "Instances" string that exists anywhere in
+    // the desktop UI to reuse. accountsMenu's title ("&Accounts") and
+    // actionSettings's text ("Setti&ngs..."). "Quit" reuses
+    // actionCloseWindow's text ("Close &Window") — the desktop has no
+    // dedicated "Quit"/"Exit" action (closing its one window *is* quitting
+    // there), so this is the closest real equivalent, same word BigScreen's
+    // own DrawQuit() screen's own "Quit" card uses.
     // Rebuilt fresh every frame (cheap) rather than a `static` array, since
     // TR()/MW() need to run after the translator is installed and could
     // change if the language setting changes mid-session.
     const LandingItem items[] = {
-        { "images/icons/instances.png", "Instances", "Browse and launch your installed Minecraft instances." },
+        { "images/icons/instances.png", StripMnemonic(MW("&Instances")), "Browse and launch your installed Minecraft instances." },
         { "images/icons/accounts.png", StripMnemonic(MW("&Accounts")), "Manage your logged-in Microsoft and offline accounts." },
         { "images/icons/settings.png", StripMnemonic(MW("Setti&ngs...")), "Change launcher and instance settings." },
-        { "images/icons/quit.png", "Quit", "Exit BigScreen and return to the desktop." },
+        { "images/icons/quit.png", StripMnemonic(MW("Close &Window")), "Exit BigScreen and return to the desktop." },
     };
 
     SetFullscreenFooterText("A: Select    B: Quit");
@@ -475,6 +480,11 @@ void DrawLanding(bool& done)
     if (BeginScreen("PrismLauncher BigScreen")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "landing")) {
             BeginNavBar();
+            // See DrawSettings' settings_content comment: BeginNavBar(), like
+            // BeginMenuButtons(), never consumes a queued focus reset on its
+            // own — every built-in ImGuiFullscreen dialog does this
+            // explicitly, so every BigScreen screen needs to as well.
+            ResetFocusHere();
 
             // HorizontalMenuItem cards are a fixed LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH
             // each and flow left-to-right via ImGui::SameLine() with no
@@ -527,9 +537,13 @@ void DrawLanding(bool& done)
 // screenshot showing exactly this layout).
 void DrawQuit(bool& done)
 {
+    // "Quit" reuses actionCloseWindow's text ("Close &Window") — see
+    // DrawLanding's comment on why that's the closest real desktop
+    // equivalent. "Back" and "Switch to Desktop Mode" have no desktop
+    // equivalent (BigScreen-only concepts) and stay BigScreen's own text.
     const LandingItem items[] = {
         { "images/icons/back.png", "Back", "Return to the previous menu." },
-        { "images/icons/quit.png", "Quit", "Fully exit BigScreen, returning to your desktop." },
+        { "images/icons/quit.png", StripMnemonic(MW("Close &Window")), "Fully exit BigScreen, returning to your desktop." },
         { "images/icons/desktop.png", "Switch to Desktop Mode", "Exit BigScreen mode, switch to the desktop interface." },
     };
 
@@ -538,6 +552,7 @@ void DrawQuit(bool& done)
     if (BeginScreen("PrismLauncher BigScreen")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "quit")) {
             BeginNavBar();
+            ResetFocusHere();
 
             const float rowWidth = static_cast<float>(std::size(items)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
             const float availableHeight = ImGui::GetContentRegionAvail().y;
@@ -578,6 +593,7 @@ void DrawAccounts()
     if (BeginScreen("Accounts")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "accounts")) {
             BeginMenuButtons();
+            ResetFocusHere();
 
             if (MenuButtonWithoutSummary("< Back"))
                 SetScreen(Screen::Landing);
@@ -624,6 +640,7 @@ void DrawAccountLogin()
     if (BeginScreen("Sign in with Microsoft")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "account_login")) {
             BeginMenuButtons();
+            ResetFocusHere();
             if (MenuButtonWithoutSummary("< Cancel")) {
                 if (g_loginTask)
                     g_loginTask->abort();
@@ -738,11 +755,15 @@ void DrawMemorySetting(const char* key, const QString& title, const QString& sum
 // wraps) already gets a controller-usable on-screen keyboard for free on
 // those platforms; this just needed confirming, not building. Unverified on
 // real Steam Deck hardware — no way to test that from here.
-void DrawTextSetting(const char* key, const QString& title, const QString& summary)
+void DrawTextSetting(const char* key, const QString& title, const QString& summary, bool isPassword = false)
 {
     SettingsObject* settings = APPLICATION->settings();
     const QString current = settings->get(key).toString();
-    const std::string valueStr = current.isEmpty() ? std::string("(not set)") : current.toStdString();
+    // Masked the same way for the row's own value preview as for the edit
+    // dialog below — showing the real password right on the settings list
+    // would defeat the point of masking it in the edit field.
+    const std::string valueStr =
+        current.isEmpty() ? std::string("(not set)") : (isPassword ? std::string(current.size(), '*') : current.toStdString());
 
     // See DrawChoiceSetting above — InputString() blocks by pumping frames,
     // so it can't be called from here (mid-frame); deferred via
@@ -751,8 +772,8 @@ void DrawTextSetting(const char* key, const QString& title, const QString& summa
     const QByteArray summaryUtf8 = summary.toUtf8();
     if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
         g_pendingAction = [key = std::string(key), title = title.toStdString(), summary = summary.toStdString(),
-                            currentStr = current.toStdString()]() {
-            const auto result = BigScreenDialogs::InputString(title, summary, currentStr);
+                            currentStr = current.toStdString(), isPassword]() {
+            const auto result = BigScreenDialogs::InputString(title, summary, currentStr, "OK", isPassword);
             if (result)
                 APPLICATION->settings()->set(QString::fromStdString(key), *result);
         };
@@ -809,6 +830,30 @@ void DrawSettingsAppearance()
                        "Color theme used by the normal (non-BigScreen) launcher window.", { "system", "dark", "bright" });
     DrawToggleSetting("EnableCat", TR("AppearanceWidget", "Enable cat"),
                        "Show the launcher's cat easter egg (desktop UI only).");
+
+    // Unlike everything above, this DOES affect BigScreen's own rendering
+    // (Settings > Appearance > Scale) — a user-adjustable multiplier on top
+    // of the automatic fit-to-window scale (see its application in
+    // renderFrame, right after UpdateLayoutScale()). No slider widget in
+    // the vendored toolkit (same reasoning as DrawMemorySetting's MB
+    // presets), so this is a preset picker, same pattern.
+    {
+        static const float kScalePresets[] = { 0.8f, 0.9f, 1.0f, 1.1f, 1.25f, 1.5f };
+        SettingsObject* settings = APPLICATION->settings();
+        const float currentScale = settings->get("BigScreenUIScale").toFloat();
+        const std::string valueStr = std::to_string(static_cast<int>(currentScale * 100.0f + 0.5f)) + "%";
+
+        if (MenuButtonWithValue("Scale", "Adjust the size of BigScreen's own interface.", valueStr.c_str())) {
+            g_pendingAction = []() {
+                std::vector<std::string> labels;
+                for (const float s : kScalePresets)
+                    labels.push_back(std::to_string(static_cast<int>(s * 100.0f + 0.5f)) + "%");
+                const auto choice = BigScreenDialogs::Choose("Scale", labels);
+                if (choice && *choice >= 0 && *choice < static_cast<int>(std::size(kScalePresets)))
+                    APPLICATION->settings()->set("BigScreenUIScale", kScalePresets[static_cast<size_t>(*choice)]);
+            };
+        }
+    }
 }
 
 void DrawSettingsWindow()
@@ -908,7 +953,7 @@ void DrawSettingsProxy()
     DrawTextSetting("ProxyUser", TrimTrailingColon(StripMnemonic(TR("ProxyPage", "&Username:"))),
                      "Username for proxy authentication, if required.");
     DrawTextSetting("ProxyPass", TrimTrailingColon(StripMnemonic(TR("ProxyPage", "&Password:"))),
-                     "Password for proxy authentication, if required.");
+                     "Password for proxy authentication, if required.", /*isPassword=*/true);
 }
 
 void DrawSettingsLanguage()
@@ -1029,7 +1074,8 @@ int g_settingsSubTab = 0;
 
 void DrawSettings()
 {
-    SetFullscreenFooterText("A: Toggle / Change    LB/RB: Category    LT/RT: Tab    B: Back");
+    SetFullscreenFooterText(kSettingsTabs[g_settingsTab].subtabCount > 1 ? "A: Toggle / Change    LB/RB: Category    LT/RT: Tab    B: Back"
+                                                                          : "A: Toggle / Change    LB/RB: Category    B: Back");
 
     const int tabCount = static_cast<int>(std::size(kSettingsTabs));
 
@@ -1061,12 +1107,18 @@ void DrawSettings()
     }
 
     const SettingsTopTab& currentTab = kSettingsTabs[g_settingsTab];
-    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR2, false)) {
-        g_settingsSubTab = (g_settingsSubTab + 1) % currentTab.subtabCount;
-        QueueResetFocus(FocusResetType::Other);
-    } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL2, false)) {
-        g_settingsSubTab = (g_settingsSubTab - 1 + currentTab.subtabCount) % currentTab.subtabCount;
-        QueueResetFocus(FocusResetType::Other);
+    // Nothing to switch to with only one sub-tab (e.g. General's "Mods &
+    // Downloads") — skip LT/RT handling, and skip drawing the sub-tab row
+    // at all below, rather than showing a strip with a single, permanently-
+    // selected, unclickable tab.
+    if (currentTab.subtabCount > 1) {
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR2, false)) {
+            g_settingsSubTab = (g_settingsSubTab + 1) % currentTab.subtabCount;
+            QueueResetFocus(FocusResetType::Other);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL2, false)) {
+            g_settingsSubTab = (g_settingsSubTab - 1 + currentTab.subtabCount) % currentTab.subtabCount;
+            QueueResetFocus(FocusResetType::Other);
+        }
     }
 
     TopBarTab topTabs[std::size(kSettingsTabs)];
@@ -1093,20 +1145,22 @@ void DrawSettings()
             // merging into the parent's — D-pad nav couldn't reach into
             // (or back out of) the settings list at all. BeginFullscreenColumnWindow
             // itself already passes this same flag for exactly this reason.
-            ImGui::BeginChild("settings_subtabs",
-                               ImVec2(0.0f, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) + ImGui::GetStyle().FramePadding.y * 2.0f +
-                                                 LayoutScale(4.0f)),
-                               ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
-            BeginNavBar();
-            for (int i = 0; i < currentTab.subtabCount; ++i) {
-                if (NavTab(currentTab.subtabs[i].name, i == g_settingsSubTab, true, 150.0f, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY,
-                           UISecondaryColor)) {
-                    g_settingsSubTab = i;
-                    QueueResetFocus(FocusResetType::Other);
+            if (currentTab.subtabCount > 1) {
+                ImGui::BeginChild("settings_subtabs",
+                                   ImVec2(0.0f, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) +
+                                                     ImGui::GetStyle().FramePadding.y * 2.0f + LayoutScale(4.0f)),
+                                   ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
+                BeginNavBar();
+                for (int i = 0; i < currentTab.subtabCount; ++i) {
+                    if (NavTab(currentTab.subtabs[i].name, i == g_settingsSubTab, true, 150.0f, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY,
+                               UISecondaryColor)) {
+                        g_settingsSubTab = i;
+                        QueueResetFocus(FocusResetType::Other);
+                    }
                 }
+                EndNavBar();
+                ImGui::EndChild();
             }
-            EndNavBar();
-            ImGui::EndChild();
 
             ImGui::BeginChild("settings_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
             BeginMenuButtons();
@@ -1372,6 +1426,7 @@ void DrawInstances()
     if (BeginScreen("Instances")) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "instances")) {
             BeginNavBar();
+            ResetFocusHere();
 
             // No explicit "< Back" card here (B already returns to Landing
             // via HandleBackButton()) — matches the reference: PCSX2's own
@@ -1428,6 +1483,7 @@ void DrawConsole()
     if (BeginScreen(title.c_str())) {
         if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "console")) {
             BeginMenuButtons();
+            ResetFocusHere();
             if (MenuButtonWithoutSummary("< Back"))
                 SetScreen(Screen::Instances);
             EndMenuButtons();
@@ -1599,6 +1655,11 @@ int main(int argc, char** argv)
         SetScreen(Screen::Console);
     };
 
+    // BigScreen-only setting (Settings > Appearance > Scale) — not a real
+    // desktop key, so registered here rather than in the shared
+    // Application::init() registerSetting() block.
+    APPLICATION->settings()->registerSetting("BigScreenUIScale", 1.0);
+
     // TEMPORARY diagnostic: BIGSCREEN_AUTOLAUNCH=<instance id> triggers the
     // exact same launch codepath a real "A: Launch" press would, without
     // needing gamepad/keyboard input to reach it — for reproducing the
@@ -1644,6 +1705,14 @@ int main(int argc, char** argv)
                 // for comparison against settings_window's single-item case.
                 g_settingsTab = 3;
                 g_settingsSubTab = 1;
+                SetScreen(Screen::Settings);
+            } else if (name == "settings_appearance") {
+                g_settingsTab = 2;
+                g_settingsSubTab = 0;
+                SetScreen(Screen::Settings);
+            } else if (name == "settings_proxy") {
+                g_settingsTab = 7;
+                g_settingsSubTab = 0;
                 SetScreen(Screen::Settings);
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
@@ -1708,6 +1777,28 @@ int main(int argc, char** argv)
         }
 
         UpdateLayoutScale();
+        // UpdateLayoutScale() computed the scale that exactly fits BigScreen's
+        // fixed 1280x720 logical layout to the actual window — "Scale" in
+        // Settings > Appearance (BigScreenUIScale, 0.8-1.5x, default 1.0) is
+        // a user multiplier on top of that fit, applied here before
+        // UpdateFontScale() so medium/large fonts (which size themselves via
+        // LayoutScale(), same as every widget dimension) pick it up too, not
+        // just the widget geometry. Padding is recomputed the same way
+        // UpdateLayoutScale() derives it (center the scaled 1280x720 box in
+        // the window) — needed regardless of which axis was the original
+        // fit's constraint, so this doesn't try to replicate that branch.
+        {
+            const float userScale = APPLICATION->settings()->get("BigScreenUIScale").toFloat();
+            if (userScale > 0.0f && userScale != 1.0f) {
+                ImGuiFullscreen::g_layout_scale *= userScale;
+                ImGuiFullscreen::g_rcp_layout_scale = 1.0f / ImGuiFullscreen::g_layout_scale;
+                const ImGuiIO& scaleIo = ImGui::GetIO();
+                ImGuiFullscreen::g_layout_padding_left =
+                    (scaleIo.DisplaySize.x - ImGuiFullscreen::LAYOUT_SCREEN_WIDTH * ImGuiFullscreen::g_layout_scale) * 0.5f;
+                ImGuiFullscreen::g_layout_padding_top =
+                    (scaleIo.DisplaySize.y - ImGuiFullscreen::LAYOUT_SCREEN_HEIGHT * ImGuiFullscreen::g_layout_scale) * 0.5f;
+            }
+        }
         UpdateFontScale();
 
         ImGui_ImplOpenGL3_NewFrame();
@@ -1721,24 +1812,37 @@ int main(int argc, char** argv)
         // axis, not as equivalent to D-pad presses for moving between
         // items — so mirror stick-down onto the D-pad keys ourselves,
         // between NewFrame (so the stick state above is current) and
-        // ImGui::NewFrame() (so nav sees it this frame). Only adds a true
-        // state on top of whatever the real D-pad already reported — never
-        // clears it — so a genuine D-pad hold is never masked.
-        {
+        // ImGui::NewFrame() (so nav sees it this frame).
+        //
+        // Reads the raw axis directly rather than using
+        // ImGuiKey_GamepadLStick{Up,Down,Left,Right} — imgui_impl_sdl2's own
+        // derivation of those uses an 8000/32767 (~24%) dead zone (SDL's own
+        // suggested *minimum*), which read as "too sensitive"/triggering
+        // from small or unintended stick movement. This uses a much larger
+        // one instead, requiring a deliberate, firm push before nav moves
+        // at all. Still purely additive on top of the real D-pad's own key
+        // state (never explicitly clears these keys) — ImGui_ImplSDL2_NewFrame()
+        // just above already re-polls and resets them to the real D-pad's
+        // current state every frame, so once the stick returns inside the
+        // dead zone this naturally stops re-asserting "down" the same way a
+        // real D-pad release does — including the same built-in
+        // hold-then-repeat pacing Dear ImGui's nav system already applies
+        // to any held direction key, gamepad-native or (as here) synthetic,
+        // so a held stick deflection repeats at the same rate a held D-pad
+        // press would, with no separate repeat logic needed here.
+        if (pad) {
             ImGuiIO& io = ImGui::GetIO();
-            const struct {
-                ImGuiKey stick;
-                ImGuiKey dpad;
-            } stickToDpad[] = {
-                { ImGuiKey_GamepadLStickUp, ImGuiKey_GamepadDpadUp },
-                { ImGuiKey_GamepadLStickDown, ImGuiKey_GamepadDpadDown },
-                { ImGuiKey_GamepadLStickLeft, ImGuiKey_GamepadDpadLeft },
-                { ImGuiKey_GamepadLStickRight, ImGuiKey_GamepadDpadRight },
-            };
-            for (const auto& mapping : stickToDpad) {
-                if (ImGui::IsKeyDown(mapping.stick))
-                    io.AddKeyEvent(mapping.dpad, true);
-            }
+            constexpr Sint16 kStickDeadZone = 20000; // out of a max 32767 — a firm, deliberate push
+            const Sint16 axisX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
+            const Sint16 axisY = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
+            if (axisX < -kStickDeadZone)
+                io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, true);
+            else if (axisX > kStickDeadZone)
+                io.AddKeyEvent(ImGuiKey_GamepadDpadRight, true);
+            if (axisY < -kStickDeadZone)
+                io.AddKeyEvent(ImGuiKey_GamepadDpadUp, true);
+            else if (axisY > kStickDeadZone)
+                io.AddKeyEvent(ImGuiKey_GamepadDpadDown, true);
         }
 
         ImGui::NewFrame();

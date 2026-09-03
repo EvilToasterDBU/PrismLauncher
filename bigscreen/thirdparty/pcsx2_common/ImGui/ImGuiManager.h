@@ -11,16 +11,22 @@
 // (real font metrics, input binding text, DPI scale).
 #pragma once
 
+#include "ImGui/ImGuiFullscreen.h"
+
 #include <string>
 #include <string_view>
 
 namespace ImGuiManager {
 
 // TODO(M1): replace with the real loaded font's size once BigScreen owns
-// font loading; 24px is a reasonable 1x placeholder.
+// font loading; 24px is a reasonable 1x placeholder. BigScreen note: scaled
+// by g_layout_scale, unlike PCSX2's original (which had its own DPI/font
+// metrics feeding this) — without it, standard-size text stayed a fixed
+// 24px regardless of window size or Settings > Appearance's "Scale" while
+// medium/large text (sized via LayoutScale() already) responded to both.
 inline float GetFontSizeStandard()
 {
-    return 24.0f;
+    return ImGuiFullscreen::LayoutScale(24.0f);
 }
 
 // TODO(M1): once BigScreen has its own icon glyphs, strip their codepoint

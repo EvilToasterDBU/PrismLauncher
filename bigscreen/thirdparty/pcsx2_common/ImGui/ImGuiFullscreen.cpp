@@ -2634,8 +2634,10 @@ void ImGuiFullscreen::DrawInputDialog()
 		};
 
 		ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
-		if (s_input_dialog_filter_type != InputFilterType::None)
+		if (s_input_dialog_filter_type == InputFilterType::Numeric || s_input_dialog_filter_type == InputFilterType::IPAddress)
 			flags |= ImGuiInputTextFlags_CallbackCharFilter;
+		else if (s_input_dialog_filter_type == InputFilterType::Password)
+			flags |= ImGuiInputTextFlags_Password;
 
 		if (s_focus_reset_queued != FocusResetType::None)
 			ImGui::SetKeyboardFocusHere();
@@ -2649,9 +2651,10 @@ void ImGuiFullscreen::DrawInputDialog()
 		ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.4f, 0.4f, 0.4f, 1.0f));
 		ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 1.0f, 1.0f, 1.0f));
 
-		ImGui::InputText("##input", &s_input_dialog_text, flags,
-			(s_input_dialog_filter_type != InputFilterType::None) ? input_callback : nullptr,
-			(s_input_dialog_filter_type != InputFilterType::None) ? static_cast<void*>(&s_input_dialog_filter_type) : nullptr);
+		const bool needs_char_filter_callback =
+			(s_input_dialog_filter_type == InputFilterType::Numeric || s_input_dialog_filter_type == InputFilterType::IPAddress);
+		ImGui::InputText("##input", &s_input_dialog_text, flags, needs_char_filter_callback ? input_callback : nullptr,
+			needs_char_filter_callback ? static_cast<void*>(&s_input_dialog_filter_type) : nullptr);
 
 		ImGui::PopStyleColor(5);
 		ImGui::PopStyleVar(3);

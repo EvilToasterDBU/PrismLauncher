@@ -33,7 +33,7 @@ void WaitForDialog(bool& resolved, StillOpenFn&& stillOpen)
 }  // namespace
 
 std::optional<QString> InputString(const std::string& title, const std::string& message, const std::string& defaultValue,
-                                    const std::string& okButtonText)
+                                    const std::string& okButtonText, bool isPassword)
 {
     bool resolved = false;
     std::optional<QString> result;
@@ -44,7 +44,7 @@ std::optional<QString> InputString(const std::string& title, const std::string& 
             resolved = true;
             result = QString::fromStdString(text);
         },
-        defaultValue);
+        defaultValue, isPassword ? InputFilterType::Password : InputFilterType::None);
 
     WaitForDialog(resolved, IsInputDialogOpen);
     return result;
