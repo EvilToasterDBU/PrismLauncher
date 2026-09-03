@@ -126,7 +126,7 @@ QString TrimTrailingColon(QString text)
     return text;
 }
 
-enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, Quit };
+enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, InstanceSettings, Quit };
 
 Screen g_screen = Screen::Landing;
 bool g_wantsQuit = false;
@@ -273,6 +273,7 @@ GSTexture* GetInstanceIconTexture(MinecraftInstance* inst)
     return raw;
 }
 MinecraftInstance* g_consoleInstance = nullptr;
+MinecraftInstance* g_instanceSettingsTarget = nullptr;
 
 // Microsoft device-code login state (Accounts/AccountLogin screens). No
 // keyboard needed on this device at all: the user opens the shown URL (or
@@ -425,6 +426,9 @@ void HandleBackButton()
             break;
         case Screen::Settings:
             SetScreen(Screen::Landing);
+            break;
+        case Screen::InstanceSettings:
+            SetScreen(Screen::Instances);
             break;
         case Screen::Quit:
             SetScreen(Screen::Landing);
@@ -708,9 +712,18 @@ void DrawAccountLogin()
 // only when the widget reports a change. invert flips both directions, for
 // keys that are phrased negatively (e.g. "...Disabled") but read more
 // naturally as a positive toggle in a menu ("Enable ...").
-void DrawToggleSetting(const char* key, const QString& title, const QString& summary, bool invert = false)
+//
+// settings defaults to the global SettingsObject (every existing call site
+// predates this parameter and still means that) — pass instance->settings()
+// instead to draw/edit a per-instance override (DrawInstanceSettings*
+// below). Per-instance settings are the *same* SettingsObject API with a
+// transparent inheritance layer underneath (MinecraftInstance::
+// loadSpecificSettings()'s registerOverride() calls) — get()/set() here
+// don't need to know or care which one they're pointed at.
+void DrawToggleSetting(const char* key, const QString& title, const QString& summary, bool invert = false, SettingsObject* settings = nullptr)
 {
-    SettingsObject* settings = APPLICATION->settings();
+    if (!settings)
+        settings = APPLICATION->settings();
     bool value = settings->get(key).toBool() != invert;
     const QByteArray titleUtf8 = title.toUtf8();
     const QByteArray summaryUtf8 = summary.toUtf8();
@@ -723,19 +736,21 @@ void DrawToggleSetting(const char* key, const QString& title, const QString& sum
 // uses for its MB presets. The actual blocking Choose() call is deferred to
 // the top of the next frame via g_pendingAction (see its comment) — this
 // function itself only ever runs mid-frame.
-void DrawChoiceSetting(const char* key, const QString& title, const QString& summary, const std::vector<std::string>& options)
+void DrawChoiceSetting(const char* key, const QString& title, const QString& summary, const std::vector<std::string>& options,
+                        SettingsObject* settings = nullptr)
 {
-    SettingsObject* settings = APPLICATION->settings();
+    if (!settings)
+        settings = APPLICATION->settings();
     const QString current = settings->get(key).toString();
     const std::string valueStr = current.isEmpty() ? std::string("(default)") : current.toStdString();
 
     const QByteArray titleUtf8 = title.toUtf8();
     const QByteArray summaryUtf8 = summary.toUtf8();
     if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = title.toStdString(), options]() {
+        g_pendingAction = [settings, key = std::string(key), title = title.toStdString(), options]() {
             const auto choice = BigScreenDialogs::Choose(title, options);
             if (choice && *choice >= 0 && *choice < static_cast<int>(options.size()))
-                APPLICATION->settings()->set(QString::fromStdString(key), QString::fromStdString(options[*choice]));
+                settings->set(QString::fromStdString(key), QString::fromStdString(options[*choice]));
         };
     }
 }
@@ -745,25 +760,26 @@ void DrawChoiceSetting(const char* key, const QString& title, const QString& sum
 // picker: current value shown on the button, tap opens a choice dialog
 // (BigScreenDialogs::Choose, same deferred pattern as DrawChoiceSetting
 // above) listing fixed MB steps.
-void DrawMemorySetting(const char* key, const QString& title, const QString& summary)
+void DrawMemorySetting(const char* key, const QString& title, const QString& summary, SettingsObject* settings = nullptr)
 {
     static const int kPresetsMb[] = { 512, 1024, 1536, 2048, 3072, 4096, 6144, 8192, 10240, 12288 };
 
-    SettingsObject* settings = APPLICATION->settings();
+    if (!settings)
+        settings = APPLICATION->settings();
     const int currentMb = settings->get(key).toInt();
     const std::string valueStr = std::to_string(currentMb) + " MB";
 
     const QByteArray titleUtf8 = title.toUtf8();
     const QByteArray summaryUtf8 = summary.toUtf8();
     if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = title.toStdString()]() {
+        g_pendingAction = [settings, key = std::string(key), title = title.toStdString()]() {
             std::vector<std::string> labels;
             for (const int mb : kPresetsMb)
                 labels.push_back(std::to_string(mb) + " MB");
 
             const auto choice = BigScreenDialogs::Choose(title, labels);
             if (choice && *choice >= 0 && *choice < static_cast<int>(std::size(kPresetsMb)))
-                APPLICATION->settings()->set(QString::fromStdString(key), kPresetsMb[*choice]);
+                settings->set(QString::fromStdString(key), kPresetsMb[*choice]);
         };
     }
 }
@@ -780,9 +796,10 @@ void DrawMemorySetting(const char* key, const QString& title, const QString& sum
 // wraps) already gets a controller-usable on-screen keyboard for free on
 // those platforms; this just needed confirming, not building. Unverified on
 // real Steam Deck hardware — no way to test that from here.
-void DrawTextSetting(const char* key, const QString& title, const QString& summary, bool isPassword = false)
+void DrawTextSetting(const char* key, const QString& title, const QString& summary, bool isPassword = false, SettingsObject* settings = nullptr)
 {
-    SettingsObject* settings = APPLICATION->settings();
+    if (!settings)
+        settings = APPLICATION->settings();
     const QString current = settings->get(key).toString();
     // Masked the same way for the row's own value preview as for the edit
     // dialog below — showing the real password right on the settings list
@@ -796,11 +813,11 @@ void DrawTextSetting(const char* key, const QString& title, const QString& summa
     const QByteArray titleUtf8 = title.toUtf8();
     const QByteArray summaryUtf8 = summary.toUtf8();
     if (MenuButtonWithValue(titleUtf8.constData(), summaryUtf8.constData(), valueStr.c_str())) {
-        g_pendingAction = [key = std::string(key), title = title.toStdString(), summary = summary.toStdString(),
+        g_pendingAction = [settings, key = std::string(key), title = title.toStdString(), summary = summary.toStdString(),
                             currentStr = current.toStdString(), isPassword]() {
             const auto result = BigScreenDialogs::InputString(title, summary, currentStr, "OK", isPassword);
             if (result)
-                APPLICATION->settings()->set(QString::fromStdString(key), *result);
+                settings->set(QString::fromStdString(key), *result);
         };
     }
 }
@@ -1227,6 +1244,229 @@ void DrawSettings()
     EndFullscreenColumns();
 }
 
+// ---- Instance Settings (X-menu "Edit...") — per-instance overrides of
+// global settings, the "settings" tab of the desktop's Edit Instance
+// window (InstanceSettingsPage -> MinecraftSettingsWidget,
+// launcher/ui/pages/instance/InstanceSettingsPage.h). A cut-down mirror of
+// DrawSettings() above, scoped to one instance's own SettingsObject
+// (instance->settings()) instead of APPLICATION->settings() — reuses the
+// exact same DrawToggleSetting/DrawChoiceSetting/DrawMemorySetting/
+// DrawTextSetting helpers (each takes an optional trailing SettingsObject*
+// for exactly this) since per-instance settings are the same SettingsObject
+// get()/set() API with a transparent global-inheritance layer underneath
+// (MinecraftInstance::loadSpecificSettings()/BaseInstance's constructor —
+// each registerOverride(globalSetting, gateFlag) call wires one key to fall
+// back to the global value whenever its gate flag is off). Each group below
+// starts with a toggle for that real "OverrideXxx" gate — matching the
+// desktop's own checkable QGroupBox — and only draws the gated fields while
+// it's on, rather than showing them present-but-disabled.
+//
+// Deliberately not ported this round (real gaps, not oversights): window
+// width/height (no numeric entry widget exists yet, unlike the MB-preset
+// picker memory settings get), Environment Variables (a key/value list
+// editor), native library workaround paths, account-for-instance override
+// (needs an account picker), mod-download-loader override, and everything
+// on the desktop's other Edit Instance tabs (Version/Mods/Worlds/
+// Screenshots/Servers/Resource-Texture-Shader-packs/log viewers — each a
+// real, separate, substantially larger BigScreen screen of its own).
+
+void DrawInstanceSettingsGeneral()
+{
+    SettingsObject* s = g_instanceSettingsTarget->settings();
+
+    DrawToggleSetting("OverrideWindow", StripMnemonic(TR("MinecraftSettingsWidget", "Game &Window")),
+                       "Use different window settings for this instance.", false, s);
+    if (s->get("OverrideWindow").toBool())
+        DrawToggleSetting("LaunchMaximized", TR("MinecraftSettingsWidget", "Start Minecraft maximized"),
+                           "Start Minecraft's window maximized.", false, s);
+
+    DrawToggleSetting("OverrideConsole", StripMnemonic(TR("MinecraftSettingsWidget", "&Console Window")),
+                       "Use different console settings for this instance.", false, s);
+    if (s->get("OverrideConsole").toBool()) {
+        DrawToggleSetting("ShowConsole", TR("MinecraftSettingsWidget", "When the game is launched, show the console window"),
+                           "Open the console window automatically when this instance launches.", false, s);
+        DrawToggleSetting("ShowConsoleOnError", TR("MinecraftSettingsWidget", "When the game crashes, show the console window"),
+                           "Open the console window automatically if this instance crashes.", false, s);
+        DrawToggleSetting("AutoCloseConsole", TR("MinecraftSettingsWidget", "When the game quits, hide the console window"),
+                           "Close the console window automatically when the game exits successfully.", false, s);
+    }
+
+    DrawToggleSetting("OverrideGameTime", StripMnemonic(TR("MinecraftSettingsWidget", "Game &Time")),
+                       "Use different play-time tracking for this instance.", false, s);
+    if (s->get("OverrideGameTime").toBool()) {
+        DrawToggleSetting("ShowGameTime", StripMnemonic(TR("MinecraftSettingsWidget", "Show time &playing this instance")),
+                           "Show how long this instance has been played for.", false, s);
+        DrawToggleSetting("RecordGameTime", StripMnemonic(TR("MinecraftSettingsWidget", "&Record time playing this instance")),
+                           "Keep track of how long this instance has been played for.", false, s);
+    }
+    DrawToggleSetting("CountGameTime",
+                       StripMnemonic(TR("MinecraftSettingsWidget", "&Count time playing this instance into total time played")),
+                       "Add this instance's play time to the launcher's overall total.", false, s);
+
+    DrawToggleSetting("OverrideMiscellaneous", "Miscellaneous", "Use different launcher-behavior settings for this instance.", false, s);
+    if (s->get("OverrideMiscellaneous").toBool()) {
+        DrawToggleSetting("CloseAfterLaunch", TR("MinecraftSettingsWidget", "When the game window opens, hide the launcher"),
+                           "Hide the launcher once this instance's game window appears.", false, s);
+        DrawToggleSetting("QuitAfterGameStop", TR("MinecraftSettingsWidget", "When the game window closes, quit the launcher"),
+                           "Quit the launcher once this instance's game exits.", false, s);
+    }
+}
+
+void DrawInstanceSettingsJava()
+{
+    SettingsObject* s = g_instanceSettingsTarget->settings();
+
+    DrawToggleSetting("OverrideJavaLocation", StripMnemonic(TR("JavaSettingsWidget", "Java Insta&llation")),
+                       "Use a different Java installation for this instance.", false, s);
+    if (s->get("OverrideJavaLocation").toBool()) {
+        DrawTextSetting("JavaPath", StripMnemonic(TR("JavaSettingsWidget", "Java &Executable")),
+                         "Path to the JRE/JDK executable to launch this instance with.", false, s);
+        DrawToggleSetting("IgnoreJavaCompatibility", TR("JavaSettingsWidget", "Skip Java compatibility checks"),
+                           TR("JavaSettingsWidget",
+                              "If enabled, the launcher will not check if this instance is compatible with the selected Java version."),
+                           false, s);
+    }
+
+    DrawToggleSetting("OverrideJavaArgs", StripMnemonic(TR("JavaSettingsWidget", "Java Argumen&ts")),
+                       "Use different JVM arguments for this instance.", false, s);
+    if (s->get("OverrideJavaArgs").toBool())
+        DrawTextSetting("JvmArgs", StripMnemonic(TR("JavaSettingsWidget", "Java Argumen&ts")),
+                         "Additional arguments passed to the Java virtual machine.", false, s);
+
+    DrawToggleSetting("OverrideMemory", StripMnemonic(TR("JavaSettingsWidget", "Memor&y")),
+                       "Use different memory limits for this instance.", false, s);
+    if (s->get("OverrideMemory").toBool()) {
+        DrawMemorySetting("MinMemAlloc", TrimTrailingColon(StripMnemonic(TR("JavaSettingsWidget", "M&inimum Memory Usage:"))),
+                           TR("JavaSettingsWidget", "The amount of memory Minecraft is started with."), s);
+        DrawMemorySetting("MaxMemAlloc", TrimTrailingColon(StripMnemonic(TR("JavaSettingsWidget", "Ma&ximum Memory Usage:"))),
+                           TR("JavaSettingsWidget", "The maximum amount of memory Minecraft is allowed to use."), s);
+    }
+}
+
+void DrawInstanceSettingsTweaks()
+{
+    SettingsObject* s = g_instanceSettingsTarget->settings();
+
+    DrawToggleSetting("OverridePerformance", StripMnemonic(TR("MinecraftSettingsWidget", "&Performance")),
+                       "Use different performance-related settings for this instance.", false, s);
+    if (s->get("OverridePerformance").toBool()) {
+        DrawToggleSetting("EnableFeralGamemode", TR("MinecraftSettingsWidget", "Enable Feral GameMode"),
+                           "Request performance optimizations from GameMode while playing (Linux only).", false, s);
+        DrawToggleSetting("EnableMangoHud", TR("MinecraftSettingsWidget", "Enable MangoHud"),
+                           "Show the MangoHud performance overlay while playing.", false, s);
+        DrawToggleSetting("UseDiscreteGpu", TR("MinecraftSettingsWidget", "Use discrete GPU"),
+                           "Hint the system to use the discrete GPU, if there is one.", false, s);
+        DrawToggleSetting("UseZink", TR("MinecraftSettingsWidget", "Use Zink"),
+                           TR("MinecraftSettingsWidget",
+                              "Use Zink, a Mesa OpenGL driver that implements OpenGL on top of Vulkan. Performance may vary depending on "
+                              "the situation. Note: If no suitable Vulkan driver is found, software rendering will be used."),
+                           false, s);
+    }
+
+    DrawToggleSetting("OverrideLegacySettings", StripMnemonic(TR("MinecraftSettingsWidget", "&Legacy Tweaks")),
+                       "Use different legacy-compatibility settings for this instance.", false, s);
+    if (s->get("OverrideLegacySettings").toBool())
+        DrawToggleSetting("OnlineFixes", TR("MinecraftSettingsWidget", "Enable online fixes (experimental)"),
+                           "Emulate old online services (skin and online-mode support) that are no longer operating.", false, s);
+}
+
+void DrawInstanceSettingsCommands()
+{
+    SettingsObject* s = g_instanceSettingsTarget->settings();
+
+    DrawToggleSetting("OverrideCommands", "Custom Commands", "Use different custom commands for this instance.", false, s);
+    if (s->get("OverrideCommands").toBool()) {
+        DrawTextSetting("WrapperCommand", StripMnemonic(TR("CustomCommands", "&Wrapper Command")),
+                         "Command to wrap the Minecraft launch with (e.g. gamemoderun, mangohud).", false, s);
+        DrawTextSetting("PreLaunchCommand", StripMnemonic(TR("CustomCommands", "&Pre-launch Command")),
+                         "Command to run before Minecraft starts.", false, s);
+        DrawTextSetting("PostExitCommand", StripMnemonic(TR("CustomCommands", "P&ost-exit Command")),
+                         "Command to run after Minecraft exits.", false, s);
+    }
+}
+
+void DrawInstanceSettingsNotes()
+{
+    SettingsObject* s = g_instanceSettingsTarget->settings();
+    DrawTextSetting("notes", "Notes", "Freeform notes about this instance.", false, s);
+}
+
+struct InstanceSettingsTab {
+    const char* name;
+    void (*draw)();
+};
+static const InstanceSettingsTab kInstanceSettingsTabs[] = {
+    { "General", &DrawInstanceSettingsGeneral }, { "Java", &DrawInstanceSettingsJava },     { "Tweaks", &DrawInstanceSettingsTweaks },
+    { "Commands", &DrawInstanceSettingsCommands }, { "Notes", &DrawInstanceSettingsNotes },
+};
+int g_instanceSettingsTab = 0;
+
+void DrawInstanceSettings()
+{
+    // Shouldn't happen (only reachable via ShowInstanceActionsMenu(), which
+    // always sets this first) — defensive fallback instead of dereferencing
+    // null.
+    if (!g_instanceSettingsTarget) {
+        SetScreen(Screen::Instances);
+        return;
+    }
+
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                          { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                          { glyphs.cancel(false), "Back" } });
+    }
+
+    const int tabCount = static_cast<int>(std::size(kInstanceSettingsTabs));
+    if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
+        g_instanceSettingsTab = (g_instanceSettingsTab + 1) % tabCount;
+        QueueResetFocus(FocusResetType::Other);
+    } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
+        g_instanceSettingsTab = (g_instanceSettingsTab - 1 + tabCount) % tabCount;
+        QueueResetFocus(FocusResetType::Other);
+    }
+
+    // "Edit... — <instance name> — <category>", matching Settings' own
+    // "Settings — <category>" pattern.
+    const std::string screenTitle = StripMnemonic(MW("&Edit...")).toStdString() + " \xE2\x80\x94 " +
+                                     g_instanceSettingsTarget->name().toStdString() + " \xE2\x80\x94 " +
+                                     kInstanceSettingsTabs[g_instanceSettingsTab].name;
+
+    if (BeginScreen(screenTitle.c_str())) {
+        if (BeginFullscreenColumnWindow(0.0f, LAYOUT_SCREEN_WIDTH, "instance_settings")) {
+            // Same non-scrolling tab-row / scrolling-content two-child-window
+            // split DrawSettings() uses for its sub-tab row, and for the
+            // same reasons (NavTab's own trailing SameLine() would otherwise
+            // run into the first setting row; keeps the tab row pinned while
+            // the content below it scrolls).
+            ImGui::BeginChild("instance_settings_tabs",
+                               ImVec2(0.0f, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) + ImGui::GetStyle().FramePadding.y * 2.0f +
+                                                 LayoutScale(4.0f)),
+                               ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
+            BeginNavBar();
+            for (int i = 0; i < tabCount; ++i) {
+                if (NavTab(kInstanceSettingsTabs[i].name, i == g_instanceSettingsTab, true, 150.0f, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY,
+                           UISecondaryColor)) {
+                    g_instanceSettingsTab = i;
+                    QueueResetFocus(FocusResetType::Other);
+                }
+            }
+            EndNavBar();
+            ImGui::EndChild();
+
+            ImGui::BeginChild("instance_settings_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
+            BeginMenuButtons();
+            ResetFocusHere();
+            kInstanceSettingsTabs[g_instanceSettingsTab].draw();
+            EndMenuButtons();
+            ImGui::EndChild();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+}
+
 // Shared by the HorizontalMenuItem confirm handler below and the "Launch"
 // entry in the X-button actions menu.
 void LaunchInstance(MinecraftInstance* inst)
@@ -1244,12 +1484,16 @@ void LaunchInstance(MinecraftInstance* inst)
 // X on a focused instance card opens this — a curated subset of the
 // desktop's right-click context menu (MainWindow::showInstanceContextMenu),
 // picking the actions that make sense without a mouse/keyboard: launching,
-// killing, opening the console, renaming, changing group, viewing the
-// instance folder, and deleting. Not yet ported: Edit Instance (the full
-// per-instance settings dialog), Copy Instance, Export, Create Shortcut —
-// all native Qt Widgets dialogs with enough surface area (checkboxes, radio
-// groups, file pickers) that porting them is its own follow-up, not a
-// simple BigScreenDialogs::* swap like the actions below.
+// killing, opening the console, editing settings (Screen::InstanceSettings,
+// via DrawInstanceSettings() above — the "settings" tab of the desktop's
+// full Edit Instance window, not the whole thing), renaming, changing
+// group, viewing the instance folder, and deleting. Not yet ported: the
+// desktop Edit Instance window's other tabs (Version/Mods/Worlds/
+// Screenshots/Servers/resource-texture-shader-packs/log viewers), Copy
+// Instance, Export, Create Shortcut — all native Qt Widgets dialogs/pages
+// with enough surface area (checkboxes, radio groups, file pickers, list
+// management) that porting each is its own follow-up, not a simple
+// BigScreenDialogs::* swap like the actions below.
 //
 // Uses the raw, non-blocking OpenChoiceDialog directly rather than
 // BigScreenDialogs::Choose() — this is called from inside DrawInstances(),
@@ -1288,6 +1532,11 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
     } else if (inst->canLaunch()) {
         actions->push_back({ StripMnemonic(MW("&Launch")).toStdString(), [inst]() { LaunchInstance(inst); } });
     }
+
+    actions->push_back({ StripMnemonic(MW("&Edit...")).toStdString(), [inst]() {
+                             g_instanceSettingsTarget = inst;
+                             SetScreen(Screen::InstanceSettings);
+                         } });
 
     // "Rename" here has no desktop dialog to match (the desktop version
     // edits the name inline in the instance list instead of via a popup),
@@ -1775,7 +2024,7 @@ int main(int argc, char** argv)
     }
 
     // TEMPORARY diagnostic: BIGSCREEN_TEST_SCREEN=<landing|instances|
-    // accounts|settings> jumps straight to that screen shortly after
+    // accounts|settings|instance_settings> jumps straight to that screen shortly after
     // startup, without needing input to navigate there — for visually
     // checking font/translation rendering via a screenshot. Remove once
     // that's confirmed.
@@ -1812,6 +2061,13 @@ int main(int argc, char** argv)
                 g_settingsTab = 7;
                 g_settingsSubTab = 0;
                 SetScreen(Screen::Settings);
+            } else if (name == "instance_settings" || name == "instance_settings_java") {
+                InstanceList* instances = APPLICATION->instances();
+                if (instances->rowCount() > 0) {
+                    g_instanceSettingsTarget = instances->at(0);
+                    g_instanceSettingsTab = (name == "instance_settings_java") ? 1 : 0;
+                    SetScreen(Screen::InstanceSettings);
+                }
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
         });
@@ -1994,6 +2250,9 @@ int main(int argc, char** argv)
                     break;
                 case Screen::Settings:
                     DrawSettings();
+                    break;
+                case Screen::InstanceSettings:
+                    DrawInstanceSettings();
                     break;
                 case Screen::Quit:
                     DrawQuit(done);
