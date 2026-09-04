@@ -12,6 +12,9 @@ namespace BigScreenDialogs {
 
 std::function<void()> PumpFrame;
 int BlockingDepth = 0;
+QString CurrentTaskStatus;
+qint64 CurrentTaskProgress = 0;
+qint64 CurrentTaskTotalProgress = 0;
 
 namespace {
 
@@ -91,10 +94,16 @@ void WaitForTask(Task* task)
 {
     BlockingGuard guard;
     while (task->isRunning()) {
+        CurrentTaskStatus = task->getStatus();
+        CurrentTaskProgress = task->getProgress();
+        CurrentTaskTotalProgress = task->getTotalProgress();
         QCoreApplication::processEvents();
         if (PumpFrame)
             PumpFrame();
     }
+    CurrentTaskStatus.clear();
+    CurrentTaskProgress = 0;
+    CurrentTaskTotalProgress = 0;
 }
 
 }  // namespace BigScreenDialogs

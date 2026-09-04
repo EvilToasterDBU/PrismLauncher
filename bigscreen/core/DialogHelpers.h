@@ -64,6 +64,16 @@ extern std::function<void()> PumpFrame;
 // OS-level modal — nothing else could receive input while it was up.
 extern int BlockingDepth;
 
+// Set/cleared by WaitForTask() below on every pump iteration, from the
+// task's own getStatus()/getProgress()/getTotalProgress() — read by
+// bigscreen/main.cpp's DrawBlockingWait() so the "please wait" screen shows
+// real status text and a real progress bar (matching the desktop's own
+// ProgressDialog, which reads the exact same Task API) instead of a bare
+// static "Please wait...". Empty/zero whenever no task is being waited on.
+extern QString CurrentTaskStatus;
+extern qint64 CurrentTaskProgress;
+extern qint64 CurrentTaskTotalProgress;
+
 // RAII helper for the above — increment on construction, decrement on
 // destruction, so an early return/exception still balances it.
 struct BlockingGuard {

@@ -574,10 +574,42 @@ void DrawBlockingWait()
         // it, instead of quietly reintroducing the same fixed-width
         // assumption one level down.
         if (BeginFullscreenColumnWindow(0.0f, 0.0f, "blocking_wait")) {
-            const char* text = "Please wait...";
-            const ImVec2 textSize = ImGui::CalcTextSize(text);
-            ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - textSize.x) * 0.5f, (ImGui::GetWindowHeight() - textSize.y) * 0.5f));
+            // BigScreenDialogs::WaitForTask() (see its comment) fills these
+            // in from the waited-on Task's own getStatus()/getProgress()/
+            // getTotalProgress() every pump iteration — the same API the
+            // desktop's own ProgressDialog reads, so a real launch's
+            // "Executing N task(s) (X out of Y are done)" status text (from
+            // ConcurrentTask::updateState(), used for library/asset
+            // downloads) and its progress show up here too, instead of a
+            // bare static message. Empty/zero when no task is being waited
+            // on (e.g. a plain dialog answer via Choose/InputString/Confirm
+            // — those don't drive a Task at all), so this falls back to the
+            // same plain text as before.
+            const bool hasTask = !BigScreenDialogs::CurrentTaskStatus.isEmpty();
+            const QByteArray statusUtf8 = hasTask ? BigScreenDialogs::CurrentTaskStatus.toUtf8() : QByteArray("Please wait...");
+            const char* text = statusUtf8.constData();
+
+            const float barWidth = LayoutScale(600.0f);
+            const float barHeight = LayoutScale(24.0f);
+            const bool hasProgress = hasTask && BigScreenDialogs::CurrentTaskTotalProgress > 0;
+            const float blockHeight =
+                ImGui::GetTextLineHeight() + (hasProgress ? (LayoutScale(12.0f) + barHeight) : 0.0f);
+
+            ImVec2 textSize = ImGui::CalcTextSize(text);
+            ImGui::SetCursorPos(ImVec2((ImGui::GetWindowWidth() - textSize.x) * 0.5f, (ImGui::GetWindowHeight() - blockHeight) * 0.5f));
             ImGui::TextUnformatted(text);
+
+            if (hasProgress) {
+                const float fraction = std::clamp(
+                    static_cast<float>(BigScreenDialogs::CurrentTaskProgress) / static_cast<float>(BigScreenDialogs::CurrentTaskTotalProgress),
+                    0.0f, 1.0f);
+                char overlay[32];
+                std::snprintf(overlay, sizeof(overlay), "%d%%", static_cast<int>(fraction * 100.0f));
+
+                ImGui::SetCursorPosX((ImGui::GetWindowWidth() - barWidth) * 0.5f);
+                ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(12.0f));
+                ImGui::ProgressBar(fraction, ImVec2(barWidth, barHeight), overlay);
+            }
         }
         EndFullscreenColumnWindow();
     }
@@ -2391,7 +2423,7 @@ int main(int argc, char** argv)
             // events arriving fine but ImGui's nav not reacting to them.
             // Remove once gamepad nav is confirmed working end-to-end.
             if (event.type == SDL_CONTROLLERBUTTONDOWN) {
-                SDL_Log("[gamepad] button down: %d", event.cbutton.button);
+                SDL_Log("[gamepad] button down: %d windowFocused=%d", event.cbutton.button, windowFocused);
             } else if (event.type == SDL_CONTROLLERAXISMOTION && std::abs(event.caxis.value) > 16000) {
                 SDL_Log("[gamepad] axis %d moved: %d", event.caxis.axis, event.caxis.value);
             } else if (event.type == SDL_CONTROLLERDEVICEADDED) {
@@ -2450,6 +2482,38 @@ int main(int argc, char** argv)
 
         ImGui_ImplOpenGL3_NewFrame();
         ImGui_ImplSDL2_NewFrame();
+
+        // Gating the SDL event queue (above) turned out not to be enough on
+        // its own, for two stacked reasons — both confirmed live by the
+        // same test (a real controller held down while the window lost
+        // focus kept driving ImGui NavId changes indefinitely despite the
+        // gate):
+        //   1. imgui_impl_sdl2's gamepad handling is poll-based, not
+        //      event-based — ImGui_ImplSDL2_NewFrame() just above directly
+        //      reads the gamepad's *current* raw hardware state via
+        //      SDL_GameControllerGetButton()/GetAxis() every frame
+        //      (ImGui_ImplSDL2_UpdateGamepads(), called from inside
+        //      NewFrame), completely bypassing the SDL event queue and
+        //      therefore the isControllerEvent gate entirely.
+        //   2. That poll doesn't set io.KeysData[].Down directly either —
+        //      it calls io.AddKeyEvent(), which only *queues* the event
+        //      (g.InputEventsQueue); the actual Down state isn't updated
+        //      until ImGui::NewFrame() (further below) drains that queue.
+        //      So calling io.ClearInputKeys() here (which only zeroes the
+        //      already-applied KeysData[].Down, confirmed by reading its
+        //      implementation) doesn't help on its own: the queued event
+        //      from this same frame's poll is still sitting there, and
+        //      gets applied moments later when NewFrame() processes it,
+        //      silently undoing the clear. io.ClearEventsQueue() is what's
+        //      needed too, to drop that queued event before it can ever be
+        //      applied. Has to run *every* frame while unfocused, not just
+        //      once on the focus-lost transition — the underlying hardware
+        //      can still be held the whole time, and the poll re-queues a
+        //      fresh event from it every frame regardless.
+        if (!windowFocused) {
+            ImGui::GetIO().ClearInputKeys();
+            ImGui::GetIO().ClearEventsQueue();
+        }
 
         // Left stick also moves menu focus, not just D-pad — many
         // controller users default to the stick. imgui_impl_sdl2 already
@@ -2572,8 +2636,8 @@ int main(int argc, char** argv)
             static ImGuiID lastNavId = 0;
             const ImGuiID navId = ImGui::GetCurrentContext()->NavId;
             if (navId != lastNavId) {
-                SDL_Log("[gamepad] ImGui NavId changed: %u -> %u (source=%d)", lastNavId, navId,
-                        static_cast<int>(ImGui::GetCurrentContext()->NavInputSource));
+                SDL_Log("[gamepad] ImGui NavId changed: %u -> %u (source=%d) windowFocused=%d", lastNavId, navId,
+                        static_cast<int>(ImGui::GetCurrentContext()->NavInputSource), windowFocused);
                 lastNavId = navId;
             }
         }
