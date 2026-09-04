@@ -2817,16 +2817,44 @@ int main(int argc, char** argv)
         // suggested *minimum*), which read as "too sensitive"/triggering
         // from small or unintended stick movement. This uses a much larger
         // one instead, requiring a deliberate, firm push before nav moves
-        // at all. Still purely additive on top of the real D-pad's own key
-        // state (never explicitly clears these keys) — ImGui_ImplSDL2_NewFrame()
-        // just above already re-polls and resets them to the real D-pad's
-        // current state every frame, so once the stick returns inside the
-        // dead zone this naturally stops re-asserting "down" the same way a
-        // real D-pad release does — including the same built-in
-        // hold-then-repeat pacing Dear ImGui's nav system already applies
-        // to any held direction key, gamepad-native or (as here) synthetic,
-        // so a held stick deflection repeats at the same rate a held D-pad
-        // press would, with no separate repeat logic needed here.
+        // at all.
+        //
+        // Does NOT hold io.AddKeyEvent(key, true) continuously the way an
+        // earlier version did, relying on Dear ImGui's own held-key repeat
+        // timing (DownDuration-based) — that collided with
+        // UpdateGamepads()'s own per-frame poll of the *real* D-pad
+        // buttons, which unconditionally re-asserts the real (unpressed,
+        // since the user is using the stick, not the D-pad) button state
+        // through io.AddKeyEvent() on these exact same keys every single
+        // frame. Since the last *applied* Down state (from the previous
+        // frame, when this code's own "true" was applied) was true,
+        // UpdateGamepads()'s "false" this frame is a genuine queued
+        // transition, immediately followed by this code re-asserting
+        // "true" — both land in the same frame's input queue, so
+        // ImGui::NewFrame() processes false-then-true *every single
+        // frame*, resetting DownDuration to ~0 each time instead of letting
+        // it accumulate. Confirmed as the actual cause of "the stick reacts
+        // way too many times per push": with DownDuration never advancing
+        // past the "just pressed" threshold, ImGui's nav system fired a
+        // move on every single frame the stick was held (~60/sec) rather
+        // than once, then a deliberate delay, then a controlled repeat
+        // rate.
+        //
+        // Fixed by not depending on Dear ImGui's hold-repeat mechanism for
+        // the stick at all: this tracks its own held-direction state and
+        // repeat timing (via ImGui::GetTime(), the same clock ImGui's own
+        // timing uses), and fires each move as a brief true-then-false
+        // *pulse* — a single supported keypress, indistinguishable from a
+        // real quick tap — at moments this code controls, rather than
+        // holding the key down and trusting ImGui to pace repeats while
+        // something else keeps re-triggering the down edge underneath it.
+        // Only one axis is ever active at a time (whichever is more
+        // deflected), not both simultaneously on a diagonal push — nothing
+        // in BigScreen's own screens needs true 2D diagonal nav (every list
+        // is a single row or a single column), and letting a slightly
+        // diagonal push fire both an X and a Y move at once was itself
+        // part of "moves further than intended for one push".
+        //
         // Same reasoning as the controller-event gating above: this reads
         // the stick's raw current state directly rather than going through
         // SDL's event queue, so it needs its own explicit focus check —
@@ -2837,14 +2865,34 @@ int main(int argc, char** argv)
             constexpr Sint16 kStickDeadZone = 20000; // out of a max 32767 — a firm, deliberate push
             const Sint16 axisX = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTX);
             const Sint16 axisY = SDL_GameControllerGetAxis(pad, SDL_CONTROLLER_AXIS_LEFTY);
-            if (axisX < -kStickDeadZone)
-                io.AddKeyEvent(ImGuiKey_GamepadDpadLeft, true);
-            else if (axisX > kStickDeadZone)
-                io.AddKeyEvent(ImGuiKey_GamepadDpadRight, true);
-            if (axisY < -kStickDeadZone)
-                io.AddKeyEvent(ImGuiKey_GamepadDpadUp, true);
-            else if (axisY > kStickDeadZone)
-                io.AddKeyEvent(ImGuiKey_GamepadDpadDown, true);
+
+            ImGuiKey dir = ImGuiKey_None;
+            if (std::abs(axisX) >= std::abs(axisY)) {
+                if (axisX < -kStickDeadZone)
+                    dir = ImGuiKey_GamepadDpadLeft;
+                else if (axisX > kStickDeadZone)
+                    dir = ImGuiKey_GamepadDpadRight;
+            } else {
+                if (axisY < -kStickDeadZone)
+                    dir = ImGuiKey_GamepadDpadUp;
+                else if (axisY > kStickDeadZone)
+                    dir = ImGuiKey_GamepadDpadDown;
+            }
+
+            static ImGuiKey lastDir = ImGuiKey_None;
+            static double nextFireTime = 0.0;
+            const double now = ImGui::GetTime();
+            constexpr double kInitialDelay = 0.35; // before the first repeat
+            constexpr double kRepeatRate = 0.12;   // between repeats while held
+
+            if (dir == ImGuiKey_None) {
+                lastDir = ImGuiKey_None;
+            } else if (dir != lastDir || now >= nextFireTime) {
+                io.AddKeyEvent(dir, true);
+                io.AddKeyEvent(dir, false);
+                nextFireTime = now + (dir != lastDir ? kInitialDelay : kRepeatRate);
+                lastDir = dir;
+            }
         }
 
         ImGui::NewFrame();
