@@ -996,6 +996,56 @@ void DrawQuit(bool& done)
     EndFullscreenColumns();
 }
 
+// "+ Add Offline Account" (DrawAccounts()) opens this. Real desktop
+// equivalent: AccountListPage::on_actionAddOffline_triggered()
+// (launcher/ui/pages/global/AccountListPage.cpp) — same gate
+// (AccountList::anyAccountIsValid(), already a public accessor, no new API
+// needed), same MinecraftAccount::createOffline()/login()/addAccount()
+// sequence. Deliberately doesn't reproduce ChooseOfflineNameDialog's
+// "Allow invalid usernames" checkbox + live regex validation (3-16 chars,
+// English letters/digits/underscore) — BigScreenDialogs::InputString has
+// no live-validation hook, and this project already accepts whatever a
+// player types for other free-text fields (instance rename, etc.) without
+// replicating that class of desktop-side guardrail.
+void ShowAddOfflineAccount()
+{
+    AccountList* accounts = APPLICATION->accounts();
+
+    // Real desktop gate — offline accounts only make sense once at least
+    // one real Microsoft account has proven Minecraft ownership, otherwise
+    // there's no way to actually play (offline mode still needs *a*
+    // licensed copy on this launcher). Message reused verbatim except
+    // <br><br> replaced with \n\n — TR() needs the exact original source
+    // string (with the real <br><br>) to find the translation; the HTML
+    // tags themselves are stripped only from the *result*, for plain-text
+    // rendering, same as every other reused rich-text desktop string in
+    // this file.
+    if (!accounts->anyAccountIsValid()) {
+        QString message =
+            TR("AccountListPage", "You must add a Microsoft account that owns Minecraft before you can add an offline account."
+                                    "<br><br>"
+                                    "If you have lost your account you can contact Microsoft for support.");
+        message.replace("<br><br>", "\n\n").replace("<br>", "\n");
+        OpenInfoMessageDialog(TR("AccountListPage", "Error").toStdString(), message.toStdString());
+        return;
+    }
+
+    const auto username = BigScreenDialogs::InputString(TR("ChooseOfflineNameDialog", "Choose Offline Name").toStdString(),
+                                                          TR("AccountListPage", "Please enter your desired username to add your offline account.")
+                                                              .toStdString(),
+                                                          std::string());
+    if (!username || username->isEmpty())
+        return;
+
+    const MinecraftAccountPtr account = MinecraftAccount::createOffline(*username);
+    if (!account)
+        return;
+    account->login()->start();  // Completes synchronously, like the desktop's own call.
+    accounts->addAccount(account);
+    if (accounts->count() == 1)
+        accounts->setDefaultAccount(account);
+}
+
 void DrawAccounts()
 {
     AccountList* accounts = APPLICATION->accounts();
@@ -1017,6 +1067,14 @@ void DrawAccounts()
                 StartLogin();
                 SetScreen(Screen::AccountLogin);
             }
+
+            // Deferred through g_pendingAction — ShowAddOfflineAccount()
+            // calls the blocking BigScreenDialogs::InputString()/
+            // OpenInfoMessageDialog(), unsafe to call directly from inside
+            // this draw function's own mid-frame button check (same
+            // reasoning as every other g_pendingAction use in this file).
+            if (MenuButtonWithoutSummary("+ Add Offline Account"))
+                g_pendingAction = []() { ShowAddOfflineAccount(); };
 
             const MinecraftAccountPtr defaultAccount = accounts->defaultAccount();
             const int count = accounts->count();
@@ -1836,6 +1894,7 @@ void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, Mo
                           ModPlatform::ResourceProvider provider = ModPlatform::ResourceProvider::MODRINTH);
 void CheckResourceUpdates(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType resourceType,
                            const QString& dialogTitle);
+const ResourceAPI& GetResourceAPI(ModPlatform::ResourceProvider provider);
 void ShowResourceActionsMenu(ResourceFolderModel* model,
                               ModPlatform::ResourceType resourceType,
                               const QString& resourceName,
@@ -3272,28 +3331,30 @@ void LaunchInstance(MinecraftInstance* inst)
     }
 }
 
-// "Update Pack" — offered in ShowInstanceActionsMenu() only for
-// Modrinth-managed instances (inst->isManagedPack() &&
-// getManagedPackType() == "modrinth"; CurseForge managed packs aren't
-// supported — the online browsing/install machinery this reuses,
-// sections 27-29 in CLAUDE.md, is Modrinth-only, no API key wired up for
-// CurseForge). Real desktop equivalent:
-// ModrinthManagedPackPage::parseManagedPack()/ManagedPackPage::updatePack()
-// (launcher/ui/pages/instance/ManagedPackPage.cpp) — reuses the exact same
-// getProjectVersions()/InstanceImportTask machinery the earlier Modrinth
-// browsing rounds already built and proved, just seeded from the
-// ALREADY-installed pack's own ID (getManagedPackID()) instead of a fresh
-// search, and with "original_instance_id" in extraInfo (confirmed by
-// reading InstanceImportTask::processModrinth() — the exact same field
-// read there that this project's own online-install path leaves unset)
-// so the real ModrinthCreationTask replaces this instance in place rather
-// than creating a new sibling.
+// "Update Pack" — offered in ShowInstanceActionsMenu() for both Modrinth-
+// and CurseForge-managed instances (inst->isManagedPack() &&
+// getManagedPackType() is "modrinth" or "flame") since section 37 gave the
+// browsing/install machinery this reuses a real FlameAPI path too. Real
+// desktop equivalent: Modrinth/FlameManagedPackPage::parseManagedPack() +
+// ManagedPackPage::updatePack() (launcher/ui/pages/instance/
+// ManagedPackPage.cpp) — reuses the exact same getProjectVersions()/
+// InstanceImportTask machinery the online-browsing rounds already built
+// and proved, just seeded from the ALREADY-installed pack's own ID
+// (getManagedPackID()) instead of a fresh search, and with
+// "original_instance_id" in extraInfo (confirmed by reading
+// InstanceImportTask::processModrinth()/processFlame() — the exact same
+// field read in both) so the real *CreationTask replaces this instance in
+// place rather than creating a new sibling.
 void CheckAndUpdateManagedPack(MinecraftInstance* inst)
 {
     const std::string dialogTitle = TR("ManagedPackPage", "Update Pack").toStdString();
 
+    const bool isFlame = inst->getManagedPackType() == "flame";
+    const ModPlatform::ResourceProvider provider = isFlame ? ModPlatform::ResourceProvider::FLAME : ModPlatform::ResourceProvider::MODRINTH;
+
     ModPlatform::IndexedPack::Ptr pack = std::make_shared<ModPlatform::IndexedPack>();
     pack->addonId = inst->getManagedPackID();
+    pack->provider = provider;
 
     ResourceAPI::VersionSearchArgs versionArgs;
     versionArgs.pack = pack;
@@ -3302,7 +3363,7 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
     QVector<ModPlatform::IndexedVersion> versions;
     bool succeeded = false;
     QString failReason;
-    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+    Task::Ptr versionsTask = GetResourceAPI(provider).getProjectVersions(
         versionArgs, { [&versions, &succeeded](QVector<ModPlatform::IndexedVersion>& result) {
                           versions = result;
                           succeeded = true;
@@ -3320,18 +3381,27 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
         return;
     }
 
-    // Real desktop labeling: ModrinthManagedPackPage::parseManagedPack()
-    // appends " (Current)" to whichever returned version's raw `version`
-    // field matches getManagedPackVersionName() — note this compares
-    // against `version`, not `versionNumber`/`fileId` (the desktop's own
-    // comment there explains why: a version's fileId in this API response
-    // isn't always the same id recorded in the modpack format spec).
+    // Real desktop labeling differs by provider — confirmed by reading
+    // both ManagedPackPage.cpp classes directly, not assumed from the
+    // shared shape: ModrinthManagedPackPage::parseManagedPack() compares
+    // the returned version's raw `version` string field against
+    // getManagedPackVersionName() (its own comment explains why not
+    // fileId — Modrinth's fileId in this response isn't always the same
+    // id recorded in the modpack format spec), while
+    // FlameManagedPackPage::parseManagedPack() compares by `fileId`
+    // against getManagedPackVersionID() instead — CurseForge's file ids
+    // are stable and unambiguous, so it doesn't need the string-based
+    // workaround. Using the wrong comparison for either provider would
+    // mean "(Current)" never matching anything real.
     const QString currentVersionName = inst->getManagedPackVersionName();
+    const QString currentVersionId = inst->getManagedPackVersionID();
     std::vector<std::string> labels;
     for (const ModPlatform::IndexedVersion& v : versions) {
         QString label = v.getVersionDisplayString();
-        if (v.version == currentVersionName)
-            label = TR("ModrinthManagedPackPage", "%1 (Current)").arg(label);
+        const bool isCurrent = isFlame ? (v.fileId.toString() == currentVersionId) : (v.version == currentVersionName);
+        if (isCurrent)
+            label = isFlame ? TR("FlameManagedPackPage", "%1 (Current)").arg(label)
+                             : TR("ModrinthManagedPackPage", "%1 (Current)").arg(label);
         labels.push_back(label.toStdString());
     }
 
@@ -3340,7 +3410,8 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
         return;
     const ModPlatform::IndexedVersion& chosenVersion = versions[static_cast<int>(*choice)];
 
-    if (chosenVersion.version == currentVersionName) {
+    const bool chosenIsCurrent = isFlame ? (chosenVersion.fileId.toString() == currentVersionId) : (chosenVersion.version == currentVersionName);
+    if (chosenIsCurrent) {
         // No real desktop equivalent for this specific confirmation (the
         // desktop just lets you click "Update Pack" on the already-
         // selected "(Current)" entry with no extra prompt) — added here
@@ -3510,9 +3581,10 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
                              SetScreen(Screen::InstanceSettings);
                          } });
 
-    // Only for Modrinth-managed instances — see CheckAndUpdateManagedPack()'s
-    // own comment for why CurseForge-managed packs aren't offered this.
-    if (inst->isManagedPack() && inst->getManagedPackType() == "modrinth") {
+    // Modrinth- or CurseForge-managed instances — see
+    // CheckAndUpdateManagedPack()'s own comment for the provider-specific
+    // handling this now does internally.
+    if (inst->isManagedPack() && (inst->getManagedPackType() == "modrinth" || inst->getManagedPackType() == "flame")) {
         actions->push_back(
             { TR("ManagedPackPage", "Update Pack").toStdString(), [inst]() { g_pendingAction = [inst]() { CheckAndUpdateManagedPack(inst); }; } });
     }
@@ -5405,7 +5477,7 @@ int main(int argc, char** argv)
     // that's confirmed.
     if (const char* screenName = std::getenv("BIGSCREEN_TEST_SCREEN")) {
         const std::string name = screenName;
-        QTimer::singleShot(1500, &app, [name]() {
+        QTimer::singleShot(1500, &app, [name, &app]() {
             if (name == "instances")
                 SetScreen(Screen::Instances);
             else if (name == "accounts")
@@ -5445,6 +5517,19 @@ int main(int argc, char** argv)
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
                     g_instanceSettingsTarget = instances->at(0);
+                    // BIGSCREEN_TEST_INSTANCE_NAME=<name> — targets a
+                    // specific real instance by name instead of always the
+                    // first one, for diagnostics that need a particular
+                    // instance (e.g. a real Modrinth- vs. Flame-managed
+                    // pack). Falls back to at(0) if no match.
+                    if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                        for (int i = 0; i < instances->rowCount(); ++i) {
+                            if (instances->at(i)->name().toStdString() == wantedName) {
+                                g_instanceSettingsTarget = instances->at(i);
+                                break;
+                            }
+                        }
+                    }
 
                     if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands") {
                         g_instanceTopTab = 0;  // "Settings"
@@ -5496,8 +5581,17 @@ int main(int argc, char** argv)
             } else if (name == "instance_actions") {
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
+                    MinecraftInstance* target = instances->at(0);
+                    if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                        for (int i = 0; i < instances->rowCount(); ++i) {
+                            if (instances->at(i)->name().toStdString() == wantedName) {
+                                target = instances->at(i);
+                                break;
+                            }
+                        }
+                    }
                     SetScreen(Screen::Instances);
-                    ShowInstanceActionsMenu(instances->at(0));
+                    ShowInstanceActionsMenu(target);
                 }
             } else if (name == "add_instance") {
                 // Jumps straight to the Y-button "Add Instance" menu,
@@ -5555,6 +5649,44 @@ int main(int argc, char** argv)
                 providerOptions.emplace_back("CurseForge", false);
                 OpenChoiceDialog(TR("ModFolderPage", "Download Mods").toStdString(), false, std::move(providerOptions),
                                   [](s32, const std::string&, bool) {});
+            } else if (name == "add_offline_account") {
+                // TEMPORARY: real round-trip test of ShowAddOfflineAccount()
+                // — types a name into the real InputString dialog via
+                // io.AddInputCharactersUTF8() (first use of character
+                // injection in this project's own testing, as opposed to
+                // gamepad button injection) rather than pre-filling
+                // InputString()'s defaultValue, since the real function
+                // always passes an empty default. Logs account count
+                // before/after and cleans up the created account
+                // immediately, same "create real data, verify, remove"
+                // pattern already used for instance-creation tests.
+                AccountList* accounts = APPLICATION->accounts();
+                const int countBefore = accounts->count();
+                SDL_Log("[test-offline-account] countBefore=%d anyValid=%d", countBefore, accounts->anyAccountIsValid());
+
+                QTimer::singleShot(1000, &app, []() {
+                    SDL_Log("[test-offline-account] typing username");
+                    ImGui::GetIO().AddInputCharactersUTF8("BigScreenTestOffline");
+                });
+                QTimer::singleShot(1500, &app, []() {
+                    SDL_Log("[test-offline-account] pressing A (OK)");
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, true);
+                    ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, false);
+                });
+
+                ShowAddOfflineAccount();
+
+                const int countAfter = accounts->count();
+                MinecraftAccountPtr created;
+                for (int i = 0; i < countAfter; ++i) {
+                    if (accounts->at(i) && accounts->at(i)->profileName() == "BigScreenTestOffline")
+                        created = accounts->at(i);
+                }
+                SDL_Log("[test-offline-account] countAfter=%d created=%d", countAfter, created != nullptr);
+                if (created) {
+                    accounts->removeAccount(accounts->index(accounts->findAccountByProfileId(created->profileId())));
+                    SDL_Log("[test-offline-account] cleaned up, countFinal=%d", accounts->count());
+                }
             } else if (name == "add_instance_import") {
                 // Jumps straight to the zip-import file selector — this is
                 // exactly what caught the file selector's fixed-size-
@@ -5581,6 +5713,32 @@ int main(int argc, char** argv)
                     ResourceFolderModel* model = inst->loaderModList();
                     model->update();
                     CheckResourceUpdates(inst, model, ModPlatform::ResourceType::Mod, "Check for Updates");
+                }
+            } else if (name == "managed_pack_update") {
+                // TEMPORARY: runs the real CheckAndUpdateManagedPack()
+                // against a specific real instance (BIGSCREEN_TEST_
+                // INSTANCE_NAME), for screenshotting the version-choice
+                // list with a real "(Current)" label — read-only up to
+                // that point, killed by the test harness's timeout before
+                // any version could actually be selected, so nothing
+                // downloads/reinstalls.
+                InstanceList* instances = APPLICATION->instances();
+                MinecraftInstance* inst = nullptr;
+                if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                    for (int i = 0; i < instances->rowCount(); ++i) {
+                        if (instances->at(i)->name().toStdString() == wantedName) {
+                            inst = instances->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (inst) {
+                    SDL_Log("[test-managed-pack] target='%s' type='%s' versionId='%s' versionName='%s'",
+                            inst->name().toUtf8().constData(), inst->getManagedPackType().toUtf8().constData(),
+                            inst->getManagedPackVersionID().toUtf8().constData(), inst->getManagedPackVersionName().toUtf8().constData());
+                    CheckAndUpdateManagedPack(inst);
+                } else {
+                    SDL_Log("[test-managed-pack] instance not found");
                 }
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
@@ -5676,8 +5834,26 @@ int main(int argc, char** argv)
         const bool isFullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
         const bool sdlFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
         const bool noNativeDialogActive = QApplication::activeWindow() == nullptr;
-        const bool windowFocused =
-            (isFullscreen && isWaylandBackend) ? noNativeDialogActive : (sdlFocused && noNativeDialogActive);
+        // Second signal for the Wayland-fullscreen branch, alongside
+        // noNativeDialogActive: SDL_WINDOW_INPUT_FOCUS (sdlFocused above)
+        // is the one already established as unreliable there (gets stuck
+        // true forever after the windowed->fullscreen transition on a real
+        // KWin session — see the long comment below) — but that means the
+        // Wayland branch previously had NO real "did some other, non-Qt
+        // application steal focus" signal at all, only "is a Qt dialog
+        // up." g_hasWindowFocus is maintained separately, from the raw
+        // SDL_WINDOWEVENT_FOCUS_GAINED/LOST *events* in the poll loop
+        // below, rather than a queried flag — a reasoned bet that the
+        // event stream isn't corrupted by whatever internal bookkeeping
+        // bug leaves the queried flag stuck (events are pushed data, not a
+        // cached value read back later), but this is unconfirmed on real
+        // Wayland/KWin hardware, same as everything else focus-related in
+        // this file — BIGSCREEN_DEBUG_FOCUS below now logs it specifically
+        // so a real test session shows whether it also gets stuck the same
+        // way, rather than silently trusting it.
+        static bool g_hasWindowFocus = true;
+        const bool windowFocused = (isFullscreen && isWaylandBackend) ? (g_hasWindowFocus && noNativeDialogActive)
+                                                                       : (sdlFocused && noNativeDialogActive);
 
         // Kept diagnostic: periodic focus-state log independent of gamepad
         // events — this is what caught the isWaylandBackend regression
@@ -5691,8 +5867,8 @@ int main(int argc, char** argv)
             const double now = ImGui::GetTime();
             if (now - lastLog > 1.0) {
                 lastLog = now;
-                SDL_Log("[focus-diag] isFullscreen=%d sdlFocused=%d noNativeDialogActive=%d windowFocused=%d", isFullscreen, sdlFocused,
-                        noNativeDialogActive, windowFocused);
+                SDL_Log("[focus-diag] isFullscreen=%d sdlFocused=%d hasWindowFocus=%d noNativeDialogActive=%d windowFocused=%d",
+                        isFullscreen, sdlFocused, g_hasWindowFocus, noNativeDialogActive, windowFocused);
             }
         }
 
@@ -5707,6 +5883,12 @@ int main(int argc, char** argv)
             if (event.type == SDL_WINDOWEVENT && event.window.event == SDL_WINDOWEVENT_CLOSE &&
                 event.window.windowID == SDL_GetWindowID(window))
                 done = true;
+            if (event.type == SDL_WINDOWEVENT && event.window.windowID == SDL_GetWindowID(window)) {
+                if (event.window.event == SDL_WINDOWEVENT_FOCUS_GAINED)
+                    g_hasWindowFocus = true;
+                else if (event.window.event == SDL_WINDOWEVENT_FOCUS_LOST)
+                    g_hasWindowFocus = false;
+            }
 
             // TEMPORARY diagnostic (see the BigScreen plan): logs every raw
             // SDL controller event so we can tell, from the log alone,
