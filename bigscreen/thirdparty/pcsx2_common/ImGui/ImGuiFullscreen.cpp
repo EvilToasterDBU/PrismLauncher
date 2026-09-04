@@ -2124,7 +2124,26 @@ bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0
 
 	const ImGuiID id = window->GetID(title);
 	ImGui::ItemSize(size);
-	if (!ImGui::ItemAdd(bb, id))
+	const bool visible = ImGui::ItemAdd(bb, id);
+	// ItemAdd() records this item's rect/ID into window->DC.LastItemData
+	// regardless of its return value (needed for hover/nav bookkeeping on
+	// off-screen items too), so this is safe to check — and needs to run
+	// unconditionally, before the early-return below, since a nav move can
+	// land focus on an item that's *currently* clipped (that's the whole
+	// point of scrolling to it). Confirmed empirically this was the actual
+	// remaining piece of BigScreen's scrollable card rows: nav correctly
+	// moved focus through every item (including off-screen ones, verified
+	// by ImGui::IsItemFocused() firing for each), but nothing ever asked
+	// the enclosing window to scroll and bring the newly-focused item into
+	// view — ScrollX measured 0.0 the entire time regardless of which item
+	// had focus. ImGuiChildFlags_NavFlattened (used by BigScreen's
+	// scrollable child) only flattens *focus movement* across the child
+	// boundary; it does not imply "auto-scroll to follow focus" the way
+	// PCSX2's own reference usage (a plain top-level window, never
+	// scrolled) never needed to find out.
+	if (ImGui::GetCurrentContext()->NavId == id)
+		ImGui::SetScrollHereX(0.5f);
+	if (!visible)
 	{
 		// PCSX2's own usage never scrolls this widget (a handful of items
 		// that always fit one screen), so it never hit this path: skipping

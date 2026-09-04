@@ -45,11 +45,13 @@ jobs:
             artifact-name: Linux
             cmake-preset: linux
             qt-version: 6.10.2
+            glibc-arch: x86_64
 
           - os: ubuntu-24.04-arm
             artifact-name: Linux-aarch64
             cmake-preset: linux
             qt-version: 6.10.2
+            glibc-arch: aarch64
 
     runs-on: ${{ matrix.os }}
 
@@ -85,11 +87,15 @@ jobs:
       # bigscreen/CMakeLists.txt needs these (SDL2/OpenGL for the window
       # and input, fmt for the vendored ImGuiFullscreen toolkit). Installed
       # here rather than added to setup-dependencies/linux so the normal
-      # desktop CI job doesn't pay for packages it never uses.
+      # desktop CI job doesn't pay for packages it never uses. zstd/xz-utils
+      # are for the "Refresh glibc from Arch" step below (Arch packages are
+      # .pkg.tar.zst, ALARM's are .pkg.tar.xz) — both are near-universally
+      # preinstalled on Ubuntu already, but not guaranteed, so listed
+      # explicitly rather than assumed.
       - name: Install BigScreen-specific dependencies
         run: |
           sudo apt-get -y update
-          sudo apt-get -y install libsdl2-dev libfmt-dev libgl1-mesa-dev
+          sudo apt-get -y install libsdl2-dev libfmt-dev libgl1-mesa-dev zstd xz-utils
 
       ##
       # BUILD
@@ -196,40 +202,23 @@ jobs:
           #     wl_fixes_interface" (a Wayland protocol interface added
           #     after this bundle's libwayland-client was built).
           #
-          # libc.so.6/libpthread/libdl/librt and ld-linux-*.so.* itself are
-          # deliberately *not* in this list, unlike an earlier version of
-          # this fix — sharun's own bundled loader (confirmed by reading its
-          # source) only ever looks for the ELF interpreter *inside* the
-          # bundle, by exact filename, with no host fallback at all:
-          # deleting it here doesn't make anything fall back to the host,
-          # it just makes the whole package fail to start with "Interpreter
-          # not found!" (reproduced live). And the interpreter is not an
+          # libc.so.6/libm.so.6/libpthread/libdl/librt and ld-linux-*.so.*
+          # itself are NOT excluded here — see the "Refresh glibc" step
+          # below instead, which replaces them with current copies rather
+          # than deleting them. sharun's own bundled loader (confirmed by
+          # reading its source) only ever looks for the ELF interpreter
+          # *inside* the bundle, by exact filename, with no host fallback at
+          # all: deleting it doesn't make anything fall back to the host, it
+          # just makes the whole package fail to start with "Interpreter not
+          # found!" (reproduced live). And the interpreter is not an
           # ordinary dependency either: ld.so and libc.so.6 share private,
           # unversioned internal ABI and must come from the exact same
           # glibc build — confirmed live that pairing this bundle's own
           # ld.so with the host's newer libc.so.6 (leaving ld.so bundled,
-          # deleting only libc.so.6) segfaults immediately (core dump), so
-          # both must always travel together, and since ld.so can only ever
-          # be the bundled one, libc.so.6/libpthread/libdl/librt stay
-          # bundled too.
-          #
-          # That still leaves the *original* bug this whole exclusion list
-          # exists for — the host's own GPU driver
-          # (/usr/lib/libgallium-<ver>.so, dlopen'd by the host's Mesa EGL
-          # libraries at run time) needing a newer glibc symbol
-          # (GLIBC_2.43) than this runner's glibc provides. Confirmed live
-          # that the fix doesn't need the *whole* glibc family excluded,
-          # just the one file the driver actually complained about:
-          # excluding only libm.so.6 (which resolves to the host's, newer,
-          # copy — itself still compatible with the bundled libc.so.6 it
-          # depends on, since regular GLIBC_x.y symbol versioning, unlike
-          # ld.so/libc.so.6's private ABI, *is* forward-compatible) was
-          # enough on its own to take the exact same binary/data from
-          # "Could not get EGL display" every time to opening a real window
-          # and uploading its first texture, with the bundled ld.so/libc.so.6
-          # pair otherwise completely untouched.
-          rm -f "$stage"/shared/lib/libm.so.6 \
-                "$stage"/shared/lib/libstdc++.so.6 \
+          # deleting only libc.so.6) segfaults immediately (core dump). So
+          # this whole family has to stay bundled *and* has to be new
+          # enough for the host — see below.
+          rm -f "$stage"/shared/lib/libstdc++.so.6 \
                 "$stage"/shared/lib/libgcc_s.so.1 \
                 "$stage"/shared/lib/libwayland-client.so.0 \
                 "$stage"/shared/lib/libwayland-egl.so.1 \
@@ -244,17 +233,108 @@ jobs:
                 "$stage"/shared/lib/libxkbcommon.so.0 \
                 "$stage"/shared/lib/libxkbcommon-x11.so.0
 
-          # Must land next to the (hard-linked) binary in bin/ — that's
-          # exactly what bigscreen/main.cpp's resource lookup and
-          # Application::getJarPath() search for relative to the running
-          # executable. jars/ (JavaCheck.jar + NewLaunch(Legacy).jar) is
-          # already guaranteed to exist and be complete:
-          # prismlauncher_bigscreen's own CMake target depends on all three
-          # (bigscreen/CMakeLists.txt).
-          cp -r bigscreen/resources "$stage/bin/"
-          cp -r build/jars "$stage/bin/"
+          echo "STAGE=$stage" >> "$GITHUB_ENV"
 
-          tar -czf "$stage.tar.gz" "$stage"
+      # The remaining piece of the glibc problem above: ld.so/libc.so.6 have
+      # to stay bundled *together* (no host fallback, must be a matched
+      # pair — see the Package step), but this runner's own glibc
+      # (ubuntu-24.04's, currently 2.39) is already older than the
+      # rolling-release Arch-based systems BigScreen actually targets
+      # (SteamOS, CachyOS, and the pocknix Arch Linux ARM build this was
+      # debugged against directly) — and *any* host library that needs a
+      # newer glibc symbol than this runner's, whether that's the host's
+      # own Mesa/GPU driver stack (confirmed: GLIBC_2.43, dlopen'd
+      # transitively) or something as ordinary as the host's own libm.so.6
+      # depending on a newer libc.so.6 than bundled (confirmed on x86_64:
+      # "version `GLIBC_ABI_DT_X86_64_PLT' not found (required by
+      # /usr/lib/libm.so.6)"), breaks the app. Deleting individual files
+      # one at a time to chase each specific missing symbol doesn't scale —
+      # a different host library can always need a newer libc.so.6 than
+      # whatever we happened to bundle, and libc.so.6 itself can't be
+      # deleted (see above).
+      #
+      # Fixed at the root instead: replace the whole matched glibc-core set
+      # (ld.so + libc/libm/libpthread/libdl/librt) with current copies
+      # pulled directly from Arch's own package repos — Arch Linux proper
+      # for x86_64, Arch Linux ARM (ALARM) for aarch64 — rather than
+      # whatever this runner's own OS happens to ship. This isn't an
+      # arbitrary substitute: BigScreen's real-world targets are
+      # overwhelmingly Arch-family (SteamOS 3 is Arch-based; so are
+      # CachyOS, Bazzite's base is different but still tracks current
+      # kernels/Mesa; pocknix, the specific device this was debugged
+      # against, *is* Arch Linux ARM), so sourcing from the same family
+      # that's actually running on these devices — rather than a fixed
+      # Ubuntu LTS snapshot that only gets older relative to a
+      # rolling-release target — is the correct fix, not just a
+      # workaround. Confirmed directly: the aarch64 ld.so pulled this way
+      # is byte-identical in size to the one already running on the actual
+      # pocknix device this bug was diagnosed on.
+      #
+      # Parses the repo's own package database (core.db — the same file
+      # `pacman` itself uses to resolve package names to filenames) rather
+      # than scraping a version number from anywhere, so this keeps working
+      # as glibc gets updated upstream without needing any maintenance
+      # here. tar auto-detects the archive's compression (zstd for Arch
+      # proper, xz for ALARM) from its content, no extra flag needed.
+      - name: Refresh glibc from Arch (${{ matrix.glibc-arch }})
+        run: |
+          set -euo pipefail
+          if [ "${{ matrix.glibc-arch }}" = "x86_64" ]; then
+            mirror="https://geo.mirror.pkgbuild.com/core/os/x86_64"
+          else
+            mirror="http://mirror.archlinuxarm.org/aarch64/core"
+          fi
+
+          workdir="$(mktemp -d)"
+          curl -sL --retry 3 --retry-connrefused "$mirror/core.db" -o "$workdir/core.db"
+          pkgname="$(tar -tf "$workdir/core.db" | grep -E '^glibc-[0-9][^/]*/$' | head -1 | sed 's#/$##')"
+          if [ -z "$pkgname" ]; then
+            echo "Could not find glibc in $mirror/core.db" >&2
+            exit 1
+          fi
+          echo "Using $pkgname from $mirror"
+
+          # Arch packages (.pkg.tar.zst) and ALARM packages (.pkg.tar.xz)
+          # use different compression, hence trying both extensions rather
+          # than hardcoding one.
+          pkgfile=""
+          for ext in zst xz; do
+            candidate="$pkgname-${{ matrix.glibc-arch }}.pkg.tar.$ext"
+            if curl -sL --retry 3 --retry-connrefused -f "$mirror/$candidate" -o "$workdir/glibc.pkg.tar.$ext"; then
+              pkgfile="$workdir/glibc.pkg.tar.$ext"
+              break
+            fi
+          done
+          if [ -z "$pkgfile" ]; then
+            echo "Could not download $pkgname for ${{ matrix.glibc-arch }} from $mirror" >&2
+            exit 1
+          fi
+
+          mkdir -p "$workdir/extracted"
+          tar -xf "$pkgfile" -C "$workdir/extracted"
+
+          for f in ld-linux-x86-64.so.2 ld-linux-aarch64.so.1 libc.so.6 libm.so.6 libpthread.so.0 libdl.so.2 librt.so.1; do
+            if [ -f "$workdir/extracted/usr/lib/$f" ]; then
+              cp -fv "$workdir/extracted/usr/lib/$f" "$STAGE/shared/lib/$f"
+              chmod +x "$STAGE/shared/lib/$f"
+            fi
+          done
+
+          rm -rf "$workdir"
+
+      # Must land next to the (hard-linked) binary in bin/ — that's exactly
+      # what bigscreen/main.cpp's resource lookup and
+      # Application::getJarPath() search for relative to the running
+      # executable. jars/ (JavaCheck.jar + NewLaunch(Legacy).jar) is already
+      # guaranteed to exist and be complete: prismlauncher_bigscreen's own
+      # CMake target depends on all three (bigscreen/CMakeLists.txt).
+      - name: Finalize package
+        run: |
+          set -euo pipefail
+          cp -r bigscreen/resources "$STAGE/bin/"
+          cp -r build/jars "$STAGE/bin/"
+
+          tar -czf "$STAGE.tar.gz" "$STAGE"
 
       - name: Upload artifact
         uses: actions/upload-artifact@v4

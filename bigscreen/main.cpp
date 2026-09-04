@@ -293,7 +293,13 @@ void DrawScrollableCardRow(const char* id, float rowWidthLogical, float rowHeigh
     // Center when everything fits (matches the pre-scrolling behavior
     // exactly); flush to the start edge when it doesn't, so there's
     // nothing but the chevron to imply more content in that direction.
-    ImGui::SetCursorPosX(std::max(0.0f, (scrollAreaWidth - rowWidth) * 0.5f));
+    // Skipped entirely when rowWidth is 0 (an empty row, e.g. no instances
+    // yet) — moving the cursor with SetCursorPosX() and then submitting no
+    // item at all is exactly the case Dear ImGui's own debug tools flag
+    // ("Code uses SetCursorPos()... Please submit an item e.g. Dummy()
+    // afterwards"), reproduced live with an empty instances list.
+    if (rowWidth > 0.0f)
+        ImGui::SetCursorPosX(std::max(0.0f, (scrollAreaWidth - rowWidth) * 0.5f));
     drawItems();
     if (canOverflow) {
         showLeft = ImGui::GetScrollX() > 0.5f;
@@ -1920,6 +1926,15 @@ void DrawInstances()
             const float availableHeight = ImGui::GetContentRegionAvail().y;
             const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
             ImGui::SetCursorPosY(std::max(0.0f, (availableHeight - rowHeight) * 0.5f));
+
+            if (count == 0) {
+                const char* text = "No instances yet — press Y to add one.";
+                const ImVec2 textSize = g_medium_font.first->CalcTextSizeA(g_medium_font.second, FLT_MAX, 0.0f, text);
+                ImGui::SetCursorPosX(std::max(0.0f, (ImGui::GetContentRegionAvail().x - textSize.x) * 0.5f));
+                ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+                ImGui::TextUnformatted(text);
+                ImGui::PopFont();
+            }
 
             DrawScrollableCardRow("instances_row", rowWidthLogical, rowHeight, [&]() {
                 for (int i = 0; i < count; ++i) {
