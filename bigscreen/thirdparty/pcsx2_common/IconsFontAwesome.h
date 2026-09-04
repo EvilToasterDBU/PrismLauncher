@@ -35,3 +35,9 @@
 #define ICON_FA_CHEVRON_RIGHT "\xef\x81\x94"  // U+F054
 #define ICON_FA_CHEVRON_UP "\xef\x81\xb7"     // U+F077
 #define ICON_FA_CHEVRON_DOWN "\xef\x81\xb8"   // U+F078
+#define ICON_FA_BATTERY_FULL "\xef\x89\x80"            // U+F240
+#define ICON_FA_BATTERY_THREE_QUARTERS "\xef\x89\x81"  // U+F241
+#define ICON_FA_BATTERY_HALF "\xef\x89\x82"            // U+F242
+#define ICON_FA_BATTERY_QUARTER "\xef\x89\x83"         // U+F243
+#define ICON_FA_BATTERY_EMPTY "\xef\x89\x84"           // U+F244
+#define ICON_FA_BOLT "\xef\x83\xa7"                    // U+F0E7

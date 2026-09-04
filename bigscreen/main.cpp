@@ -62,8 +62,10 @@
 #include "settings/SettingsObject.h"
 
 #include <QColor>
+#include <QApplication>
 #include <QCoreApplication>
 #include <QDir>
+#include <QFile>
 #include <QFileInfo>
 #include <QPainter>
 #include <QPixmap>
@@ -75,6 +77,7 @@
 #include <qrencode.h>
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
 #include <filesystem>
 #include <functional>
@@ -176,7 +179,10 @@ void SetFooterHints(std::initializer_list<std::pair<const char*, std::string_vie
     SetFullscreenFooterText(std::span(items.begin(), items.size()));
 }
 
-constexpr float kTopBarHeight = 60.0f;
+// Kept in sync with the vendored toolkit's own LAYOUT_TOP_BAR_HEIGHT
+// (ImGuiFullscreen.h), which its dialog-centering code (DrawChoiceDialog()
+// etc.) needs to know about too — see its comment.
+constexpr float kTopBarHeight = ImGuiFullscreen::LAYOUT_TOP_BAR_HEIGHT;
 
 // A single top-bar tab icon (see DrawTopBar's tabs parameter) — no text
 // label, matching the reference (PCSX2's own settings screen shows category
@@ -185,6 +191,68 @@ struct TopBarTab {
     const char* icon;
     bool active;
 };
+
+// Linux battery info via sysfs (/sys/class/power_supply/<name>/{type,
+// capacity,status}) — no library needed, this is the same interface
+// upower/acpi themselves read. Handheld/laptop-only: desktops typically
+// have no entry with type=="Battery" at all, in which case this returns
+// nullopt and the top bar simply omits the indicator, matching the user's
+// own "if the device has one" ask. The scan for *which* power_supply entry
+// is the battery (there can be several non-battery entries — AC adapters,
+// USB-PD ports) only runs once; capacity/status are re-read periodically
+// (sysfs reads are cheap, but no reason to do it every single frame).
+struct BatteryInfo {
+    int percent;
+    bool charging;
+};
+
+std::optional<BatteryInfo> GetBatteryInfo()
+{
+    static bool scanned = false;
+    static QString batteryDir;
+    if (!scanned) {
+        scanned = true;
+        QDir powerSupply("/sys/class/power_supply");
+        for (const QString& entry : powerSupply.entryList(QDir::Dirs | QDir::NoDotAndDotDot)) {
+            QFile typeFile(powerSupply.filePath(entry) + "/type");
+            if (typeFile.open(QIODevice::ReadOnly) && typeFile.readAll().trimmed() == "Battery") {
+                batteryDir = powerSupply.filePath(entry);
+                break;
+            }
+        }
+    }
+    if (batteryDir.isEmpty())
+        return std::nullopt;
+
+    static std::optional<BatteryInfo> cached;
+    static std::chrono::steady_clock::time_point lastRead;
+    const auto now = std::chrono::steady_clock::now();
+    if (cached && now - lastRead < std::chrono::seconds(5))
+        return cached;
+    lastRead = now;
+
+    QFile capacityFile(batteryDir + "/capacity");
+    if (!capacityFile.open(QIODevice::ReadOnly)) {
+        cached.reset();
+        return cached;
+    }
+    bool ok = false;
+    const int percent = capacityFile.readAll().trimmed().toInt(&ok);
+    if (!ok) {
+        cached.reset();
+        return cached;
+    }
+
+    bool charging = false;
+    QFile statusFile(batteryDir + "/status");
+    if (statusFile.open(QIODevice::ReadOnly)) {
+        const QByteArray status = statusFile.readAll().trimmed();
+        charging = (status == "Charging" || status == "Full");
+    }
+
+    cached = BatteryInfo{ std::clamp(percent, 0, 100), charging };
+    return cached;
+}
 
 // A persistent status bar (app icon + screen title on the left) drawn above
 // every screen's content — the visual reference (PCSX2's own BigScreen
@@ -219,10 +287,29 @@ void DrawTopBar(const char* title, std::span<const TopBarTab> tabs = {})
     dl->AddText(g_large_font.first, g_large_font.second, titlePos, ImGui::GetColorU32(UIBackgroundTextColor), title);
 
     if (tabs.empty()) {
+        float rightEdge = displaySize.x - padding;
+
+        // "clock -> battery" (outermost-right, clock just to its left) —
+        // only shown when the device actually reports one via sysfs
+        // (desktops typically don't, matching the "if it has one" ask).
+        if (const std::optional<BatteryInfo> battery = GetBatteryInfo()) {
+            const char* icon = battery->percent >= 90   ? ICON_FA_BATTERY_FULL
+                                : battery->percent >= 65 ? ICON_FA_BATTERY_THREE_QUARTERS
+                                : battery->percent >= 35 ? ICON_FA_BATTERY_HALF
+                                : battery->percent >= 10 ? ICON_FA_BATTERY_QUARTER
+                                                          : ICON_FA_BATTERY_EMPTY;
+            char label[32];
+            std::snprintf(label, sizeof(label), "%s%s %d%%", battery->charging ? ICON_FA_BOLT " " : "", icon, battery->percent);
+            const ImVec2 batterySize = g_large_font.first->CalcTextSizeA(g_large_font.second, FLT_MAX, 0.0f, label);
+            const ImVec2 batteryPos(rightEdge - batterySize.x, (barHeight - g_large_font.second) * 0.5f);
+            dl->AddText(g_large_font.first, g_large_font.second, batteryPos, ImGui::GetColorU32(UIBackgroundTextColor), label);
+            rightEdge -= batterySize.x + LayoutScale(20.0f);
+        }
+
         const QString timeStr = QTime::currentTime().toString("HH:mm:ss");
         const QByteArray timeUtf8 = timeStr.toUtf8();
         const ImVec2 timeSize = g_large_font.first->CalcTextSizeA(g_large_font.second, FLT_MAX, 0.0f, timeUtf8.constData());
-        const ImVec2 timePos(displaySize.x - timeSize.x - padding, (barHeight - g_large_font.second) * 0.5f);
+        const ImVec2 timePos(rightEdge - timeSize.x, (barHeight - g_large_font.second) * 0.5f);
         dl->AddText(g_large_font.first, g_large_font.second, timePos, ImGui::GetColorU32(UIBackgroundTextColor), timeUtf8.constData());
         return;
     }
@@ -1573,18 +1660,62 @@ void DrawInstanceSettingsNotes()
     DrawTextSetting("notes", TR("NotesPage", "Notes"), "Freeform notes about this instance.", false, s);
 }
 
-// The desktop's ModFolderPage equivalent — enable/disable/delete only (no
-// browsing/installing new mods yet, matching M5's still-open "mod/modpack
-// browsing" scope; adding one from Modrinth/CurseForge needs the same kind
-// of larger browsing UI that's deferred there). loaderModList() lazily
-// creates the model but doesn't populate it — matches the desktop page's
-// own on-open update() call — so this triggers exactly one update() the
-// first time this tab is drawn for a given instance (tracked by comparing
-// the model pointer, which is stable for a given MinecraftInstance's
-// lifetime), then just re-polls size()/at() every frame the same way every
-// other BigScreen list already does (Instances, Accounts, ...) — no signal
-// wiring needed, the model's own QFileSystemWatcher keeps it current in
-// the background regardless of whether this tab is being drawn.
+// X on a focused mod opens this — matches ShowInstanceActionsMenu()'s own
+// shape exactly, including the same reason its "Delete" action defers
+// through g_pendingAction rather than calling BigScreenDialogs::Confirm
+// directly (this runs from inside DrawChoiceDialog()'s own callback via
+// OpenChoiceDialog, which is mid-frame; Confirm()'s blocking pump loop
+// can't start from there). "Check for Updates" and "Download Mods" are
+// real, requested actions with no implementation yet (each needs its own
+// substantially larger piece of work — a real update-checking task graph
+// for the first, a Modrinth/CurseForge browsing UI for the second, the
+// same "mod/modpack browsing" scope this project has deferred since M5) —
+// shown as an OpenInfoMessageDialog placeholder rather than silently doing
+// nothing or being left out of the menu, so it's clear they're planned,
+// not forgotten.
+void ShowModActionsMenu(ModFolderModel* mods, const QString& modName, const QString& fileName)
+{
+    ChoiceDialogOptions options;
+    options.emplace_back(StripMnemonic(MW("Dele&te")).toStdString(), false);
+    options.emplace_back("Check for Updates", false);
+    options.emplace_back("Download Mods", false);
+
+    OpenChoiceDialog(modName.toStdString(), false, std::move(options), [mods, modName, fileName](s32 index, const std::string&, bool) {
+        if (index < 0)
+            return;
+        g_pendingAction = [mods, modName, fileName, index]() {
+            CloseChoiceDialog();
+            switch (index) {
+                case 0: {
+                    const QString message = QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
+                    if (BigScreenDialogs::Confirm("Confirm Deletion", message.toStdString(), false, "Delete", "Cancel"))
+                        mods->uninstallResource(fileName);
+                    break;
+                }
+                case 1:
+                    OpenInfoMessageDialog("Coming Soon", "Checking for mod updates isn't implemented yet.");
+                    break;
+                case 2:
+                    OpenInfoMessageDialog("Coming Soon", "Browsing and downloading new mods isn't implemented yet.");
+                    break;
+            }
+        };
+    });
+}
+
+// The desktop's ModFolderPage equivalent — enable/disable via a toggle per
+// row, everything else (delete, check for updates, download mods — see
+// ShowModActionsMenu() above) behind X, matching explicit feedback that
+// destructive/heavier actions belong in a popup menu, not as another
+// inline control next to the toggle. loaderModList() lazily creates the
+// model but doesn't populate it — matches the desktop page's own on-open
+// update() call — so this triggers exactly one update() the first time
+// this tab is drawn for a given instance (tracked by comparing the model
+// pointer, which is stable for a given MinecraftInstance's lifetime), then
+// just re-polls size()/at() every frame the same way every other BigScreen
+// list already does (Instances, Accounts, ...) — no signal wiring needed,
+// the model's own QFileSystemWatcher keeps it current in the background
+// regardless of whether this tab is being drawn.
 void DrawInstanceSettingsMods()
 {
     ModFolderModel* mods = g_instanceSettingsTarget->loaderModList();
@@ -1613,34 +1744,48 @@ void DrawInstanceSettingsMods()
             mods->setResourceEnabled(indexes, enabled ? EnableAction::ENABLE : EnableAction::DISABLE);
         }
 
-        // X deletes the focused mod (confirmed first) — same
-        // g_pendingAction-deferred BigScreenDialogs::Confirm pattern
-        // ShowInstanceActionsMenu's own "Delete" uses, needed for the same
-        // reason: this runs mid-frame, and Confirm()'s blocking pump loop
-        // can't start from inside an already-open frame.
-        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)) {
-            ModFolderModel* modsForDelete = mods;
-            const QString modName = mod.name();
-            const QString fileName = mod.fileinfo().fileName();
-            g_pendingAction = [modsForDelete, modName, fileName]() {
-                const QString message = QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
-                if (!BigScreenDialogs::Confirm("Confirm Deletion", message.toStdString(), false, "Delete", "Cancel"))
-                    return;
-                modsForDelete->uninstallResource(fileName);
-            };
-        }
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+            ShowModActionsMenu(mods, mod.name(), mod.fileinfo().fileName());
     }
 }
 
-struct InstanceSettingsTab {
+struct InstanceSettingsSubTab {
     const char* name;
     void (*draw)();
 };
-static const InstanceSettingsTab kInstanceSettingsTabs[] = {
-    { "General", &DrawInstanceSettingsGeneral }, { "Java", &DrawInstanceSettingsJava },       { "Tweaks", &DrawInstanceSettingsTweaks },
-    { "Commands", &DrawInstanceSettingsCommands }, { "Mods", &DrawInstanceSettingsMods },      { "Notes", &DrawInstanceSettingsNotes },
+struct InstanceTopTab {
+    const char* name;
+    const char* icon;
+    const InstanceSettingsSubTab* subtabs;
+    int subtabCount;
 };
-int g_instanceSettingsTab = 0;
+
+// Two-level structure, matching DrawSettings()' own Category (LB/RB) +
+// Sub-tab (LT/RT) pattern exactly, rather than one flat row — per explicit
+// feedback that mixing "Settings' own internal groupings" (General/Java/
+// Tweaks/Commands/Notes — these were always one page's sub-tabs, matching
+// the desktop's own "settings" tab) with "Mods" (a genuinely separate
+// desktop page, like Version/Worlds/Screenshots/... will be too) in one
+// flat row read as structurally wrong, not just a naming nitpick: Mods
+// isn't a sibling of General/Java/etc., it's a sibling of the *whole*
+// Settings category. Future top-level categories (Version, Worlds, ...)
+// slot in here the same way Mods did — each its own InstanceTopTab entry,
+// not another flat tab appended to Settings' own row.
+static const InstanceSettingsSubTab kInstanceSettingsSubTabs[] = {
+    { "General", &DrawInstanceSettingsGeneral },   { "Java", &DrawInstanceSettingsJava },
+    { "Tweaks", &DrawInstanceSettingsTweaks },      { "Commands", &DrawInstanceSettingsCommands },
+    { "Notes", &DrawInstanceSettingsNotes },
+};
+static const InstanceSettingsSubTab kInstanceModsSubTabs[] = {
+    { "Mods", &DrawInstanceSettingsMods },
+};
+static const InstanceTopTab kInstanceTopTabs[] = {
+    { "Settings", "images/icons/settings.png", kInstanceSettingsSubTabs, static_cast<int>(std::size(kInstanceSettingsSubTabs)) },
+    { "Mods", "images/icons/tab_mods.png", kInstanceModsSubTabs, static_cast<int>(std::size(kInstanceModsSubTabs)) },
+};
+
+int g_instanceTopTab = 0;
+int g_instanceSubTab = 0;
 
 void DrawInstanceSettings()
 {
@@ -1652,13 +1797,21 @@ void DrawInstanceSettings()
         return;
     }
 
+    const int topTabCount = static_cast<int>(std::size(kInstanceTopTabs));
+    const InstanceTopTab& currentTop = kInstanceTopTabs[g_instanceTopTab];
+    const bool onModsTab = std::string(currentTop.name) == "Mods";
+
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
-        const bool onModsTab = std::string(kInstanceSettingsTabs[g_instanceSettingsTab].name) == "Mods";
         if (onModsTab) {
-            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
-                              { glyphs.west, "Delete" },
+            SetFooterHints({ { glyphs.confirm(false), "Toggle" },
+                              { glyphs.west, "Actions" },
                               { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { glyphs.cancel(false), "Back" } });
+        } else if (currentTop.subtabCount > 1) {
+            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { ICON_PF_XBOX_LT "/" ICON_PF_XBOX_RT, "Tab" },
                               { glyphs.cancel(false), "Back" } });
         } else {
             SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
@@ -1667,47 +1820,73 @@ void DrawInstanceSettings()
         }
     }
 
-    const int tabCount = static_cast<int>(std::size(kInstanceSettingsTabs));
     if (ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
-        g_instanceSettingsTab = (g_instanceSettingsTab + 1) % tabCount;
+        g_instanceTopTab = (g_instanceTopTab + 1) % topTabCount;
+        g_instanceSubTab = 0;
         QueueResetFocus(FocusResetType::Other);
     } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
-        g_instanceSettingsTab = (g_instanceSettingsTab - 1 + tabCount) % tabCount;
+        g_instanceTopTab = (g_instanceTopTab - 1 + topTabCount) % topTabCount;
+        g_instanceSubTab = 0;
         QueueResetFocus(FocusResetType::Other);
     }
+
+    // Nothing to switch to with only one sub-tab (Mods) — skip LT/RT
+    // handling and skip drawing the sub-tab row at all below, matching
+    // DrawSettings()' own identical rule (and root-caused fix — see its
+    // history — for why a single-item sub-tab row isn't just harmless
+    // clutter but can leave nav focus unreachable).
+    if (currentTop.subtabCount > 1) {
+        if (ImGui::IsKeyPressed(ImGuiKey_GamepadR2, false)) {
+            g_instanceSubTab = (g_instanceSubTab + 1) % currentTop.subtabCount;
+            QueueResetFocus(FocusResetType::Other);
+        } else if (ImGui::IsKeyPressed(ImGuiKey_GamepadL2, false)) {
+            g_instanceSubTab = (g_instanceSubTab - 1 + currentTop.subtabCount) % currentTop.subtabCount;
+            QueueResetFocus(FocusResetType::Other);
+        }
+    }
+
+    TopBarTab topTabs[std::size(kInstanceTopTabs)];
+    for (int i = 0; i < topTabCount; ++i)
+        topTabs[i] = { kInstanceTopTabs[i].icon, i == g_instanceTopTab };
 
     // "Edit... — <instance name> — <category>", matching Settings' own
     // "Settings — <category>" pattern.
     const std::string screenTitle = StripMnemonic(MW("&Edit...")).toStdString() + " \xE2\x80\x94 " +
-                                     g_instanceSettingsTarget->name().toStdString() + " \xE2\x80\x94 " +
-                                     kInstanceSettingsTabs[g_instanceSettingsTab].name;
+                                     g_instanceSettingsTarget->name().toStdString() + " \xE2\x80\x94 " + currentTop.name;
 
-    if (BeginScreen(screenTitle.c_str())) {
+    if (BeginScreen(screenTitle.c_str(), true, topTabs)) {
         if (BeginFullscreenColumnWindow(0.0f, 0.0f, "instance_settings")) {
-            // Same non-scrolling tab-row / scrolling-content two-child-window
-            // split DrawSettings() uses for its sub-tab row, and for the
-            // same reasons (NavTab's own trailing SameLine() would otherwise
-            // run into the first setting row; keeps the tab row pinned while
-            // the content below it scrolls).
-            ImGui::BeginChild("instance_settings_tabs",
-                               ImVec2(0.0f, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) + ImGui::GetStyle().FramePadding.y * 2.0f +
-                                                 LayoutScale(4.0f)),
-                               ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
-            BeginNavBar();
-            for (int i = 0; i < tabCount; ++i) {
-                if (NavTab(kInstanceSettingsTabs[i].name, i == g_instanceSettingsTab, true, 150.0f, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY,
-                           UISecondaryColor)) {
-                    g_instanceSettingsTab = i;
-                    QueueResetFocus(FocusResetType::Other);
+            if (currentTop.subtabCount > 1) {
+                // Same non-scrolling tab-row / scrolling-content two-child-
+                // window split DrawSettings() uses for its own sub-tab row,
+                // and for the same reasons (NavTab's own trailing
+                // ImGui::SameLine() would otherwise carry into the first
+                // setting row; keeps the tab row pinned while the content
+                // below it scrolls). ImGuiChildFlags_NavFlattened on both:
+                // without it, each nested BeginChild becomes its own
+                // separate nav boundary instead of merging into the
+                // parent's — D-pad nav couldn't reach into (or back out of)
+                // the settings list at all.
+                ImGui::BeginChild("instance_settings_subtabs",
+                                   ImVec2(0.0f, LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) +
+                                                     ImGui::GetStyle().FramePadding.y * 2.0f + LayoutScale(4.0f)),
+                                   ImGuiChildFlags_NavFlattened, ImGuiWindowFlags_NoScrollbar);
+                BeginNavBar();
+                for (int i = 0; i < currentTop.subtabCount; ++i) {
+                    if (NavTab(currentTop.subtabs[i].name, i == g_instanceSubTab, true, 150.0f, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY,
+                               UISecondaryColor)) {
+                        g_instanceSubTab = i;
+                        QueueResetFocus(FocusResetType::Other);
+                    }
                 }
+                EndNavBar();
+                ImGui::EndChild();
             }
-            EndNavBar();
-            ImGui::EndChild();
 
             ImGui::BeginChild("instance_settings_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
             BeginMenuButtons();
             ResetFocusHere();
-            kInstanceSettingsTabs[g_instanceSettingsTab].draw();
+            currentTop.subtabs[g_instanceSubTab].draw();
             EndMenuButtons();
             ImGui::EndChild();
         }
@@ -2413,10 +2592,13 @@ int main(int argc, char** argv)
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
                     g_instanceSettingsTarget = instances->at(0);
-                    g_instanceSettingsTab = (name == "instance_settings_java")     ? 1
-                                             : (name == "instance_settings_commands") ? 3
-                                             : (name == "instance_settings_mods")     ? 4
-                                                                                       : 0;
+                    if (name == "instance_settings_mods") {
+                        g_instanceTopTab = 1;  // "Mods"
+                        g_instanceSubTab = 0;
+                    } else {
+                        g_instanceTopTab = 0;  // "Settings"
+                        g_instanceSubTab = (name == "instance_settings_java") ? 1 : (name == "instance_settings_commands") ? 3 : 0;
+                    }
                     SetScreen(Screen::InstanceSettings);
                 }
             } else if (name == "instance_actions") {
@@ -2464,19 +2646,50 @@ int main(int argc, char** argv)
 
         // Gamepad input should only drive BigScreen while its own window
         // actually has WM focus — otherwise a button press meant for
-        // whatever else is on screen (alt-tabbed away, a Steam overlay, a
+        // whatever else is on screen (a native Qt dialog on top of it, a
         // different app) also gets processed here, which reads as BigScreen
         // "stealing" input in the background. Deliberately a *different*
         // signal from SDL_HINT_JOYSTICK_ALLOW_BACKGROUND_EVENTS above: that
         // hint controls whether SDL's joystick subsystem *delivers*
         // controller events at all (needed because its own internal focus
-        // tracking was unreliable under gamescope — see the comment there),
-        // while this checks the window's actual WM-reported focus before
-        // *acting* on events that did arrive. The two don't conflict: under
-        // gamescope, a dedicated BigScreen session is still the WM-focused
-        // surface, so SDL_WINDOW_INPUT_FOCUS reads true there regardless of
-        // whichever internal joystick quirk the other hint works around.
-        const bool windowFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        // tracking was unreliable under gamescope), while this checks
+        // focus before *acting* on events that did arrive.
+        //
+        // SDL_WINDOW_INPUT_FOCUS alone turned out not to be reliable enough
+        // on its own, though — confirmed live (a periodic diagnostic, no
+        // other window ever touched) that on this real Wayland/KWin
+        // session, once BigScreen actually switches to
+        // SDL_WINDOW_FULLSCREEN_DESKTOP (which happens shortly after window
+        // creation, via a *second* SDL_SetWindowFullscreen() call — see
+        // where BigScreenFullscreen is applied), the flag reads correctly
+        // true for the very first sample and then gets stuck false forever
+        // after, even with BigScreen the only thing on screen and no
+        // competing window ever created — this is what broke stick/gamepad
+        // input in fullscreen mode generally, not something specific to
+        // the earlier unfocused-input fix. A real quirk in how this
+        // compositor's xdg-shell handles the windowed->fullscreen
+        // transition's focus renegotiation, not something fixable from
+        // this side of the SDL/Wayland boundary. (The earlier windowed-mode
+        // test that first validated this whole gating approach — a konsole
+        // window stealing focus — never exercised the fullscreen path, so
+        // it didn't catch this.)
+        //
+        // Fixed by not trusting SDL's flag once fullscreen, and instead
+        // asking Qt directly whether one of *its own* top-level widgets is
+        // currently active. BigScreen never creates a QWidget of its own,
+        // so QApplication::activeWindow() is reliably null unless a real
+        // native dialog (the launch progress window, an instance console,
+        // an MSA login form, ...) is actually up and focused — exactly the
+        // case this gating exists to catch, and a signal Qt tracks
+        // entirely independently of SDL's window state. Still ANDed with
+        // SDL's flag while windowed (verified reliable there, and it adds
+        // real coverage SDL_WINDOW_FULLSCREEN_DESKTOP wouldn't give: e.g.
+        // alt-tabbing to an unrelated non-Qt app while BigScreen runs in a
+        // window rather than fullscreen).
+        const bool isFullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
+        const bool sdlFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
+        const bool noNativeDialogActive = QApplication::activeWindow() == nullptr;
+        const bool windowFocused = isFullscreen ? noNativeDialogActive : (sdlFocused && noNativeDialogActive);
 
         SDL_Event event;
         while (SDL_PollEvent(&event)) {

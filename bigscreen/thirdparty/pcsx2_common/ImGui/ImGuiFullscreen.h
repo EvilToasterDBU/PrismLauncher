@@ -38,6 +38,17 @@ namespace ImGuiFullscreen
 	static constexpr float LAYOUT_MENU_WINDOW_X_PADDING = 12.0f;
 	static constexpr float LAYOUT_FOOTER_PADDING = 10.0f;
 	static constexpr float LAYOUT_FOOTER_HEIGHT = LAYOUT_MEDIUM_FONT_SIZE + LAYOUT_FOOTER_PADDING * 2.0f;
+	// PCSX2's own reference usage has no persistent top bar, so its dialog-
+	// centering math (DrawChoiceDialog() etc.) only ever excludes
+	// LAYOUT_FOOTER_HEIGHT from the bottom. BigScreen added its own status
+	// bar (main.cpp's DrawTopBar(), kTopBarHeight — this value must match
+	// that one) on top of the vendored toolkit — without also excluding it
+	// here, a dialog centered in the *full* display (footer-only excluded)
+	// increasingly overlaps the top bar as Settings > Appearance > Scale
+	// grows past 100%, since both the dialog and the top bar grow together
+	// but the centering math never made room for the latter. Confirmed
+	// live at 150%.
+	static constexpr float LAYOUT_TOP_BAR_HEIGHT = 60.0f;
 	static constexpr float LAYOUT_HORIZONTAL_MENU_HEIGHT = 320.0f;
 	static constexpr float LAYOUT_HORIZONTAL_MENU_PADDING = 30.0f;
 	static constexpr float LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH = 250.0f;

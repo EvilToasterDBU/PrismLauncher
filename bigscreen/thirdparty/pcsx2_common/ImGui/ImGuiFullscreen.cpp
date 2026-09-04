@@ -2351,7 +2351,13 @@ void ImGuiFullscreen::DrawFileSelector()
 		return;
 
 	ImGui::SetNextWindowSize(LayoutScale(1000.0f, 680.0f));
-	ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
+	// See LAYOUT_TOP_BAR_HEIGHT's comment: center in the space between
+	// BigScreen's own top bar and the footer, not the full display —
+	// otherwise this increasingly overlaps the top bar as Scale grows past
+	// 100% (confirmed live at 150%).
+	ImGui::SetNextWindowPos(
+		ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f,
+			(LayoutScale(LAYOUT_TOP_BAR_HEIGHT) + ImGui::GetIO().DisplaySize.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)) * 0.5f),
 		ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 	ImGui::OpenPopup(s_file_selector_title.c_str());
 
@@ -2504,7 +2510,10 @@ void ImGuiFullscreen::DrawChoiceDialog()
 																		  LayoutScale(LAYOUT_MENU_BUTTON_Y_PADDING) * 2.0f) *
 																		  static_cast<float>(s_choice_dialog_options.size()));
 	ImGui::SetNextWindowSize(ImVec2(width, height));
-	ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
+	// See LAYOUT_TOP_BAR_HEIGHT's comment.
+	ImGui::SetNextWindowPos(
+		ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f,
+			(LayoutScale(LAYOUT_TOP_BAR_HEIGHT) + ImGui::GetIO().DisplaySize.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)) * 0.5f),
 		ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 	ImGui::OpenPopup(s_choice_dialog_title.c_str());
 
@@ -2627,7 +2636,10 @@ void ImGuiFullscreen::DrawInputDialog()
 		return;
 
 	ImGui::SetNextWindowSize(LayoutScale(700.0f, 0.0f));
-	ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
+	// See LAYOUT_TOP_BAR_HEIGHT's comment.
+	ImGui::SetNextWindowPos(
+		ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f,
+			(LayoutScale(LAYOUT_TOP_BAR_HEIGHT) + ImGui::GetIO().DisplaySize.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)) * 0.5f),
 		ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 	ImGui::OpenPopup(s_input_dialog_title.c_str());
 
@@ -2846,7 +2858,10 @@ void ImGuiFullscreen::DrawMessageDialog()
 	const char* win_id = s_message_dialog_title.empty() ? "##messagedialog" : s_message_dialog_title.c_str();
 
 	ImGui::SetNextWindowSize(LayoutScale(700.0f, 0.0f));
-	ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
+	// See LAYOUT_TOP_BAR_HEIGHT's comment.
+	ImGui::SetNextWindowPos(
+		ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f,
+			(LayoutScale(LAYOUT_TOP_BAR_HEIGHT) + ImGui::GetIO().DisplaySize.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)) * 0.5f),
 		ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 	ImGui::OpenPopup(win_id);
 
@@ -3024,7 +3039,10 @@ void ImGuiFullscreen::DrawProgressDialogs(ImVec2& position, float spacing)
 	{
 		const std::string popup_id = fmt::format("##progress_dialog_{}", data.id);
 		ImGui::SetNextWindowSize(LayoutScale(600.0f, 0.0f));
-		ImGui::SetNextWindowPos((ImGui::GetIO().DisplaySize - LayoutScale(0.0f, LAYOUT_FOOTER_HEIGHT)) * 0.5f,
+		// See LAYOUT_TOP_BAR_HEIGHT's comment.
+		ImGui::SetNextWindowPos(
+			ImVec2(ImGui::GetIO().DisplaySize.x * 0.5f,
+				(LayoutScale(LAYOUT_TOP_BAR_HEIGHT) + ImGui::GetIO().DisplaySize.y - LayoutScale(LAYOUT_FOOTER_HEIGHT)) * 0.5f),
 			ImGuiCond_Always, ImVec2(0.5f, 0.5f));
 		ImGui::OpenPopup(popup_id.c_str());
 
