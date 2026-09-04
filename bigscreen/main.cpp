@@ -1675,32 +1675,71 @@ void DrawInstanceSettingsNotes()
 // not forgotten.
 void ShowModActionsMenu(ModFolderModel* mods, const QString& modName, const QString& fileName)
 {
+    // "Check for Updates"/"Download Mods" reuse ModFolderPage's own real
+    // action text verbatim (ModFolderPage.cpp: updateMenu->addAction(tr(
+    // "Check for Updates")); ui->actionDownloadItem->setText(tr("Download
+    // Mods"));) — same words BigScreen already had, now actually routed
+    // through the matching Crowdin translation instead of coincidentally
+    // matching the English source.
+    const QString checkForUpdates = TR("ModFolderPage", "Check for Updates");
+    const QString downloadMods = TR("ModFolderPage", "Download Mods");
+
     ChoiceDialogOptions options;
     options.emplace_back(StripMnemonic(MW("Dele&te")).toStdString(), false);
-    options.emplace_back("Check for Updates", false);
-    options.emplace_back("Download Mods", false);
+    options.emplace_back(checkForUpdates.toStdString(), false);
+    options.emplace_back(downloadMods.toStdString(), false);
 
-    OpenChoiceDialog(modName.toStdString(), false, std::move(options), [mods, modName, fileName](s32 index, const std::string&, bool) {
-        if (index < 0)
-            return;
-        g_pendingAction = [mods, modName, fileName, index]() {
-            CloseChoiceDialog();
-            switch (index) {
-                case 0: {
-                    const QString message = QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
-                    if (BigScreenDialogs::Confirm("Confirm Deletion", message.toStdString(), false, "Delete", "Cancel"))
-                        mods->uninstallResource(fileName);
-                    break;
-                }
-                case 1:
-                    OpenInfoMessageDialog("Coming Soon", "Checking for mod updates isn't implemented yet.");
-                    break;
-                case 2:
-                    OpenInfoMessageDialog("Coming Soon", "Browsing and downloading new mods isn't implemented yet.");
-                    break;
-            }
-        };
-    });
+    OpenChoiceDialog(modName.toStdString(), false, std::move(options),
+                      [mods, modName, fileName, checkForUpdates, downloadMods](s32 index, const std::string&, bool) {
+                          if (index < 0)
+                              return;
+                          g_pendingAction = [mods, modName, fileName, index, checkForUpdates, downloadMods]() {
+                              CloseChoiceDialog();
+                              switch (index) {
+                                  case 0: {
+                                      // No desktop equivalent for this exact
+                                      // wording — ModFolderPage::removeItems()
+                                      // only confirms when the instance is
+                                      // *running* (a crash-risk warning, not
+                                      // a generic "are you sure"; the
+                                      // not-running case deletes with no
+                                      // confirmation at all on desktop) — but
+                                      // BigScreen keeps one regardless of
+                                      // running state, same as everywhere
+                                      // else a destructive gamepad action
+                                      // needs a confirm step. The *title*
+                                      // does have a real match though:
+                                      // ModFolderPage::removeItems()'s own
+                                      // CustomMessageBox::selectable(...,
+                                      // tr("Confirm Delete"), ...) — distinct
+                                      // from MainWindow's "Confirm Deletion"
+                                      // (used for whole-instance delete
+                                      // elsewhere in this file), which is a
+                                      // different real string for a
+                                      // different operation.
+                                      const QString message =
+                                          QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
+                                      if (BigScreenDialogs::Confirm(TR("ModFolderPage", "Confirm Delete").toStdString(),
+                                                                     message.toStdString(), false,
+                                                                     StripMnemonic(MW("Dele&te")).toStdString(),
+                                                                     TR("LaunchController", "Cancel").toStdString()))
+                                          mods->uninstallResource(fileName);
+                                      break;
+                                  }
+                                  case 1:
+                                      // No real equivalent for this exact
+                                      // status sentence — BigScreen-only,
+                                      // describing a BigScreen-specific gap.
+                                      OpenInfoMessageDialog(checkForUpdates.toStdString(),
+                                                             "Checking for mod updates isn't implemented yet.");
+                                      break;
+                                  case 2:
+                                      OpenInfoMessageDialog(downloadMods.toStdString(),
+                                                             "Browsing and downloading new mods isn't implemented yet.");
+                                      break;
+                              }
+                          };
+                      });
 }
 
 // The desktop's ModFolderPage equivalent — enable/disable via a toggle per
