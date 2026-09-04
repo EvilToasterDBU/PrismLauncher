@@ -68,12 +68,17 @@ void LaunchController::executeTask()
         return;
     }
 
-    if (!JavaCommon::checkJVMArgs(m_instance->settings()->get("JvmArgs").toString(), m_parentWidget)) {
+    if (!checkJvmArgsValid(m_instance->settings()->get("JvmArgs").toString())) {
         emitFailed(tr("Invalid Java arguments specified. Please fix this first."));
         return;
     }
 
     login();
+}
+
+bool LaunchController::checkJvmArgsValid(const QString& jvmargs)
+{
+    return JavaCommon::checkJVMArgs(jvmargs, m_parentWidget);
 }
 
 void LaunchController::decideAccount()
@@ -94,17 +99,7 @@ void LaunchController::decideAccount()
 
     if (!accounts->anyAccountIsValid()) {
         // Tell the user they need to log in at least one account in order to play.
-        auto reply = CustomMessageBox::selectable(m_parentWidget, tr("No Accounts"),
-                                                  tr("In order to play Minecraft, you must have at least one Microsoft "
-                                                     "account which owns Minecraft logged in. "
-                                                     "Would you like to open the account manager to add an account now?"),
-                                                  QMessageBox::Information, QMessageBox::Yes | QMessageBox::No)
-                         ->exec();
-
-        if (reply == QMessageBox::Yes) {
-            // Open the account manager.
-            APPLICATION->ShowGlobalSettings(m_parentWidget, "accounts");
-        } else if (reply == QMessageBox::No) {
+        if (!offerToOpenAccountManager()) {
             // Do not open "profile select" dialog.
             return;
         }
@@ -112,19 +107,44 @@ void LaunchController::decideAccount()
 
     if (!m_accountToUse && accounts->anyAccountIsValid()) {
         // If no default account is set, ask the user which one to use.
-        ProfileSelectDialog selectDialog(tr("Which account would you like to use?"), ProfileSelectDialog::GlobalDefaultCheckbox,
-                                         m_parentWidget);
-
-        selectDialog.exec();
-
-        // Launch the instance with the selected account.
-        m_accountToUse = selectDialog.selectedAccount();
+        bool useAsGlobalDefault = false;
+        m_accountToUse = selectAccountToUse(&useAsGlobalDefault);
 
         // If the user said to use the account as default, do that.
-        if (selectDialog.useAsGlobalDefault() && m_accountToUse) {
+        if (useAsGlobalDefault && m_accountToUse) {
             accounts->setDefaultAccount(m_accountToUse);
         }
     }
+}
+
+bool LaunchController::offerToOpenAccountManager()
+{
+    auto reply = CustomMessageBox::selectable(m_parentWidget, tr("No Accounts"),
+                                              tr("In order to play Minecraft, you must have at least one Microsoft "
+                                                 "account which owns Minecraft logged in. "
+                                                 "Would you like to open the account manager to add an account now?"),
+                                              QMessageBox::Information, QMessageBox::Yes | QMessageBox::No)
+                     ->exec();
+
+    if (reply == QMessageBox::Yes) {
+        // Open the account manager.
+        APPLICATION->ShowGlobalSettings(m_parentWidget, "accounts");
+    } else if (reply == QMessageBox::No) {
+        return false;
+    }
+    return true;
+}
+
+MinecraftAccountPtr LaunchController::selectAccountToUse(bool* useAsDefault)
+{
+    ProfileSelectDialog selectDialog(tr("Which account would you like to use?"), ProfileSelectDialog::GlobalDefaultCheckbox,
+                                     m_parentWidget);
+
+    selectDialog.exec();
+
+    if (useAsDefault)
+        *useAsDefault = selectDialog.useAsGlobalDefault();
+    return selectDialog.selectedAccount();
 }
 
 LaunchDecision LaunchController::decideLaunchMode()

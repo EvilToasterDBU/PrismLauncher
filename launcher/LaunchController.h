@@ -100,6 +100,26 @@ class LaunchController : public Task {
     // window, and closing *that* stray window was taking the whole
     // application down with it via Qt's normal window-close handling.
     virtual void showInstanceConsole(const QString& page = QString());
+    // Called from decideAccount() when no valid account exists at all.
+    // Default shows the real "No Accounts" QMessageBox and, on Yes, opens
+    // the desktop account-manager settings dialog — matching the original
+    // inline code exactly (including that the "Yes" path does NOT return
+    // early, only "No" does; decideAccount() replicates that by only
+    // returning early when this returns false).
+    virtual bool offerToOpenAccountManager();
+    // Called from decideAccount() when there are valid accounts but none
+    // resolved as the one to use (no instance-specific or global default).
+    // Default shows the real ProfileSelectDialog. *useAsDefault is set to
+    // whether the picked account should become the global default
+    // (mirrors ProfileSelectDialog::useAsGlobalDefault()).
+    virtual MinecraftAccountPtr selectAccountToUse(bool* useAsDefault);
+    // Called first thing in executeTask(), before anything else — checks
+    // the instance's JvmArgs for a handful of known-unsafe patterns (manual
+    // -Xmx/-Xms/PermSize memory flags that conflict with the dedicated
+    // memory settings, or a "-version:" flag). Default calls the real
+    // JavaCommon::checkJVMArgs(jvmargs, m_parentWidget), which shows a
+    // native warning QMessageBox and returns false if a problem was found.
+    virtual bool checkJvmArgsValid(const QString& jvmargs);
 
    private:
     void login();

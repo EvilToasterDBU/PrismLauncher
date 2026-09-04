@@ -2350,7 +2350,21 @@ void ImGuiFullscreen::DrawFileSelector()
 	if (!s_file_selector_open)
 		return;
 
-	ImGui::SetNextWindowSize(LayoutScale(1000.0f, 680.0f));
+	// Clamped to the real display size (minus a small margin), not just
+	// LayoutScale(1000, 680) unconditionally — BigScreen's own Scale
+	// setting (Settings > Appearance, up to 150%) multiplies
+	// g_layout_scale beyond what "fits" the window by design (see its own
+	// docs/comment), and unlike every other screen here (which build their
+	// content width from BeginFullscreenColumnWindow(0, 0, ...), already
+	// clamped to DisplaySize), this dialog's SetNextWindowSize() was fixed
+	// regardless of the real window size — confirmed live at 150%: a
+	// requested 1500x1020 size inside a real 1280x800 window, centered,
+	// pushed both left and right edges off-screen equally, clipping every
+	// row's leftmost characters (the window's own left edge sitting at a
+	// negative X, not a text-clipping bug).
+	const ImVec2 requestedSize = LayoutScale(1000.0f, 680.0f);
+	const ImVec2 maxSize = ImGui::GetIO().DisplaySize - LayoutScale(40.0f, 40.0f);
+	ImGui::SetNextWindowSize(ImVec2(std::min(requestedSize.x, maxSize.x), std::min(requestedSize.y, maxSize.y)));
 	// See LAYOUT_TOP_BAR_HEIGHT's comment: center in the space between
 	// BigScreen's own top bar and the footer, not the full display —
 	// otherwise this increasingly overlaps the top bar as Scale grows past

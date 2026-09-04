@@ -53,12 +53,40 @@
 #include "meta/Version.h"
 #include "meta/VersionList.h"
 #include "minecraft/MinecraftInstance.h"
+#include "InstanceCopyPrefs.h"
+#include "InstanceCopyTask.h"
+#include "InstanceImportTask.h"
+#include "MMCZip.h"
+#include "ResourceDownloadTask.h"
+#include "archive/ExportToZipTask.h"
 #include "minecraft/VanillaInstanceCreationTask.h"
 #include "minecraft/auth/AccountList.h"
 #include "minecraft/auth/AuthFlow.h"
 #include "minecraft/auth/MinecraftAccount.h"
+#include "minecraft/Component.h"
+#include "minecraft/PackProfile.h"
+#include "minecraft/World.h"
+#include "minecraft/WorldList.h"
+#include "modplatform/ModIndex.h"
+#include "modplatform/ResourceAPI.h"
+#include "modplatform/modrinth/ModrinthAPI.h"
+#include "net/ApiRequest.h"
+#include "net/NetJob.h"
+
+#include <FileSystem.h>
+#include <io/stream_reader.h>
+#include <io/stream_writer.h>
+#include <tag_compound.h>
+#include <tag_list.h>
+#include <tag_primitive.h>
+#include <tag_string.h>
+#include <sstream>
+#include "minecraft/mod/DataPackFolderModel.h"
 #include "minecraft/mod/ModFolderModel.h"
 #include "minecraft/mod/Resource.h"
+#include "minecraft/mod/ResourcePackFolderModel.h"
+#include "minecraft/mod/ShaderPackFolderModel.h"
+#include "minecraft/mod/TexturePackFolderModel.h"
 #include "settings/SettingsObject.h"
 
 #include <QColor>
@@ -67,6 +95,8 @@
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
+#include <QLocale>
+#include <QMap>
 #include <QPainter>
 #include <QPixmap>
 #include <QProcess>
@@ -84,6 +114,7 @@
 #include <initializer_list>
 #include <span>
 #include <unordered_map>
+#include <unordered_set>
 
 using namespace ImGuiFullscreen;
 
@@ -133,7 +164,7 @@ QString TrimTrailingColon(QString text)
     return text;
 }
 
-enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, InstanceSettings, Quit };
+enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, InstanceSettings, Quit, ModrinthBrowse };
 
 Screen g_screen = Screen::Landing;
 bool g_wantsQuit = false;
@@ -177,6 +208,23 @@ void SetScreen(Screen screen)
 void SetFooterHints(std::initializer_list<std::pair<const char*, std::string_view>> items)
 {
     SetFullscreenFooterText(std::span(items.begin(), items.size()));
+}
+
+// Whether the window should actually go fullscreen right now — the real
+// "BigScreenFullscreen" setting (persisted to the user's real
+// prismlauncher.cfg, defaults to true), UNLESS the BIGSCREEN_WINDOWED dev/
+// test env var is set, in which case this always returns false. Never
+// writes BIGSCREEN_WINDOWED's override back into the setting itself — a
+// test run must never persist "windowed" into the user's real config and
+// have it silently stick on their actual hardware afterward. Used both at
+// startup (main()) and every frame's live-toggle check, so a test run
+// can't be fought back into fullscreen by that per-frame check comparing
+// against the (unmodified) real setting value.
+bool WantFullscreen()
+{
+    if (qEnvironmentVariableIsSet("BIGSCREEN_WINDOWED"))
+        return false;
+    return APPLICATION->settings()->get("BigScreenFullscreen").toBool();
 }
 
 // Kept in sync with the vendored toolkit's own LAYOUT_TOP_BAR_HEIGHT
@@ -284,7 +332,49 @@ void DrawTopBar(const char* title, std::span<const TopBarTab> tabs = {})
         dl->AddImage(static_cast<ImTextureID>(appIcon->GetNativeHandle()), iconPos, iconPos + ImVec2(iconSize, iconSize));
 
     const ImVec2 titlePos(iconPos.x + iconSize + LayoutScale(12.0f), (barHeight - g_large_font.second) * 0.5f);
-    dl->AddText(g_large_font.first, g_large_font.second, titlePos, ImGui::GetColorU32(UIBackgroundTextColor), title);
+
+    // Right-hand content's *left edge* needs to be known before the title
+    // is drawn, not after — a long title (instance name + category, e.g.
+    // "Изменить… — automodpack — Screenshots") with enough tab icons
+    // (10, at the high end now with Servers/Screenshots added) can run
+    // right into the icon row otherwise, since AddText() has no width
+    // limit of its own and nothing previously stopped it there. Confirmed
+    // live via a real screenshot: title glyphs overlapping the Settings/
+    // Mods tab icons. Clipped (via cpu_fine_clip_rect) rather than
+    // measured-and-truncated-with-ellipsis — simpler, and good enough to
+    // just stop the overlap; a title long enough to hit this only loses a
+    // few trailing characters behind the icon row, still fully readable
+    // via the sub-tab's own on-screen content.
+    float titleClipRight = displaySize.x - padding;
+    if (!tabs.empty()) {
+        const float tabBoxSize = barHeight * 0.8f;
+        const float tabGap = LayoutScale(6.0f);
+        const float rowWidth = static_cast<float>(tabs.size()) * tabBoxSize + static_cast<float>(tabs.size() - 1) * tabGap;
+        titleClipRight = displaySize.x - padding - rowWidth - LayoutScale(12.0f);
+    } else {
+        // Mirrors the battery/clock width computation below (kept in sync
+        // by construction — same GetBatteryInfo()/QTime formatting) so
+        // the clip boundary matches where that content will actually
+        // start.
+        float rightEdge = displaySize.x - padding;
+        if (const std::optional<BatteryInfo> battery = GetBatteryInfo()) {
+            char label[32];
+            std::snprintf(label, sizeof(label), "%s%s %d%%", battery->charging ? ICON_FA_BOLT " " : "",
+                          battery->percent >= 90   ? ICON_FA_BATTERY_FULL
+                          : battery->percent >= 65 ? ICON_FA_BATTERY_THREE_QUARTERS
+                          : battery->percent >= 35 ? ICON_FA_BATTERY_HALF
+                          : battery->percent >= 10 ? ICON_FA_BATTERY_QUARTER
+                                                    : ICON_FA_BATTERY_EMPTY,
+                          battery->percent);
+            rightEdge -= g_large_font.first->CalcTextSizeA(g_large_font.second, FLT_MAX, 0.0f, label).x + LayoutScale(20.0f);
+        }
+        const QByteArray timeUtf8 = QTime::currentTime().toString("HH:mm:ss").toUtf8();
+        rightEdge -= g_large_font.first->CalcTextSizeA(g_large_font.second, FLT_MAX, 0.0f, timeUtf8.constData()).x;
+        titleClipRight = rightEdge - LayoutScale(12.0f);
+    }
+    const ImVec4 titleClipRect(titlePos.x, 0.0f, std::max(titlePos.x, titleClipRight), barHeight);
+    dl->AddText(g_large_font.first, g_large_font.second, titlePos, ImGui::GetColorU32(UIBackgroundTextColor), title, nullptr, 0.0f,
+                &titleClipRect);
 
     if (tabs.empty()) {
         float rightEdge = displaySize.x - padding;
@@ -439,6 +529,24 @@ GSTexture* GetInstanceIconTexture(MinecraftInstance* inst)
 MinecraftInstance* g_consoleInstance = nullptr;
 MinecraftInstance* g_instanceSettingsTarget = nullptr;
 
+// Instance Settings > Logs' own "list vs. viewer" state — see
+// DrawInstanceSettingsLogs(). Empty g_selectedLogFile means "show the file
+// list"; non-empty means "show g_selectedLogContent for this file".
+QString g_selectedLogFile;
+QString g_selectedLogContent;
+MinecraftInstance* g_selectedLogInstance = nullptr;
+
+// Instance Settings > Screenshots' own "list vs. viewer" state — same
+// shape as the Logs globals above, texture instead of text.
+// g_selectedScreenshotIndex is this file's position in the current
+// GetInstanceScreenshots() listing — drives gallery-style Left/Right
+// browsing inside the viewer (see OpenScreenshotViewer()); -1 means "not
+// viewing anything" / "unknown position."
+QString g_selectedScreenshotPath;
+std::shared_ptr<GSTexture> g_selectedScreenshotTexture;
+int g_selectedScreenshotIndex = -1;
+MinecraftInstance* g_selectedScreenshotInstance = nullptr;
+
 // Microsoft device-code login state (Accounts/AccountLogin screens). No
 // keyboard needed on this device at all: the user opens the shown URL (or
 // scans the QR, which encodes the same URL with the code pre-filled) on
@@ -583,6 +691,11 @@ void SwitchToDesktopMode()
 // consume the same button internally (see DrawChoiceDialog/DrawFileSelector
 // in the vendored ImGuiFullscreen.cpp), so acting here too in the same
 // frame would both close the popup *and* pop our own screen stack.
+
+// Defined near DrawModrinthBrowse() (depends on g_modrinthBrowse, declared
+// there) — forward-declared here since HandleBackButton() needs it and is
+// defined earlier in the file.
+Screen ModrinthBrowseBackTarget();
 void HandleBackButton()
 {
     if (IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen())
@@ -628,6 +741,9 @@ void HandleBackButton()
             break;
         case Screen::Quit:
             SetScreen(Screen::Landing);
+            break;
+        case Screen::ModrinthBrowse:
+            SetScreen(ModrinthBrowseBackTarget());
             break;
     }
 
@@ -1578,6 +1694,23 @@ void DrawInstanceSettingsGeneral()
         DrawToggleSetting("QuitAfterGameStop", TR("MinecraftSettingsWidget", "When the game window closes, quit the launcher"),
                            "Quit the launcher once this instance's game exits.", false, s);
     }
+
+    // Not an "override" gate like the others above (no matching
+    // OverrideXxx flag — registerSetting("GlobalDataPacksEnabled", false)
+    // is a plain per-instance setting) — this is what makes the "Data
+    // Packs" top-level tab (BuildInstanceTopTabs()) appear at all:
+    // dataPackList() returns nullptr unless this is on, matching
+    // GlobalDataPackPage::shouldDisplay() exactly. Off by default, so the
+    // tab is normally hidden — this toggle (plus the path field, reused
+    // verbatim from MinecraftSettingsWidget.ui) is the only way to turn it
+    // on from BigScreen.
+    DrawToggleSetting("GlobalDataPacksEnabled", StripMnemonic(TR("MinecraftSettingsWidget", "&Global Data Packs")),
+                       TR("MinecraftSettingsWidget", "Allows installing data packs across all worlds if an applicable mod is installed.\n"
+                                                      "It is most likely you will need to change the path - please refer to the mod's website."),
+                       false, s);
+    if (s->get("GlobalDataPacksEnabled").toBool())
+        DrawTextSetting("GlobalDataPacksPath", TR("MinecraftSettingsWidget", "Folder Path"),
+                         "Path to the shared data packs folder, relative to the instance's .minecraft directory.", false, s);
 }
 
 void DrawInstanceSettingsJava()
@@ -1660,148 +1793,1129 @@ void DrawInstanceSettingsNotes()
     DrawTextSetting("notes", TR("NotesPage", "Notes"), "Freeform notes about this instance.", false, s);
 }
 
-// X on a focused mod opens this — matches ShowInstanceActionsMenu()'s own
-// shape exactly, including the same reason its "Delete" action defers
-// through g_pendingAction rather than calling BigScreenDialogs::Confirm
-// directly (this runs from inside DrawChoiceDialog()'s own callback via
-// OpenChoiceDialog, which is mid-frame; Confirm()'s blocking pump loop
-// can't start from there). "Check for Updates" and "Download Mods" are
-// real, requested actions with no implementation yet (each needs its own
-// substantially larger piece of work — a real update-checking task graph
-// for the first, a Modrinth/CurseForge browsing UI for the second, the
-// same "mod/modpack browsing" scope this project has deferred since M5) —
-// shown as an OpenInfoMessageDialog placeholder rather than silently doing
-// nothing or being left out of the menu, so it's clear they're planned,
-// not forgotten.
-void ShowModActionsMenu(ModFolderModel* mods, const QString& modName, const QString& fileName)
+// X on a focused resource (mod / resource pack / texture pack / shader
+// pack — every one of these is a ResourceFolderModel under the hood, see
+// DrawResourceFolderList() below) opens this — matches
+// ShowInstanceActionsMenu()'s own shape exactly, including the same reason
+// its "Delete" action defers through g_pendingAction rather than calling
+// BigScreenDialogs::Confirm directly (this runs from inside
+// DrawChoiceDialog()'s own callback via OpenChoiceDialog, which is
+// mid-frame; Confirm()'s blocking pump loop can't start from there).
+// "Check for Updates" still has no implementation (needs a real
+// update-checking task graph — a substantially larger, separate piece of
+// work) — shown as an OpenInfoMessageDialog placeholder rather than
+// silently doing nothing or being left out of the menu, so it's clear
+// it's planned, not forgotten. "Download ..." opens StartResourceBrowse()
+// (defined near DrawModrinthBrowse(), forward-declared below) — the same
+// Modrinth browse screen StartModrinthBrowse() uses for whole-modpack
+// installs, here targeting this one resource type + the current
+// instance's already-existing folder instead. confirmDeleteTitle/
+// checkForUpdatesText/downloadText are passed in by the caller rather
+// than hardcoded here, since the real desktop source strings differ by
+// resource type (Mods reuses ModFolderPage's own bespoke overrides;
+// Resource/Texture/Shader/Data Packs reuse the shared
+// ExternalResourcesPage base text instead — see each
+// DrawInstanceSettingsXxx() wrapper below for exactly which).
+void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle);
+void ShowResourceActionsMenu(ResourceFolderModel* model,
+                              ModPlatform::ResourceType resourceType,
+                              const QString& resourceName,
+                              const QString& fileName,
+                              const QString& confirmDeleteTitle,
+                              const QString& checkForUpdatesText,
+                              const QString& downloadText)
 {
-    // "Check for Updates"/"Download Mods" reuse ModFolderPage's own real
-    // action text verbatim (ModFolderPage.cpp: updateMenu->addAction(tr(
-    // "Check for Updates")); ui->actionDownloadItem->setText(tr("Download
-    // Mods"));) — same words BigScreen already had, now actually routed
-    // through the matching Crowdin translation instead of coincidentally
-    // matching the English source.
-    const QString checkForUpdates = TR("ModFolderPage", "Check for Updates");
-    const QString downloadMods = TR("ModFolderPage", "Download Mods");
-
     ChoiceDialogOptions options;
     options.emplace_back(StripMnemonic(MW("Dele&te")).toStdString(), false);
-    options.emplace_back(checkForUpdates.toStdString(), false);
-    options.emplace_back(downloadMods.toStdString(), false);
+    options.emplace_back(checkForUpdatesText.toStdString(), false);
+    options.emplace_back(downloadText.toStdString(), false);
 
-    OpenChoiceDialog(modName.toStdString(), false, std::move(options),
-                      [mods, modName, fileName, checkForUpdates, downloadMods](s32 index, const std::string&, bool) {
-                          if (index < 0)
-                              return;
-                          g_pendingAction = [mods, modName, fileName, index, checkForUpdates, downloadMods]() {
-                              CloseChoiceDialog();
-                              switch (index) {
-                                  case 0: {
-                                      // No desktop equivalent for this exact
-                                      // wording — ModFolderPage::removeItems()
-                                      // only confirms when the instance is
-                                      // *running* (a crash-risk warning, not
-                                      // a generic "are you sure"; the
-                                      // not-running case deletes with no
-                                      // confirmation at all on desktop) — but
-                                      // BigScreen keeps one regardless of
-                                      // running state, same as everywhere
-                                      // else a destructive gamepad action
-                                      // needs a confirm step. The *title*
-                                      // does have a real match though:
-                                      // ModFolderPage::removeItems()'s own
-                                      // CustomMessageBox::selectable(...,
-                                      // tr("Confirm Delete"), ...) — distinct
-                                      // from MainWindow's "Confirm Deletion"
-                                      // (used for whole-instance delete
-                                      // elsewhere in this file), which is a
-                                      // different real string for a
-                                      // different operation.
-                                      const QString message =
-                                          QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
-                                      if (BigScreenDialogs::Confirm(TR("ModFolderPage", "Confirm Delete").toStdString(),
-                                                                     message.toStdString(), false,
-                                                                     StripMnemonic(MW("Dele&te")).toStdString(),
-                                                                     TR("LaunchController", "Cancel").toStdString()))
-                                          mods->uninstallResource(fileName);
-                                      break;
-                                  }
-                                  case 1:
-                                      // No real equivalent for this exact
-                                      // status sentence — BigScreen-only,
-                                      // describing a BigScreen-specific gap.
-                                      OpenInfoMessageDialog(checkForUpdates.toStdString(),
-                                                             "Checking for mod updates isn't implemented yet.");
-                                      break;
-                                  case 2:
-                                      OpenInfoMessageDialog(downloadMods.toStdString(),
-                                                             "Browsing and downloading new mods isn't implemented yet.");
-                                      break;
-                              }
-                          };
-                      });
+    OpenChoiceDialog(
+        resourceName.toStdString(), false, std::move(options),
+        [model, resourceType, resourceName, fileName, confirmDeleteTitle, checkForUpdatesText, downloadText](s32 index,
+                                                                                                                const std::string&, bool) {
+            if (index < 0)
+                return;
+            g_pendingAction = [model, resourceType, resourceName, fileName, index, confirmDeleteTitle, checkForUpdatesText,
+                                downloadText]() {
+                CloseChoiceDialog();
+                switch (index) {
+                    case 0: {
+                        // BigScreen always confirms destructive gamepad
+                        // actions regardless of running state — the desktop
+                        // side only confirms deletion while the instance is
+                        // actually running (a crash-risk warning, see
+                        // ExternalResourcesPage::removeItems()), and skips
+                        // any prompt at all otherwise, but that asymmetry
+                        // doesn't fit a controller-only UI, so this message
+                        // is BigScreen's own wording. The *title* does reuse
+                        // the real desktop string the caller passed in
+                        // though.
+                        const QString message =
+                            QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(resourceName);
+                        if (BigScreenDialogs::Confirm(confirmDeleteTitle.toStdString(), message.toStdString(), false,
+                                                       StripMnemonic(MW("Dele&te")).toStdString(),
+                                                       TR("LaunchController", "Cancel").toStdString()))
+                            model->uninstallResource(fileName);
+                        break;
+                    }
+                    case 1:
+                        // No real equivalent for this exact status sentence
+                        // — BigScreen-only, describing a BigScreen-specific
+                        // gap.
+                        OpenInfoMessageDialog(checkForUpdatesText.toStdString(), "Checking for updates isn't implemented yet.");
+                        break;
+                    case 2:
+                        StartResourceBrowse(g_instanceSettingsTarget, model, resourceType, downloadText);
+                        break;
+                }
+            };
+        });
 }
 
-// The desktop's ModFolderPage equivalent — enable/disable via a toggle per
-// row, everything else (delete, check for updates, download mods — see
-// ShowModActionsMenu() above) behind X, matching explicit feedback that
-// destructive/heavier actions belong in a popup menu, not as another
-// inline control next to the toggle. loaderModList() lazily creates the
-// model but doesn't populate it — matches the desktop page's own on-open
-// update() call — so this triggers exactly one update() the first time
-// this tab is drawn for a given instance (tracked by comparing the model
-// pointer, which is stable for a given MinecraftInstance's lifetime), then
-// just re-polls size()/at() every frame the same way every other BigScreen
-// list already does (Instances, Accounts, ...) — no signal wiring needed,
-// the model's own QFileSystemWatcher keeps it current in the background
-// regardless of whether this tab is being drawn.
-void DrawInstanceSettingsMods()
+// Shared by every "list of installed X, toggle to enable/disable, X opens
+// the actions menu" tab (Mods/Resource Packs/Texture Packs/Shader Packs) —
+// all four of the underlying model types (ModFolderModel,
+// ResourcePackFolderModel, TexturePackFolderModel, ShaderPackFolderModel)
+// are plain ResourceFolderModel subclasses with no additional API this
+// screen needs, confirmed by reading each header directly rather than
+// assumed from the similar page names. Matches explicit feedback that
+// destructive/heavier actions belong in a popup menu (X), not as another
+// inline control next to the toggle. The model's *List() getter on
+// MinecraftInstance lazily creates it but doesn't populate it — matches
+// each desktop page's own on-open update() call — so this triggers one
+// update() the first time a given model pointer is seen (comparing against
+// the previous call's pointer; harmless to re-trigger on every tab switch
+// since update() is designed to be called repeatedly, same as the desktop
+// page does every time it's opened), then just re-polls size()/at() every
+// frame the same way every other BigScreen list already does (Instances,
+// Accounts, ...) — no signal wiring needed, each model's own
+// QFileSystemWatcher keeps it current in the background regardless of
+// whether its tab is being drawn.
+void DrawResourceFolderList(ResourceFolderModel* model,
+                             ModPlatform::ResourceType resourceType,
+                             const char* emptyText,
+                             const QString& confirmDeleteTitle,
+                             const QString& checkForUpdatesText,
+                             const QString& downloadText)
 {
-    ModFolderModel* mods = g_instanceSettingsTarget->loaderModList();
-
-    static ModFolderModel* lastModel = nullptr;
-    if (mods != lastModel) {
-        mods->update();
-        lastModel = mods;
+    static ResourceFolderModel* lastModel = nullptr;
+    if (model != lastModel) {
+        model->update();
+        lastModel = model;
     }
 
-    const int count = static_cast<int>(mods->size());
+    const int count = static_cast<int>(model->size());
     if (count == 0) {
-        ImGui::TextUnformatted("No mods installed.");
+        ImGui::TextUnformatted(emptyText);
         return;
     }
 
     const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
 
     for (int i = 0; i < count; ++i) {
-        Resource& mod = mods->at(i);
-        bool enabled = mod.enabled();
-        const QByteArray nameUtf8 = mod.name().toUtf8();
+        Resource& resource = model->at(i);
+        bool enabled = resource.enabled();
+        const QByteArray nameUtf8 = resource.name().toUtf8();
 
+        // PushID(i): ImGuiFullscreen's widgets derive their ImGui ID from
+        // the title text alone (see MenuButtonFrame() in the vendored
+        // toolkit) — two resources with the same display name (confirmed
+        // live: a real instance had two shader packs both named
+        // "LethalRudimentary") would otherwise collide onto the same ID,
+        // which Dear ImGui flags with its own "2 visible items with
+        // conflicting ID" debug overlay and — worse — makes both rows
+        // respond to input as if they were one. Scoping by loop index
+        // guarantees uniqueness regardless of what's on disk.
+        ImGui::PushID(i);
         if (ToggleButton(nameUtf8.constData(), nullptr, &enabled)) {
-            const QModelIndexList indexes = { mods->index(i, 0) };
-            mods->setResourceEnabled(indexes, enabled ? EnableAction::ENABLE : EnableAction::DISABLE);
+            const QModelIndexList indexes = { model->index(i, 0) };
+            model->setResourceEnabled(indexes, enabled ? EnableAction::ENABLE : EnableAction::DISABLE);
         }
 
         if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)) {
             // ResourceFolderModel::uninstallResource() (see its own
             // implementation) matches against the *base* filename, and
             // itself strips a trailing ".disabled" — the suffix
-            // PrismLauncher appends on disk when a mod is toggled off —
-            // before comparing, but only from its own internal copy, not
-            // from whatever the caller passes in. mod.fileinfo().fileName()
-            // reports the file exactly as it sits on disk right now, so for
-            // a currently-disabled mod that's already ".disabled"-suffixed,
-            // and passing it through unstripped never matches, so the
-            // delete silently no-ops. Confirmed live: worked once (the
-            // first mod deleted happened to be enabled), then stopped
-            // working — the user's list has both enabled and disabled
-            // mods, and every later attempt landed on a disabled one.
-            QString fileName = mod.fileinfo().fileName();
-            if (!mod.enabled() && fileName.endsWith(".disabled"))
+            // PrismLauncher appends on disk when a resource is toggled off
+            // — before comparing, but only from its own internal copy, not
+            // from whatever the caller passes in. resource.fileinfo().
+            // fileName() reports the file exactly as it sits on disk right
+            // now, so for a currently-disabled resource that's already
+            // ".disabled"-suffixed, passing it through unstripped never
+            // matches and the delete silently no-ops (confirmed live for
+            // Mods specifically — same underlying model type, so the same
+            // fix applies uniformly here).
+            QString fileName = resource.fileinfo().fileName();
+            if (!resource.enabled() && fileName.endsWith(".disabled"))
                 fileName.chop(9);
-            ShowModActionsMenu(mods, mod.name(), fileName);
+            ShowResourceActionsMenu(model, resourceType, resource.name(), fileName, confirmDeleteTitle, checkForUpdatesText,
+                                     downloadText);
         }
+        ImGui::PopID();
+    }
+}
+
+void DrawInstanceSettingsMods()
+{
+    // "Check for Updates"/"Download Mods" reuse ModFolderPage's own real
+    // action text verbatim (ModFolderPage.cpp: updateMenu->addAction(tr(
+    // "Check for Updates")); ui->actionDownloadItem->setText(tr("Download
+    // Mods"));), and its delete-confirmation title reuses ModFolderPage's
+    // own override of removeItems() (tr("Confirm Delete")) — distinct from
+    // MainWindow's "Confirm Deletion" (used for whole-instance delete
+    // elsewhere in this file), a different real string for a different
+    // operation.
+    DrawResourceFolderList(g_instanceSettingsTarget->loaderModList(), ModPlatform::ResourceType::Mod, "No mods installed.",
+                            TR("ModFolderPage", "Confirm Delete"), TR("ModFolderPage", "Check for Updates"),
+                            TR("ModFolderPage", "Download Mods"));
+}
+
+// Resource/Texture/Shader Packs don't override removeItems() on the
+// desktop side the way ModFolderPage does (confirmed — grepped each page's
+// .cpp for it, found nothing), so their real "Confirm Delete" title and
+// "Check for &Updates" action text come from the shared
+// ExternalResourcesPage base class instead (ExternalResourcesPage.cpp's
+// removeItems(), and ExternalResourcesPage.ui's actionUpdateItem — the
+// context for a Designer-form action's default text is the form's own
+// <class>, i.e. "ExternalResourcesPage", not whichever subclass happens to
+// use it unchanged). Each page's "Download Packs" text *is* its own
+// override though (every one of the three sets it explicitly in its
+// constructor), so that one is looked up per-type.
+void DrawInstanceSettingsResourcePacks()
+{
+    DrawResourceFolderList(g_instanceSettingsTarget->resourcePackList(), ModPlatform::ResourceType::ResourcePack,
+                            "No resource packs installed.", TR("ExternalResourcesPage", "Confirm Delete"),
+                            StripMnemonic(TR("ExternalResourcesPage", "Check for &Updates")), TR("ResourcePackPage", "Download Packs"));
+}
+
+// Texture Packs search under ResourceType::ResourcePack too, not a
+// separate "TexturePack" type — confirmed by reading both
+// ModrinthAPI.cpp's g_resourceTypeMap (no TexturePack entry — Modrinth's
+// own taxonomy files legacy texture packs under the same "resourcepack"
+// project type as modern resource packs) and the desktop's own
+// TexturePackResourceModel (ui/pages/modplatform/TexturePackModel.cpp),
+// which subclasses ResourcePackResourceModel and only adds legacy-MC-
+// version filtering on top of its search — never introduces its own
+// resource type. The install *target* is still texturePackList()
+// (the correct legacy-format instance folder), just the browse/search
+// type that differs from the folder name.
+void DrawInstanceSettingsTexturePacks()
+{
+    DrawResourceFolderList(g_instanceSettingsTarget->texturePackList(), ModPlatform::ResourceType::ResourcePack,
+                            "No texture packs installed.", TR("ExternalResourcesPage", "Confirm Delete"),
+                            StripMnemonic(TR("ExternalResourcesPage", "Check for &Updates")), TR("TexturePackPage", "Download Packs"));
+}
+
+void DrawInstanceSettingsShaderPacks()
+{
+    DrawResourceFolderList(g_instanceSettingsTarget->shaderPackList(), ModPlatform::ResourceType::ShaderPack,
+                            "No shader packs installed.", TR("ExternalResourcesPage", "Confirm Delete"),
+                            StripMnemonic(TR("ExternalResourcesPage", "Check for &Updates")), TR("ShaderPackPage", "Download Packs"));
+}
+
+// Same shape/reasoning as Resource/Texture/Shader Packs above — confirmed
+// DataPackPage.cpp doesn't override removeItems() either, so it's the same
+// ExternalResourcesPage base text for the delete title and update action.
+void DrawInstanceSettingsDataPacks()
+{
+    DrawResourceFolderList(g_instanceSettingsTarget->dataPackList(), ModPlatform::ResourceType::DataPack, "No data packs installed.",
+                            TR("ExternalResourcesPage", "Confirm Delete"), StripMnemonic(TR("ExternalResourcesPage", "Check for &Updates")),
+                            TR("DataPackPage", "Download Packs"));
+}
+
+// WorldList (launcher/minecraft/WorldList.h) isn't a ResourceFolderModel —
+// no enable/disable toggle, no "Check for Updates"/"Download" concept — so
+// this doesn't reuse DrawResourceFolderList()/ShowResourceActionsMenu().
+// X on a focused world opens Delete/Rename/Copy, all real strings from
+// WorldListPage.cpp (context "WorldListPage" throughout — that page owns
+// these directly, no shared base class the way the resource pages did).
+// Reset Icon and View Folder aren't ported (lower value, no clear gamepad-
+// friendly way to preview an icon file picker without a working file
+// selector round-trip — deferred like the rest of what this pass skips).
+void ShowWorldActionsMenu(WorldList* worlds, int index)
+{
+    if (index < 0 || index >= static_cast<int>(worlds->size()))
+        return;
+    const World& targetWorld = (*worlds)[static_cast<size_t>(index)];
+    // Same empty-LevelName fallback as DrawInstanceSettingsWorlds() — see
+    // its comment for why this can legitimately happen on real disk.
+    const QString worldName = targetWorld.name().isEmpty() ? targetWorld.folderName() : targetWorld.name();
+
+    ChoiceDialogOptions options;
+    options.emplace_back(StripMnemonic(MW("Dele&te")).toStdString(), false);
+    options.emplace_back(TR("WorldListPage", "Rename World").toStdString(), false);
+    options.emplace_back(TR("WorldListPage", "Copy World").toStdString(), false);
+
+    OpenChoiceDialog(worldName.toStdString(), false, std::move(options), [worlds, index, worldName](s32 choice, const std::string&, bool) {
+        if (choice < 0)
+            return;
+        g_pendingAction = [worlds, index, worldName, choice]() {
+            CloseChoiceDialog();
+            // The world list could have changed (deleted elsewhere,
+            // watcher refresh) between opening this menu and the action
+            // actually running a frame later — re-validate rather than
+            // trusting the captured index blindly.
+            if (index < 0 || index >= static_cast<int>(worlds->size()))
+                return;
+            switch (choice) {
+                case 0: {  // Delete
+                    const QString message = TR("WorldListPage",
+                                                "You are about to delete \"%1\".\n"
+                                                "The world may be gone forever (A LONG TIME).\n\n"
+                                                "Are you sure?")
+                                                 .arg(worldName);
+                    if (BigScreenDialogs::Confirm(TR("WorldListPage", "Confirm Deletion").toStdString(), message.toStdString(), false,
+                                                   StripMnemonic(MW("Dele&te")).toStdString(),
+                                                   TR("LaunchController", "Cancel").toStdString())) {
+                        // stopWatching()/startWatching() around the task
+                        // matches WorldListPage::on_actionRemove_triggered()
+                        // exactly — avoids the QFileSystemWatcher racing the
+                        // task's own filesystem operations on the same
+                        // directory.
+                        worlds->stopWatching();
+                        std::unique_ptr<Task> task = worlds->createDeleteWorldTask(index);
+                        if (task) {
+                            task->start();
+                            BigScreenDialogs::WaitForTask(task.get());
+                        }
+                        worlds->startWatching();
+                    }
+                    break;
+                }
+                case 1: {  // Rename
+                    const auto newName =
+                        BigScreenDialogs::InputString(TR("WorldListPage", "World name").toStdString(),
+                                                       TR("WorldListPage", "Enter a new world name.").toStdString(), worldName.toStdString());
+                    if (newName && !newName->isEmpty() && index < static_cast<int>(worlds->size()))
+                        (*worlds)[static_cast<size_t>(index)].rename(*newName);
+                    break;
+                }
+                case 2: {  // Copy
+                    const auto copyName = BigScreenDialogs::InputString(
+                        TR("WorldListPage", "World name").toStdString(), TR("WorldListPage", "Enter a new name for the copy.").toStdString(),
+                        worldName.toStdString());
+                    if (copyName && !copyName->isEmpty()) {
+                        worlds->stopWatching();
+                        std::unique_ptr<Task> task = worlds->createCopyWorldTask(index, *copyName);
+                        if (task) {
+                            task->start();
+                            BigScreenDialogs::WaitForTask(task.get());
+                        }
+                        worlds->startWatching();
+                    }
+                    break;
+                }
+            }
+        };
+    });
+}
+
+// worldList() lazily creates the model but doesn't populate it —
+// startWatching() (WorldList.cpp) both begins the QFileSystemWatcher *and*
+// triggers the initial update(), matching WorldListPage's own
+// openedImpl(). Never calls stopWatching() when leaving this tab (same
+// choice as DrawResourceFolderList() makes for its own models) — a bit of
+// background filesystem watching left running is harmless, and simpler
+// than threading a "tab closed" event through this immediate-mode screen
+// stack.
+void DrawInstanceSettingsWorlds()
+{
+    WorldList* worlds = g_instanceSettingsTarget->worldList();
+
+    static WorldList* lastWorldList = nullptr;
+    if (worlds != lastWorldList) {
+        worlds->startWatching();
+        lastWorldList = worlds;
+    }
+
+    const int count = static_cast<int>(worlds->size());
+    if (count == 0) {
+        ImGui::TextUnformatted("No worlds yet.");
+        return;
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+    const QLocale locale;
+
+    for (int i = 0; i < count; ++i) {
+        const World& world = (*worlds)[static_cast<size_t>(i)];
+        // World::name() falls back to the folder name only when the
+        // level.dat "LevelName" NBT tag is entirely absent (World.cpp) —
+        // not when the tag exists but holds an empty string, which does
+        // happen on real disk (confirmed live: one of this instance's
+        // real worlds hit exactly this). An empty title crashes
+        // MenuButton() — ImGuiFullscreen's MenuButtonFrame() computes its
+        // ID from the title text, and an empty string at the root of this
+        // child window hashes to the same ID as the window itself,
+        // tripping ImGui's own "Cannot have an empty ID at the root of a
+        // window" assertion (confirmed via gdb backtrace). Falling back to
+        // folderName() here replicates the same "never blank" intent the
+        // constructor's own fallback has, for the case it doesn't cover.
+        const QString displayName = world.name().isEmpty() ? world.folderName() : world.name();
+        const QByteArray nameUtf8 = displayName.toUtf8();
+        const QString summary = QString("%1  \xE2\x80\xA2  %2  \xE2\x80\xA2  %3")
+                                     .arg(world.gameType().toTranslatedString())
+                                     .arg(locale.toString(world.lastPlayed(), QLocale::ShortFormat))
+                                     .arg(locale.formattedDataSize(world.bytes()));
+        const QByteArray summaryUtf8 = summary.toUtf8();
+
+        // PushID(i): same reasoning as DrawResourceFolderList() — two
+        // worlds can share a display name (e.g. two "New World"s), which
+        // would otherwise collide onto the same ImGui ID.
+        ImGui::PushID(i);
+        MenuButton(nameUtf8.constData(), summaryUtf8.constData());
+
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+            ShowWorldActionsMenu(worlds, i);
+        ImGui::PopID();
+    }
+}
+
+// Same file set the desktop's OtherLogsPage::getPaths() builds (crash-
+// reports/, logs/, and the instance root itself — MinecraftInstance::
+// getLogFileSearchPaths(), a real public API, reused directly rather than
+// duplicated) and the same filters (*.log/*.log.gz always; *.txt too for
+// search paths other than the instance root itself, matching that
+// function's own "searchPath != m_basePath" check) — paths returned
+// relative to gameRoot(), newest-first (QDir::SortFlag::Time).
+std::vector<QString> GetInstanceLogFiles(MinecraftInstance* inst)
+{
+    const QDir baseDir(inst->gameRoot());
+    std::vector<QString> result;
+    for (const QString& searchPath : inst->getLogFileSearchPaths()) {
+        const QDir searchDir(searchPath);
+        QStringList filters{ "*.log", "*.log.gz" };
+        if (searchPath != inst->gameRoot())
+            filters.append("*.txt");
+        const QStringList entries = searchDir.entryList(filters, QDir::Files | QDir::Readable, QDir::SortFlag::Time);
+        for (const QString& name : entries)
+            result.push_back(baseDir.relativeFilePath(searchDir.filePath(name)));
+    }
+    return result;
+}
+
+// A two-state screen within one sub-tab (list of log files, or the
+// selected file's content) — the first tab in Instance Settings that
+// needs a "drill into an item" step rather than a flat list + X-menu. B
+// still exits the whole Instance Settings screen from either state
+// (HandleBackButton()'s Screen::InstanceSettings case doesn't know about
+// this nested state — same as it doesn't for any other tab), so the "<
+// Back" row below is the only way to return to the file list without
+// leaving Edit Instance entirely; not ideal, but consistent with how B
+// already behaves everywhere else in this screen (always a full exit),
+// not a new inconsistency.
+//
+// v1 gap, deliberately not ported: Delete/Copy-to-clipboard/Paste-to-
+// mclo.gs (OtherLogsPage's on_btnDelete/on_btnCopy/on_btnPaste) and
+// decompressing *.log.gz (would need zlib/libarchive wired up for this one
+// screen) — view-only for now, most useful case (checking a recent crash
+// report on real hardware) doesn't need either.
+void DrawInstanceSettingsLogs()
+{
+    MinecraftInstance* inst = g_instanceSettingsTarget;
+
+    // Reset if the target instance changed (e.g. Y/X back out to
+    // Instances, edit a different instance, come back to Logs) — leftover
+    // content from a different instance's log would otherwise show
+    // briefly. Switching tabs and back within the *same* instance
+    // deliberately keeps the viewer open where the user left it. A global
+    // (not a function-local static) so external code — namely the
+    // BIGSCREEN_TEST_SCREEN diagnostic — can pre-populate the viewer state
+    // and have it survive this function's own first call.
+    if (inst != g_selectedLogInstance) {
+        g_selectedLogFile.clear();
+        g_selectedLogContent.clear();
+        g_selectedLogInstance = inst;
+    }
+
+    if (!g_selectedLogFile.isEmpty()) {
+        if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back")) {
+            g_selectedLogFile.clear();
+            g_selectedLogContent.clear();
+            return;
+        }
+        ImGui::BeginChild("log_viewer", ImVec2(0.0f, 0.0f), true);
+        if (g_selectedLogContent.isEmpty()) {
+            ImGui::TextUnformatted("(empty file)");
+        } else {
+            const QStringList lines = g_selectedLogContent.split('\n');
+            for (const QString& line : lines) {
+                const QByteArray lineUtf8 = line.toUtf8();
+                ImGui::TextUnformatted(lineUtf8.constData());
+            }
+        }
+        ImGui::EndChild();
+        return;
+    }
+
+    const std::vector<QString> files = GetInstanceLogFiles(inst);
+    if (files.empty()) {
+        ImGui::TextUnformatted("No log files found.");
+        return;
+    }
+
+    const QDir baseDir(inst->gameRoot());
+    const QLocale locale;
+    for (size_t i = 0; i < files.size(); ++i) {
+        const QString& relPath = files[i];
+        const QFileInfo fi(baseDir.filePath(relPath));
+        const QString summary =
+            locale.toString(fi.lastModified(), QLocale::ShortFormat) + "  \xE2\x80\xA2  " + locale.formattedDataSize(fi.size());
+        const QByteArray nameUtf8 = relPath.toUtf8();
+        const QByteArray summaryUtf8 = summary.toUtf8();
+
+        ImGui::PushID(static_cast<int>(i));
+        if (MenuButton(nameUtf8.constData(), summaryUtf8.constData())) {
+            if (relPath.endsWith(".gz")) {
+                g_selectedLogContent = "This log is compressed (.gz) — viewing compressed logs isn't supported yet.";
+            } else {
+                QFile file(baseDir.filePath(relPath));
+                if (file.open(QIODevice::ReadOnly | QIODevice::Text)) {
+                    g_selectedLogContent = QString::fromUtf8(file.readAll());
+                    file.close();
+                } else {
+                    g_selectedLogContent = "Failed to open this log file.";
+                }
+            }
+            g_selectedLogFile = relPath;
+        }
+        ImGui::PopID();
+    }
+}
+
+// The actual version-change work — reachable only via g_pendingAction (see
+// ShowVersionComponentActionsMenu() below), so BigScreenDialogs::* and
+// WaitForTask are safe to call directly here, same reasoning as
+// StartVanillaInstanceCreation(). Generic over any component (Minecraft,
+// a mod loader, LWJGL, intermediary mappings, ...) — for anything other
+// than net.minecraft itself, candidates are filtered to versions
+// compatible with the currently-installed Minecraft version, the same way
+// the desktop's VersionSelectDialog does via
+// setExactIfPresentFilter(BaseVersionList::ParentVersionRole, ...)
+// (VersionPage.cpp:399): Meta::Version::requiredSet() carries the same
+// "requires net.minecraft == X" data that role reads from, already
+// populated by the lightweight version-*list* load alone (confirmed live
+// — no per-candidate full load needed just to filter). Skipping this
+// filter would let a gamepad user pick a loader version flat-out
+// incompatible with the installed Minecraft version and silently break
+// the instance. Release-only for net.minecraft specifically (same
+// scoping choice StartVanillaInstanceCreation() already made — snapshot/
+// old_beta/old_alpha filtering is real desktop-side UI surface, not just
+// a missing checkbox); every other component's version list has no
+// release/snapshot concept of its own, so no such filter applies there.
+void ChangeComponentVersion(ComponentPtr comp)
+{
+    MinecraftInstance* inst = g_instanceSettingsTarget;
+    PackProfile* profile = inst->getPackProfile();
+    const QString uid = comp->getID();
+    const bool isMinecraft = uid == "net.minecraft";
+    const QString currentMcVersion = profile->getComponentVersion("net.minecraft");
+
+    const std::string dialogTitle = TR("VersionPage", "Change Version").toStdString();
+
+    Meta::VersionList::Ptr versionList = isMinecraft ? APPLICATION->metadataIndex()->get("net.minecraft") : comp->getVersionList();
+    if (!versionList) {
+        BigScreenDialogs::Confirm(dialogTitle, "No version list is available for this component.", false, "OK", "OK");
+        return;
+    }
+    if (!versionList->isLoaded()) {
+        Task::Ptr loadTask = versionList->getLoadTask();
+        loadTask->start();
+        BigScreenDialogs::WaitForTask(loadTask.get());
+        if (!versionList->isLoaded()) {
+            BigScreenDialogs::Confirm(dialogTitle, "Failed to load the version list. Check your internet connection.", false, "OK", "OK");
+            return;
+        }
+    }
+
+    std::vector<std::string> labels;
+    std::vector<Meta::Version::Ptr> candidates;
+    for (int i = 0; i < versionList->count(); ++i) {
+        Meta::Version::Ptr version = std::dynamic_pointer_cast<Meta::Version>(versionList->at(i));
+        if (!version)
+            continue;
+        if (isMinecraft) {
+            if (version->typeString() != "release")
+                continue;
+        } else {
+            // A version with no declared net.minecraft requirement at all
+            // is treated as "compatible with anything" (matches the
+            // desktop filter's own exact-if-present semantics — an empty
+            // filter value doesn't exclude).
+            const auto& reqs = version->requiredSet();
+            const auto it = std::find_if(reqs.begin(), reqs.end(), [](const Meta::Require& req) { return req.uid == "net.minecraft"; });
+            if (it != reqs.end() && it->equalsVersion != currentMcVersion)
+                continue;
+        }
+        candidates.push_back(version);
+    }
+    std::sort(candidates.begin(), candidates.end(),
+              [](const Meta::Version::Ptr& a, const Meta::Version::Ptr& b) { return a->rawTime() > b->rawTime(); });
+    for (const Meta::Version::Ptr& version : candidates)
+        labels.push_back(version->descriptor().toStdString());
+    if (labels.empty()) {
+        BigScreenDialogs::Confirm(dialogTitle,
+                                   isMinecraft ? "No release versions available."
+                                               : ("No versions compatible with Minecraft " + currentMcVersion.toStdString() +
+                                                  " are available for this component."),
+                                   false, "OK", "OK");
+        return;
+    }
+
+    const auto versionChoice = BigScreenDialogs::Choose(dialogTitle, labels);
+    if (!versionChoice || *versionChoice < 0 || static_cast<size_t>(*versionChoice) >= candidates.size())
+        return;
+    Meta::Version::Ptr chosenVersion = candidates[static_cast<size_t>(*versionChoice)];
+
+    if (isMinecraft) {
+        // Same AutomaticJavaSwitch/OverrideJavaLocation reset the desktop
+        // does right before a Minecraft version change (VersionPage.cpp)
+        // — an instance-specific pinned Java install can be wrong for a
+        // very different Minecraft version (e.g. Java 8 pinned for 1.8,
+        // now switching to 1.21 which needs Java 21); clearing the
+        // override lets automatic Java selection pick a compatible one
+        // again.
+        if (APPLICATION->settings()->get("AutomaticJavaSwitch").toBool() && inst->settings()->get("AutomaticJava").toBool() &&
+            inst->settings()->get("OverrideJavaLocation").toBool()) {
+            inst->settings()->set("OverrideJavaLocation", false);
+            inst->settings()->set("JavaPath", "");
+        }
+    }
+
+    // important=true only for net.minecraft, matching VersionPage.cpp's
+    // own `bool important = false; if (uid == "net.minecraft") important =
+    // true;` exactly.
+    profile->setComponentVersion(uid, chosenVersion->descriptor(), isMinecraft);
+    profile->resolve(Net::Mode::Online);
+}
+
+// X on any component row opens this — Minecraft and every loader/library
+// component alike now (see ChangeComponentVersion()'s comment). Uses the
+// raw non-blocking OpenChoiceDialog directly, same reasoning as every
+// other X-menu in this file: called from inside
+// DrawInstanceSettingsVersion(), itself mid-frame.
+void ShowVersionComponentActionsMenu(ComponentPtr comp)
+{
+    ChoiceDialogOptions options;
+    options.emplace_back(TR("VersionPage", "Change Version").toStdString(), false);
+
+    OpenChoiceDialog(comp->getName().toStdString(), false, std::move(options), [comp](s32 index, const std::string&, bool) {
+        if (index != 0)
+            return;
+        g_pendingAction = [comp]() {
+            CloseChoiceDialog();
+            ChangeComponentVersion(comp);
+        };
+    });
+}
+
+// List of every installed PackProfile component (Minecraft, mod loader,
+// LWJGL, intermediary mappings, ...) — name + version as the summary, X
+// opens "Change Version" for any row (ChangeComponentVersion()). Matches
+// the desktop VersionPage's own list content, minus the reorder/remove/
+// customize/revert/add-agents/import-components surface (real, larger
+// follow-ups — see the "Известные пробелы" note in CLAUDE.md).
+void DrawInstanceSettingsVersion()
+{
+    PackProfile* profile = g_instanceSettingsTarget->getPackProfile();
+
+    // Unlike ResourceFolderModel/WorldList (which populate themselves the
+    // instant BigScreen calls their own getter), PackProfile does NOT
+    // auto-load — MinecraftInstance only parses mmc-pack.json into it on
+    // demand, whenever something first calls reload()/resolve(). The
+    // desktop's own VersionPage does this unconditionally on open
+    // (VersionPage.cpp's reloadPackProfile(), called from its
+    // constructor) — nothing in BigScreen's own code path happened to
+    // trigger it before this tab existed. Confirmed live: without this,
+    // the list showed "No components installed." for a real, fully
+    // modded instance. Same "once per distinct model pointer" caching as
+    // DrawResourceFolderList()/DrawInstanceSettingsWorlds().
+    static PackProfile* lastProfile = nullptr;
+    if (profile != lastProfile) {
+        profile->reload(Net::Mode::Online);
+        lastProfile = profile;
+    }
+
+    const int count = profile->rowCount(QModelIndex());
+    if (count == 0) {
+        ImGui::TextUnformatted("No components installed.");
+        return;
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+
+    for (int i = 0; i < count; ++i) {
+        ComponentPtr comp = profile->getComponent(i);
+        if (!comp)
+            continue;
+
+        const QString name = comp->getName();
+        const QString version = comp->getVersion();
+        const QByteArray nameUtf8 = name.toUtf8();
+        const QByteArray summaryUtf8 = version.toUtf8();
+
+        ImGui::PushID(i);
+        MenuButton(nameUtf8.constData(), summaryUtf8.constData());
+
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+            ShowVersionComponentActionsMenu(comp);
+        ImGui::PopID();
+    }
+}
+
+struct BigScreenServerEntry {
+    QString name;
+    QString address;
+};
+
+// Desktop's ServersPage.cpp keeps its NBT parsing (parseServersDat()) and
+// the Server struct that reads it (both private to that .cpp, not
+// exported anywhere reusable) — but the underlying library they're built
+// on (libnbtplusplus, CMake target "nbt++") is a real, ordinary link
+// dependency of Launcher_logic, which prismlauncher_bigscreen already
+// links — so this reimplements just the reading half directly against
+// that same library, rather than needing ServersPage itself. Read-only,
+// name + address only (no icon/acceptTextures) — see
+// DrawInstanceSettingsServers()'s own comment for why this stays
+// read-only in v1 rather than also writing servers.dat back.
+std::vector<BigScreenServerEntry> ReadServersDat(const QString& path)
+{
+    std::vector<BigScreenServerEntry> result;
+    try {
+        const QByteArray input = FS::read(path);
+        if (input.isEmpty())
+            return result;
+        std::istringstream stream(std::string(input.constData(), static_cast<size_t>(input.size())));
+        auto pair = nbt::io::read_compound(stream);
+        if (pair.first != "" || pair.second == nullptr)
+            return result;
+        if (!pair.second->has_key("servers", nbt::tag_type::List))
+            return result;
+
+        auto& serversList = pair.second->at("servers").as<nbt::tag_list>();
+        for (auto& entry : serversList) {
+            auto& serverTag = entry.as<nbt::tag_compound>();
+            BigScreenServerEntry e;
+            if (serverTag.has_key("name")) {
+                const std::string nameStr(serverTag["name"]);
+                e.name = QString::fromUtf8(nameStr.c_str());
+            }
+            if (serverTag.has_key("ip")) {
+                const std::string ipStr(serverTag["ip"]);
+                e.address = QString::fromUtf8(ipStr.c_str());
+            }
+            result.push_back(e);
+        }
+    } catch (...) {
+        // Matches parseServersDat()'s own catch-all — a missing or
+        // corrupt servers.dat isn't a BigScreen bug to surface, same as
+        // the desktop silently treating it as "no servers".
+    }
+    return result;
+}
+
+// Loads the FULL parsed servers.dat compound, not just name/address —
+// used by the write helpers below (unlike ReadServersDat(), which is
+// display-only and never writes anything back). Returns a fresh empty
+// compound (not null) on any read/parse failure, matching
+// parseServersDat()'s own "missing/corrupt file == no servers yet"
+// treatment — the write helpers then just add to (or, for a rename,
+// harmlessly no-op past) an empty compound instead of needing a separate
+// error path.
+std::unique_ptr<nbt::tag_compound> LoadServersDatCompound(const QString& path)
+{
+    try {
+        const QByteArray input = FS::read(path);
+        if (!input.isEmpty()) {
+            std::istringstream stream(std::string(input.constData(), static_cast<size_t>(input.size())));
+            auto pair = nbt::io::read_compound(stream);
+            if (pair.first == "" && pair.second != nullptr)
+                return std::move(pair.second);
+        }
+    } catch (...) {
+    }
+    return std::make_unique<nbt::tag_compound>();
+}
+
+bool SaveServersDatCompound(const QString& path, nbt::tag_compound& compound)
+{
+    try {
+        if (!FS::ensureFilePathExists(path))
+            return false;
+        std::ostringstream s;
+        nbt::io::write_tag("", compound, s);
+        const QByteArray val(s.str().data(), static_cast<int>(s.str().size()));
+        FS::write(path, val);  // throws on failure, matching FS::write()'s own contract
+        return true;
+    } catch (...) {
+        return false;
+    }
+}
+
+// Delete/Rename/Change Address/Add all follow the same shape: load the
+// full compound, mutate just the one list or entry actually being
+// touched, save. Every OTHER entry's `value` (name, ip, icon,
+// acceptTextures, whatever else — this project has no reason to know or
+// care) is moved wholesale from the old list into the new one rather than
+// reconstructed field-by-field from a lossy intermediate struct — the
+// same "icon/acceptTextures could silently get dropped" risk flagged when
+// this tab was first built (read-only, v1) doesn't apply here, since
+// nothing not explicitly being edited is ever touched or re-serialized
+// from scratch.
+void DeleteServerEntry(const QString& path, int index)
+{
+    std::unique_ptr<nbt::tag_compound> root = LoadServersDatCompound(path);
+    if (!root->has_key("servers", nbt::tag_type::List))
+        return;
+    nbt::tag_list& oldList = root->at("servers").as<nbt::tag_list>();
+    if (index < 0 || static_cast<size_t>(index) >= oldList.size())
+        return;
+
+    nbt::tag_list newList(nbt::tag_type::Compound);
+    for (size_t i = 0; i < oldList.size(); ++i) {
+        if (static_cast<int>(i) == index)
+            continue;
+        newList.push_back(std::move(oldList[i]));
+    }
+    (*root)["servers"] = nbt::value(std::move(newList));
+    SaveServersDatCompound(path, *root);
+}
+
+void SetServerField(const QString& path, int index, const char* key, const QString& newValue)
+{
+    std::unique_ptr<nbt::tag_compound> root = LoadServersDatCompound(path);
+    if (!root->has_key("servers", nbt::tag_type::List))
+        return;
+    nbt::tag_list& list = root->at("servers").as<nbt::tag_list>();
+    if (index < 0 || static_cast<size_t>(index) >= list.size())
+        return;
+    nbt::tag_compound& entry = list[static_cast<size_t>(index)].as<nbt::tag_compound>();
+    entry[key] = newValue.toStdString();
+    SaveServersDatCompound(path, *root);
+}
+
+// New entries get name + ip only — no icon (matches the desktop's own
+// "Add" behavior: a blank row the user edits inline, no icon until the
+// game actually connects and one gets cached), no acceptTextures (desktop
+// only ever writes that tag when the user picks something other than the
+// "Ask" default, which "Add" doesn't).
+void AddServerEntry(const QString& path, const QString& name, const QString& address)
+{
+    std::unique_ptr<nbt::tag_compound> root = LoadServersDatCompound(path);
+    nbt::tag_list list(nbt::tag_type::Compound);
+    if (root->has_key("servers", nbt::tag_type::List)) {
+        nbt::tag_list& existing = root->at("servers").as<nbt::tag_list>();
+        for (size_t i = 0; i < existing.size(); ++i)
+            list.push_back(std::move(existing[i]));
+    }
+    nbt::tag_compound newServer;
+    newServer.insert("name", name.toStdString());
+    newServer.insert("ip", address.toStdString());
+    list.push_back(std::move(newServer));
+    (*root)["servers"] = nbt::value(std::move(list));
+    SaveServersDatCompound(path, *root);
+}
+
+// Instance Settings > Servers' own displayed list, cached like the other
+// tabs' models (Mods/Worlds/...) — a plain read + a path key rather than a
+// QAbstractListModel, since servers.dat has no equivalent of those models'
+// own QFileSystemWatcher. Reloaded explicitly (ReloadServersCache()) after
+// any write, and whenever DrawInstanceSettingsServers() sees a different
+// path (switched instance).
+QString g_serversCachePath;
+std::vector<BigScreenServerEntry> g_serversCache;
+
+void ReloadServersCache(const QString& path)
+{
+    g_serversCachePath = path;
+    g_serversCache = ReadServersDat(path);
+}
+
+// X on a focused server — Rename/Change Address (no desktop dialog to
+// match, same reasoning as Worlds' own "Rename" — the desktop edits these
+// inline in its table, not via a popup, so this text stays BigScreen's
+// own) and Remove (real strings, context "ServersPage"). g_pendingAction-
+// deferred throughout, same reentrancy reasoning as every other X-menu in
+// this file. Reloads g_serversCache after any successful write so the
+// list reflects the change on the very next frame, rather than needing a
+// tab switch to pick it up.
+void ShowServerActionsMenu(const QString& path, int index, const QString& name)
+{
+    ChoiceDialogOptions options;
+    options.emplace_back("Rename", false);
+    options.emplace_back("Change Address", false);
+    options.emplace_back(TR("ServersPage", "Remove").toStdString(), false);
+
+    OpenChoiceDialog(name.toStdString(), false, std::move(options), [path, index, name](s32 choice, const std::string&, bool) {
+        if (choice < 0)
+            return;
+        g_pendingAction = [path, index, name, choice]() {
+            CloseChoiceDialog();
+            switch (choice) {
+                case 0: {
+                    const auto newName = BigScreenDialogs::InputString("Rename Server", "Enter a new name", name.toStdString());
+                    if (newName && !newName->isEmpty()) {
+                        SetServerField(path, index, "name", *newName);
+                        ReloadServersCache(path);
+                    }
+                    break;
+                }
+                case 1: {
+                    const QString currentAddress =
+                        (index >= 0 && static_cast<size_t>(index) < g_serversCache.size()) ? g_serversCache[static_cast<size_t>(index)].address : QString();
+                    const auto newAddress =
+                        BigScreenDialogs::InputString("Change Server Address", "Enter a new address", currentAddress.toStdString());
+                    if (newAddress && !newAddress->isEmpty()) {
+                        SetServerField(path, index, "ip", *newAddress);
+                        ReloadServersCache(path);
+                    }
+                    break;
+                }
+                case 2: {
+                    const QString message = TR("ServersPage", "You are about to remove \"%1\".\n"
+                                                                "This is permanent and the server will be gone from your list forever (A "
+                                                                "LONG TIME).\n\n"
+                                                                "Are you sure?")
+                                                 .arg(name);
+                    if (BigScreenDialogs::Confirm(TR("ServersPage", "Confirm Removal").toStdString(), message.toStdString(), false,
+                                                   TR("ServersPage", "Remove").toStdString(), TR("LaunchController", "Cancel").toStdString())) {
+                        DeleteServerEntry(path, index);
+                        ReloadServersCache(path);
+                    }
+                    break;
+                }
+            }
+        };
+    });
+}
+
+// Add/Rename/Change Address/Remove, on top of the read-only list this tab
+// started with — see LoadServersDatCompound()/SaveServersDatCompound() and
+// the write helpers above for why this doesn't risk the icon/
+// acceptTextures data-loss originally flagged as the reason to stay
+// read-only. Not ported: reorder, live server ping (player count/MOTD).
+void DrawInstanceSettingsServers()
+{
+    MinecraftInstance* inst = g_instanceSettingsTarget;
+    const QString path = FS::PathCombine(inst->gameRoot(), "servers.dat");
+
+    if (path != g_serversCachePath)
+        ReloadServersCache(path);
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+
+    // Real "Add" text (context "ServersPage") — new server prompts for
+    // name then address via two InputString calls, matching the file
+    // selector-based flows elsewhere in this file for "ask a couple of
+    // things, then do the write" actions.
+    if (MenuButtonWithoutSummary(("+ " + TR("ServersPage", "Add")).toStdString().c_str())) {
+        g_pendingAction = [path]() {
+            const auto name = BigScreenDialogs::InputString("Add Server", "Enter a server name", "Minecraft Server");
+            if (!name || name->isEmpty())
+                return;
+            const auto address = BigScreenDialogs::InputString("Add Server", "Enter a server address", "");
+            if (!address || address->isEmpty())
+                return;
+            AddServerEntry(path, *name, *address);
+            ReloadServersCache(path);
+        };
+    }
+
+    std::vector<BigScreenServerEntry>& cachedServers = g_serversCache;
+    if (cachedServers.empty()) {
+        ImGui::TextUnformatted("No servers saved.");
+        return;
+    }
+
+    for (size_t i = 0; i < cachedServers.size(); ++i) {
+        const QString entryName = cachedServers[i].name;
+        const QByteArray nameUtf8 = entryName.toUtf8();
+        const QByteArray addressUtf8 = cachedServers[i].address.toUtf8();
+        ImGui::PushID(static_cast<int>(i));
+        MenuButton(nameUtf8.constData(), addressUtf8.constData());
+
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+            ShowServerActionsMenu(path, static_cast<int>(i), entryName);
+        ImGui::PopID();
+    }
+}
+
+struct BigScreenScreenshotEntry {
+    QString path;
+    QString fileName;
+    QDateTime modified;
+    qint64 size;
+};
+
+// Same folder + filter the desktop's own ScreenshotsPage uses
+// (InstancePageProvider.h: FS::PathCombine(inst->gameRoot(),
+// "screenshots"); ScreenshotsPage.cpp: m_model->setNameFilters({"*.png"})
+// — Minecraft only ever writes PNG screenshots) — plain QDir scan, no
+// custom model needed the way ServersPage's servers.dat parsing did;
+// desktop's own ScreenshotsFSModel is just a QFileSystemModel with a name
+// filter, nothing this reimplements loses by not reusing it directly.
+std::vector<BigScreenScreenshotEntry> GetInstanceScreenshots(MinecraftInstance* inst)
+{
+    std::vector<BigScreenScreenshotEntry> result;
+    const QDir dir(FS::PathCombine(inst->gameRoot(), "screenshots"));
+    const QStringList entries = dir.entryList({ "*.png" }, QDir::Files | QDir::Readable, QDir::SortFlag::Time);
+    for (const QString& name : entries) {
+        const QFileInfo fi(dir.filePath(name));
+        result.push_back({ fi.absoluteFilePath(), name, fi.lastModified(), fi.size() });
+    }
+    return result;
+}
+
+// X on a focused screenshot — just Delete (the only destructive action;
+// desktop's Rename/View Folder/Copy-to-clipboard aren't ported — Rename
+// has no real gamepad-relevant benefit for an auto-named screenshot file,
+// View Folder needs a working file browser round-trip, Copy-to-clipboard
+// assumes a mouse-driven paste target). Real strings from
+// ScreenshotsPage.cpp/.ui, context "ScreenshotsPage".
+void ShowScreenshotActionsMenu(const QString& path, const QString& fileName)
+{
+    ChoiceDialogOptions options;
+    options.emplace_back(TR("ScreenshotsPage", "Delete").toStdString(), false);
+
+    OpenChoiceDialog(fileName.toStdString(), false, std::move(options), [path](s32 index, const std::string&, bool) {
+        if (index != 0)
+            return;
+        g_pendingAction = [path]() {
+            CloseChoiceDialog();
+            if (BigScreenDialogs::Confirm(TR("ScreenshotsPage", "Confirm Deletion").toStdString(),
+                                           TR("ScreenshotsPage", "You are about to delete the selected screenshot.\n"
+                                                                  "This may be permanent and it will be gone from the folder.\n\n"
+                                                                  "Are you sure?")
+                                               .toStdString(),
+                                           false, TR("ScreenshotsPage", "Delete").toStdString(),
+                                           TR("LaunchController", "Cancel").toStdString())) {
+                QFile::remove(path);
+                // If the deleted file is the one currently open in the
+                // viewer, back out to the list rather than leaving a
+                // texture for a file that no longer exists on screen.
+                if (g_selectedScreenshotPath == path) {
+                    g_selectedScreenshotPath.clear();
+                    g_selectedScreenshotTexture.reset();
+                    g_selectedScreenshotIndex = -1;
+                }
+            }
+        };
+    });
+}
+
+// Two-state screen (file list, or the selected image) — same shape as
+// DrawInstanceSettingsLogs(), texture instead of text lines. Reuses
+// BigScreenGui::UploadQImage() (already used for real instance icons and
+// the Microsoft login QR code — see GetInstanceIconTexture()/AccountLogin
+// screen) rather than any new image-loading path. Loaded lazily, one
+// screenshot at a time, only when actually opened — not a thumbnail grid
+// (the desktop's own ScreenshotsPage thumbnails via a 4-thread pool, real
+// but substantial extra machinery a gamepad list doesn't need).
+// Loads the screenshot at `index` into the viewer globals — shared by the
+// list's own MenuButton confirm handler and the gallery-style Left/Right
+// navigation inside the viewer itself, so both go through one path.
+void OpenScreenshotViewer(const std::vector<BigScreenScreenshotEntry>& screenshots, int index)
+{
+    if (index < 0 || index >= static_cast<int>(screenshots.size()))
+        return;
+    const BigScreenScreenshotEntry& shot = screenshots[static_cast<size_t>(index)];
+    const QImage image(shot.path);
+    g_selectedScreenshotTexture = image.isNull() ? nullptr : BigScreenGui::UploadQImage(image);
+    g_selectedScreenshotPath = shot.path;
+    g_selectedScreenshotIndex = index;
+}
+
+void DrawInstanceSettingsScreenshots()
+{
+    MinecraftInstance* inst = g_instanceSettingsTarget;
+
+    if (inst != g_selectedScreenshotInstance) {
+        g_selectedScreenshotPath.clear();
+        g_selectedScreenshotTexture.reset();
+        g_selectedScreenshotIndex = -1;
+        g_selectedScreenshotInstance = inst;
+    }
+
+    // Needed in both branches now: the list to render itself, the viewer
+    // to know how many screenshots exist for Left/Right to wrap around.
+    // Re-scanning every frame (not cached) matches this function's own
+    // existing list-branch behavior — a small directory, harmless.
+    const std::vector<BigScreenScreenshotEntry> screenshots = GetInstanceScreenshots(inst);
+
+    if (!g_selectedScreenshotPath.isEmpty()) {
+        if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back")) {
+            g_selectedScreenshotPath.clear();
+            g_selectedScreenshotTexture.reset();
+            g_selectedScreenshotIndex = -1;
+            return;
+        }
+
+        // Gallery-style browsing: Left/Right (D-pad or stick — the stick
+        // is already mirrored onto these same GamepadDpad* keys, see the
+        // per-frame stick-to-D-pad mirror in main()) moves to the
+        // previous/next screenshot and wraps around at either end. Safe
+        // to repurpose Left/Right here specifically because the viewer
+        // has no vertical list of its own to navigate — unlike every
+        // other screen, where these keys are already spoken for.
+        if (screenshots.size() > 1 && g_selectedScreenshotIndex >= 0) {
+            const int count = static_cast<int>(screenshots.size());
+            if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, false))
+                OpenScreenshotViewer(screenshots, (g_selectedScreenshotIndex + 1) % count);
+            else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, false))
+                OpenScreenshotViewer(screenshots, (g_selectedScreenshotIndex - 1 + count) % count);
+        }
+
+        if (screenshots.size() > 1) {
+            const GamepadGlyphs glyphs = GetGamepadGlyphs();
+            SetFooterHints({ { glyphs.dpad_lr, "Prev / Next" }, { glyphs.cancel(false), "Back" } });
+        }
+
+        if (g_selectedScreenshotTexture) {
+            // Scale to fit the available area while preserving aspect
+            // ratio (never upscale past the available width or height,
+            // whichever is the binding constraint) and center
+            // horizontally — same "fit inside a box" math as any image
+            // viewer, nothing toolkit-specific to lean on here.
+            const float availW = ImGui::GetContentRegionAvail().x;
+            const float availH = ImGui::GetContentRegionAvail().y;
+            const float texW = static_cast<float>(g_selectedScreenshotTexture->GetWidth());
+            const float texH = static_cast<float>(g_selectedScreenshotTexture->GetHeight());
+            float drawW = availW;
+            float drawH = texH * (availW / texW);
+            if (drawH > availH) {
+                drawH = availH;
+                drawW = texW * (availH / texH);
+            }
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + std::max(0.0f, (availW - drawW) * 0.5f));
+            ImGui::Image(static_cast<ImTextureID>(g_selectedScreenshotTexture->GetNativeHandle()), ImVec2(drawW, drawH));
+        } else {
+            ImGui::TextUnformatted("Failed to load this screenshot.");
+        }
+        return;
+    }
+
+    if (screenshots.empty()) {
+        ImGui::TextUnformatted("No screenshots yet.");
+        return;
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+    const QLocale locale;
+
+    for (size_t i = 0; i < screenshots.size(); ++i) {
+        const BigScreenScreenshotEntry& shot = screenshots[i];
+        const QString summary = locale.toString(shot.modified, QLocale::ShortFormat) + "  \xE2\x80\xA2  " + locale.formattedDataSize(shot.size);
+        const QByteArray nameUtf8 = shot.fileName.toUtf8();
+        const QByteArray summaryUtf8 = summary.toUtf8();
+
+        ImGui::PushID(static_cast<int>(i));
+        if (MenuButton(nameUtf8.constData(), summaryUtf8.constData()))
+            OpenScreenshotViewer(screenshots, static_cast<int>(i));
+
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
+            ShowScreenshotActionsMenu(shot.path, shot.fileName);
+        ImGui::PopID();
     }
 }
 
@@ -1814,6 +2928,18 @@ struct InstanceTopTab {
     const char* icon;
     const InstanceSettingsSubTab* subtabs;
     int subtabCount;
+    // Mods/Resource/Texture/Shader/Data Packs and Worlds all show a list
+    // where X opens a per-item actions menu — Settings doesn't. Drives
+    // which footer hint row to show, replacing an earlier name-string
+    // comparison ("Mods") that would've silently missed each new tab added
+    // alongside this field.
+    bool hasActionsMenu;
+    // A-button hint text for hasActionsMenu tabs, or nullptr to omit the
+    // A-button hint entirely (Worlds: nothing is bound to A, only X).
+    // Ignored when !hasActionsMenu (Settings hardcodes its own "Toggle /
+    // Change" wording below, unconditionally correct for every Settings
+    // sub-tab).
+    const char* primaryHint;
 };
 
 // Two-level structure, matching DrawSettings()' own Category (LB/RB) +
@@ -1821,12 +2947,12 @@ struct InstanceTopTab {
 // feedback that mixing "Settings' own internal groupings" (General/Java/
 // Tweaks/Commands/Notes — these were always one page's sub-tabs, matching
 // the desktop's own "settings" tab) with "Mods" (a genuinely separate
-// desktop page, like Version/Worlds/Screenshots/... will be too) in one
-// flat row read as structurally wrong, not just a naming nitpick: Mods
-// isn't a sibling of General/Java/etc., it's a sibling of the *whole*
-// Settings category. Future top-level categories (Version, Worlds, ...)
-// slot in here the same way Mods did — each its own InstanceTopTab entry,
-// not another flat tab appended to Settings' own row.
+// desktop page, like Resource/Texture/Shader Packs also are) in one flat
+// row read as structurally wrong, not just a naming nitpick: Mods isn't a
+// sibling of General/Java/etc., it's a sibling of the *whole* Settings
+// category. Every later top-level category slots in here the same way
+// Mods did — each its own InstanceTopTab entry, not another flat tab
+// appended to Settings' own row.
 static const InstanceSettingsSubTab kInstanceSettingsSubTabs[] = {
     { "General", &DrawInstanceSettingsGeneral },   { "Java", &DrawInstanceSettingsJava },
     { "Tweaks", &DrawInstanceSettingsTweaks },      { "Commands", &DrawInstanceSettingsCommands },
@@ -1835,10 +2961,112 @@ static const InstanceSettingsSubTab kInstanceSettingsSubTabs[] = {
 static const InstanceSettingsSubTab kInstanceModsSubTabs[] = {
     { "Mods", &DrawInstanceSettingsMods },
 };
-static const InstanceTopTab kInstanceTopTabs[] = {
-    { "Settings", "images/icons/settings.png", kInstanceSettingsSubTabs, static_cast<int>(std::size(kInstanceSettingsSubTabs)) },
-    { "Mods", "images/icons/tab_mods.png", kInstanceModsSubTabs, static_cast<int>(std::size(kInstanceModsSubTabs)) },
+static const InstanceSettingsSubTab kInstanceResourcePacksSubTabs[] = {
+    { "Resource Packs", &DrawInstanceSettingsResourcePacks },
 };
+static const InstanceSettingsSubTab kInstanceTexturePacksSubTabs[] = {
+    { "Texture Packs", &DrawInstanceSettingsTexturePacks },
+};
+static const InstanceSettingsSubTab kInstanceShaderPacksSubTabs[] = {
+    { "Shader Packs", &DrawInstanceSettingsShaderPacks },
+};
+static const InstanceSettingsSubTab kInstanceDataPacksSubTabs[] = {
+    { "Data Packs", &DrawInstanceSettingsDataPacks },
+};
+static const InstanceSettingsSubTab kInstanceWorldsSubTabs[] = {
+    { "Worlds", &DrawInstanceSettingsWorlds },
+};
+static const InstanceSettingsSubTab kInstanceLogsSubTabs[] = {
+    { "Logs", &DrawInstanceSettingsLogs },
+};
+static const InstanceSettingsSubTab kInstanceVersionSubTabs[] = {
+    { "Version", &DrawInstanceSettingsVersion },
+};
+static const InstanceSettingsSubTab kInstanceServersSubTabs[] = {
+    { "Servers", &DrawInstanceSettingsServers },
+};
+static const InstanceSettingsSubTab kInstanceScreenshotsSubTabs[] = {
+    { "Screenshots", &DrawInstanceSettingsScreenshots },
+};
+
+// Max entries BuildInstanceTopTabs() can produce (Settings, Mods, one of
+// Resource/Texture Packs, Shader Packs, Data Packs, Worlds, Logs, Version,
+// Servers, Screenshots) — sized for the caller's stack array, bump if a
+// future category is added.
+constexpr int kMaxInstanceTopTabs = 10;
+
+// Built fresh each call rather than one static array, because which
+// top-level categories exist depends on the instance: Resource Packs and
+// Texture Packs are mutually exclusive on the real desktop side
+// (ResourcePackPage::shouldDisplay()/TexturePackPage::shouldDisplay() gate
+// on the instance's "texturepacks" trait — pre-1.6 Minecraft used texture
+// packs, everything since uses resource packs, an instance is never both)
+// — so BigScreen shows whichever one the desktop would, not both or a
+// guess. Cheap (a handful of pointer-sized entries) to rebuild every call.
+int BuildInstanceTopTabs(MinecraftInstance* inst, InstanceTopTab* out)
+{
+    int n = 0;
+    out[n++] = { "Settings", "images/icons/settings.png", kInstanceSettingsSubTabs, static_cast<int>(std::size(kInstanceSettingsSubTabs)),
+                 false, nullptr };
+    out[n++] = { "Mods", "images/icons/tab_mods.png", kInstanceModsSubTabs, static_cast<int>(std::size(kInstanceModsSubTabs)), true,
+                 "Toggle" };
+    if (inst->traits().contains("texturepacks")) {
+        out[n++] = { "Texture Packs", "images/icons/tab_resourcepacks.png", kInstanceTexturePacksSubTabs,
+                      static_cast<int>(std::size(kInstanceTexturePacksSubTabs)), true, "Toggle" };
+    } else {
+        out[n++] = { "Resource Packs", "images/icons/tab_resourcepacks.png", kInstanceResourcePacksSubTabs,
+                      static_cast<int>(std::size(kInstanceResourcePacksSubTabs)), true, "Toggle" };
+    }
+    out[n++] = { "Shader Packs", "images/icons/tab_shaderpacks.png", kInstanceShaderPacksSubTabs,
+                 static_cast<int>(std::size(kInstanceShaderPacksSubTabs)), true, "Toggle" };
+    // Real desktop behavior (InstancePageProvider only ever adds
+    // GlobalDataPackPage, never the raw DataPackPage — confirmed by
+    // reading it) — this tab, unlike every other resource list here, is
+    // NOT always present: dataPackList() (MinecraftInstance.cpp) returns
+    // nullptr unless "GlobalDataPacksEnabled" is on (default off — this is
+    // a niche opt-in feature for mods that share data packs across
+    // worlds, not the same thing as an ordinary per-world data pack, see
+    // DrawInstanceSettingsGeneral()'s own comment on the toggle). Gating
+    // here — rather than only null-checking inside
+    // DrawInstanceSettingsDataPacks() — matches the desktop's own
+    // shouldDisplay()-based tab visibility instead of showing a
+    // permanently-empty tab for the common case.
+    if (inst->settings()->get("GlobalDataPacksEnabled").toBool()) {
+        out[n++] = { "Data Packs", "images/icons/tab_datapacks.png", kInstanceDataPacksSubTabs,
+                      static_cast<int>(std::size(kInstanceDataPacksSubTabs)), true, "Toggle" };
+    }
+    out[n++] = { "Worlds", "images/icons/tab_worlds.png", kInstanceWorldsSubTabs, static_cast<int>(std::size(kInstanceWorldsSubTabs)), true,
+                 nullptr };
+    // hasActionsMenu=false: unlike Mods/Packs/Worlds, X doesn't open a
+    // per-item menu here — pressing A on a log file directly enters its
+    // viewer (see DrawInstanceSettingsLogs()). primaryHint="View" still
+    // gets shown via the non-hasActionsMenu footer branch below, which
+    // now checks primaryHint too instead of hardcoding "Toggle / Change"
+    // unconditionally.
+    out[n++] = { "Logs", "images/icons/tab_logs.png", kInstanceLogsSubTabs, static_cast<int>(std::size(kInstanceLogsSubTabs)), false, "View" };
+    // hasActionsMenu=true: X on any row opens "Change Version", filtered
+    // to versions compatible with the installed Minecraft version for
+    // every component except Minecraft itself (see
+    // ChangeComponentVersion()). primaryHint=nullptr: no single action
+    // applies to every row the way "Toggle" does for Mods, so the
+    // A-button hint is omitted entirely, same as Worlds.
+    out[n++] = { "Version", "images/icons/tab_version.png", kInstanceVersionSubTabs, static_cast<int>(std::size(kInstanceVersionSubTabs)),
+                 true, nullptr };
+    // hasActionsMenu=true, primaryHint=nullptr: X opens Rename/Change
+    // Address/Remove per row, plus a "+ Add" entry at the top of the list
+    // itself (not an X-menu action, since it doesn't apply to any
+    // existing row) — no single action applies to every row the way
+    // "Toggle" does for Mods, so the A-button hint is omitted, same as
+    // Worlds.
+    out[n++] = { "Servers", "images/icons/tab_servers.png", kInstanceServersSubTabs, static_cast<int>(std::size(kInstanceServersSubTabs)),
+                 true, nullptr };
+    // hasActionsMenu=true, primaryHint="View": A opens the selected
+    // screenshot (DrawInstanceSettingsScreenshots()'s own MenuButton
+    // confirm handler), X opens Delete — same shape as Mods/Packs.
+    out[n++] = { "Screenshots", "images/icons/tab_screenshots.png", kInstanceScreenshotsSubTabs,
+                 static_cast<int>(std::size(kInstanceScreenshotsSubTabs)), true, "View" };
+    return n;
+}
 
 int g_instanceTopTab = 0;
 int g_instanceSubTab = 0;
@@ -1853,24 +3081,49 @@ void DrawInstanceSettings()
         return;
     }
 
-    const int topTabCount = static_cast<int>(std::size(kInstanceTopTabs));
-    const InstanceTopTab& currentTop = kInstanceTopTabs[g_instanceTopTab];
-    const bool onModsTab = std::string(currentTop.name) == "Mods";
+    InstanceTopTab allTabs[kMaxInstanceTopTabs];
+    const int topTabCount = BuildInstanceTopTabs(g_instanceSettingsTarget, allTabs);
+    // Defensive: switching between instances with different trait sets
+    // (e.g. one has "texturepacks", another doesn't) could otherwise leave
+    // a stale index pointing past the end of a shorter tab set.
+    if (g_instanceTopTab >= topTabCount)
+        g_instanceTopTab = 0;
+    const InstanceTopTab& currentTop = allTabs[g_instanceTopTab];
 
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
-        if (onModsTab) {
-            SetFooterHints({ { glyphs.confirm(false), "Toggle" },
-                              { glyphs.west, "Actions" },
-                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
-                              { glyphs.cancel(false), "Back" } });
+        if (currentTop.hasActionsMenu) {
+            if (currentTop.primaryHint) {
+                SetFooterHints({ { glyphs.confirm(false), currentTop.primaryHint },
+                                  { glyphs.west, "Actions" },
+                                  { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                                  { glyphs.cancel(false), "Back" } });
+            } else {
+                // Worlds: nothing is bound to A — omit that hint entirely
+                // rather than advertise a button that does nothing.
+                SetFooterHints({ { glyphs.west, "Actions" },
+                                  { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                                  { glyphs.cancel(false), "Back" } });
+            }
         } else if (currentTop.subtabCount > 1) {
-            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+            // primaryHint isn't set for any current multi-sub-tab category
+            // (only Settings has subtabCount > 1, and its own sub-tabs are
+            // all toggle/choice lists) — "Toggle / Change" is the correct
+            // default there. Falls back to it whenever primaryHint is
+            // unset, same as the single-sub-tab branch below.
+            SetFooterHints({ { glyphs.confirm(false), currentTop.primaryHint ? currentTop.primaryHint : "Toggle / Change" },
                               { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
                               { ICON_PF_XBOX_LT "/" ICON_PF_XBOX_RT, "Tab" },
                               { glyphs.cancel(false), "Back" } });
+        } else if (currentTop.primaryHint && currentTop.primaryHint[0] == '\0') {
+            // Explicit empty string (as opposed to nullptr, which falls
+            // back to "Toggle / Change" below): a fully read-only tab with
+            // nothing bound to A *or* X (Servers, v1 — see
+            // DrawInstanceSettingsServers()) — showing neither hint beats
+            // advertising a button that does nothing.
+            SetFooterHints({ { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" }, { glyphs.cancel(false), "Back" } });
         } else {
-            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+            SetFooterHints({ { glyphs.confirm(false), currentTop.primaryHint ? currentTop.primaryHint : "Toggle / Change" },
                               { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
                               { glyphs.cancel(false), "Back" } });
         }
@@ -1886,8 +3139,9 @@ void DrawInstanceSettings()
         QueueResetFocus(FocusResetType::Other);
     }
 
-    // Nothing to switch to with only one sub-tab (Mods) — skip LT/RT
-    // handling and skip drawing the sub-tab row at all below, matching
+    // Nothing to switch to with only one sub-tab (Mods, and now Resource/
+    // Texture/Shader Packs too) — skip LT/RT handling and skip drawing the
+    // sub-tab row at all below, matching
     // DrawSettings()' own identical rule (and root-caused fix — see its
     // history — for why a single-item sub-tab row isn't just harmless
     // clutter but can leave nav focus unreachable).
@@ -1901,16 +3155,28 @@ void DrawInstanceSettings()
         }
     }
 
-    TopBarTab topTabs[std::size(kInstanceTopTabs)];
+    // topTabs is sized to the kMaxInstanceTopTabs *upper bound*, but
+    // topTabCount (this instance's real tab count — e.g. 5 whenever Data
+    // Packs is hidden, see BuildInstanceTopTabs()) can be smaller. Passing
+    // the raw array to BeginScreen() would implicitly convert it to a
+    // std::span sized by the array's compile-time extent (6), not
+    // topTabCount — silently including trailing uninitialized stack
+    // entries. Confirmed via gdb: this crashed with a SIGSEGV inside
+    // DrawTopBar()'s icon-string handling, reading a garbage pointer from
+    // exactly that uninitialized 6th slot, every time an instance had
+    // fewer than kMaxInstanceTopTabs real tabs. Constructing the span
+    // explicitly with the real count fixes it.
+    TopBarTab topTabs[kMaxInstanceTopTabs];
     for (int i = 0; i < topTabCount; ++i)
-        topTabs[i] = { kInstanceTopTabs[i].icon, i == g_instanceTopTab };
+        topTabs[i] = { allTabs[i].icon, i == g_instanceTopTab };
+    const std::span<const TopBarTab> topTabsSpan(topTabs, static_cast<size_t>(topTabCount));
 
     // "Edit... — <instance name> — <category>", matching Settings' own
     // "Settings — <category>" pattern.
     const std::string screenTitle = StripMnemonic(MW("&Edit...")).toStdString() + " \xE2\x80\x94 " +
                                      g_instanceSettingsTarget->name().toStdString() + " \xE2\x80\x94 " + currentTop.name;
 
-    if (BeginScreen(screenTitle.c_str(), true, topTabs)) {
+    if (BeginScreen(screenTitle.c_str(), true, topTabsSpan)) {
         if (BeginFullscreenColumnWindow(0.0f, 0.0f, "instance_settings")) {
             if (currentTop.subtabCount > 1) {
                 // Same non-scrolling tab-row / scrolling-content two-child-
@@ -1970,14 +3236,11 @@ void LaunchInstance(MinecraftInstance* inst)
 // picking the actions that make sense without a mouse/keyboard: launching,
 // killing, opening the console, editing settings (Screen::InstanceSettings,
 // via DrawInstanceSettings() above — the "settings" tab of the desktop's
-// full Edit Instance window, not the whole thing), renaming, changing
-// group, viewing the instance folder, and deleting. Not yet ported: the
-// desktop Edit Instance window's other tabs (Version/Mods/Worlds/
-// Screenshots/Servers/resource-texture-shader-packs/log viewers), Copy
-// Instance, Export, Create Shortcut — all native Qt Widgets dialogs/pages
-// with enough surface area (checkboxes, radio groups, file pickers, list
-// management) that porting each is its own follow-up, not a simple
-// BigScreenDialogs::* swap like the actions below.
+// full Edit Instance window, not the whole thing), copying, renaming,
+// changing group, viewing the instance folder, exporting, and deleting.
+// Not yet ported: mrpack/CurseForge pack export (ExportPackDialog —
+// reconstructs a portable pack manifest, real modplatform-specific work
+// beyond StartInstanceExport()'s plain zip), Create Shortcut.
 //
 // Uses the raw, non-blocking OpenChoiceDialog directly rather than
 // BigScreenDialogs::Choose() — this is called from inside DrawInstances(),
@@ -1988,9 +3251,80 @@ void LaunchInstance(MinecraftInstance* inst)
 // reasoning as HandleBackButton()'s quit-confirm dialog. Its callback (see
 // below) fires from inside a *later* frame's EndLayout() — still mid-frame
 // — so any action needing a follow-up BigScreenDialogs::* call (Kill,
-// Rename, Change Group, Delete) defers that through g_pendingAction rather
-// than calling it directly; Launch/Open Console/View Folder don't need a
-// dialog at all, so they run immediately.
+// Copy, Rename, Change Group, Export, Delete) defers that through
+// g_pendingAction rather than calling it directly; Launch/Open Console/
+// View Folder don't need a dialog at all, so they run immediately.
+
+// Reuses MMCZip::ExportToZipTask directly — the same Task
+// ExportInstanceDialog::doExport() builds. Deliberately plain-zip-only
+// (matches actionExportInstanceZip, not the Modrinth/.mrpack or
+// CurseForge/Flame pack variants, which need to reconstruct a portable
+// pack manifest — real modplatform-specific work, not a small follow-up).
+// Also deliberately skips the desktop dialog's per-file include/exclude
+// checkbox tree (FileIgnoreProxy) — collectFileListRecursively(...,
+// nullptr) with a null filter includes everything, matching what a fresh
+// "just export the whole instance" click would produce with nothing
+// unchecked, the common case.
+void StartInstanceExport(MinecraftInstance* inst)
+{
+    const std::string dialogTitle = TR("ExportInstanceDialog", "Export Instance").toStdString();
+    const std::string initialDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString();
+
+    // select_directory=true: picks an existing folder (via the file
+    // selector's own "<Use This Directory>" entry) rather than a filename
+    // — BigScreen builds the actual output filename itself from the
+    // instance's own name, matching the desktop dialog's own default
+    // suggestion (FS::PathCombine(QDir::homePath(), name + ".zip")) minus
+    // the ability to freely retype the filename, which needs a keyboard-
+    // centric save dialog this project has no equivalent of.
+    ImGuiFullscreen::OpenFileSelector(
+        dialogTitle, true,
+        [inst](const std::string& dir) {
+            if (dir.empty())
+                return;
+            g_pendingAction = [inst, dir]() {
+                CloseFileSelector();
+
+                const QString sanitizedName = FS::RemoveInvalidFilenameChars(inst->name());
+                const QString outputPath = FS::PathCombine(QString::fromStdString(dir), sanitizedName + ".zip");
+
+                // Matches ExportInstanceDialog.cpp's own SaveIcon() —
+                // copies a *custom* (non-built-in) icon file into the
+                // instance root first, so it's included in the zip and the
+                // re-imported instance keeps its icon. Simplified: skips
+                // the built-in-theme-icon-as-pixmap fallback branch (rarer
+                // — only matters for an icon that was never a real file to
+                // begin with), the common "user added a custom icon image"
+                // case is what this covers.
+                const MMCIcon* mmcIcon = APPLICATION->icons()->icon(inst->iconKey());
+                if (mmcIcon && !mmcIcon->isBuiltIn()) {
+                    const QString iconPath = mmcIcon->getFilePath();
+                    if (!iconPath.isEmpty()) {
+                        const QFileInfo iconInfo(iconPath);
+                        FS::copy(iconPath, FS::PathCombine(inst->instanceRoot(), iconInfo.fileName()))();
+                    }
+                }
+
+                QFileInfoList files;
+                if (!MMCZip::collectFileListRecursively(inst->instanceRoot(), nullptr, &files, nullptr)) {
+                    BigScreenDialogs::Confirm(TR("ExportInstanceDialog", "Error").toStdString(),
+                                               TR("ExportInstanceDialog", "Unable to export instance").toStdString(), false, "OK", "OK");
+                    return;
+                }
+
+                unique_qobject_ptr<Task> task(new MMCZip::ExportToZipTask(outputPath, inst->instanceRoot(), files, "", true));
+                task->start();
+                BigScreenDialogs::WaitForTask(task.get());
+
+                if (!task->wasSuccessful()) {
+                    BigScreenDialogs::Confirm(TR("ExportInstanceDialog", "Error").toStdString(), task->failReason().toStdString(), false,
+                                               "OK", "OK");
+                }
+            };
+        },
+        {}, initialDir);
+}
+
 void ShowInstanceActionsMenu(MinecraftInstance* inst)
 {
     struct Action {
@@ -2021,6 +3355,48 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
                              g_instanceSettingsTarget = inst;
                              SetScreen(Screen::InstanceSettings);
                          } });
+
+    // Desktop's CopyInstanceDialog lets the user pick exactly what to
+    // bring along (saves/mods/resource packs/screenshots/servers/...) and
+    // whether to symlink/hardlink/clone instead of a plain copy
+    // (InstanceCopyPrefs — 13 independent booleans). Deliberately not
+    // exposed here: the default InstanceCopyPrefs{} (copy everything,
+    // no link tricks) is already the common case ("just duplicate this
+    // instance"), and building a 13-item checkable picker for the
+    // advanced cases isn't worth it for how rarely they're used. New name
+    // defaults to the original's own name, same as the desktop dialog's
+    // own ui->instNameTextBox->setText(original->name()) — the user is
+    // expected to change it, same expectation either UI.
+    actions->push_back({ StripMnemonic(MW("Cop&y...")).toStdString(), [inst]() {
+                             g_pendingAction = [inst]() {
+                                 const auto name = BigScreenDialogs::InputString(TR("CopyInstanceDialog", "Copy Instance").toStdString(),
+                                                                                  "Enter a name for the copy", inst->name().toStdString());
+                                 if (!name || name->isEmpty())
+                                     return;
+
+                                 auto* copyTask = new InstanceCopyTask(inst, InstanceCopyPrefs());
+                                 copyTask->setName(*name);
+                                 copyTask->setGroup(APPLICATION->instances()->getInstanceGroup(inst->id()));
+                                 copyTask->setIcon(inst->iconKey());
+
+                                 unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(copyTask));
+                                 task->start();
+                                 BigScreenDialogs::WaitForTask(task.get());
+
+                                 if (!task->wasSuccessful()) {
+                                     BigScreenDialogs::Confirm(StripMnemonic(MW("Cop&y...")).toStdString(),
+                                                                "Failed to copy instance: " + task->failReason().toStdString(), false, "OK",
+                                                                "OK");
+                                 }
+                             };
+                         } });
+
+    // StartInstanceExport() opens the file selector itself (non-blocking,
+    // same as OpenFileSelector's own reasoning elsewhere in this file) —
+    // safe to call directly from this action's run(), no g_pendingAction
+    // needed at this level (StartInstanceExport()'s own callback handles
+    // the blocking part once a folder is actually picked).
+    actions->push_back({ StripMnemonic(MW("E&xport...")).toStdString(), [inst]() { StartInstanceExport(inst); } });
 
     // "Rename" here has no desktop dialog to match (the desktop version
     // edits the name inline in the instance list instead of via a popup),
@@ -2193,15 +3569,596 @@ void StartVanillaInstanceCreation()
         BigScreenDialogs::Confirm(dialogTitle, "Failed to create instance: " + task->failReason().toStdString(), false, "OK", "OK");
 }
 
-// Y on the Instances screen opens this. Only one real creation method is
-// wired up yet (see StartVanillaInstanceCreation's comment) — structured as
-// a proper menu now so adding more (Modrinth, CurseForge, zip import, ...)
-// later is just more entries, not a redesign. Same non-blocking
-// OpenChoiceDialog reasoning as ShowInstanceActionsMenu above.
+// Reuses the exact same InstanceImportTask the desktop's ImportPage builds
+// (ImportPage.cpp's on_modpackBtn_clicked()/updateState() local-file
+// branch) — a zip or .mrpack (Modrinth pack) file, detected as either a
+// Modrinth- or CurseForge-format pack from its own manifest inside the
+// archive, or imported as a raw MultiMC/PrismLauncher-format instance zip
+// if neither manifest is present (InstanceImportTask.cpp handles all
+// three internally — nothing BigScreen-specific to replicate there).
+// v1 gap, matches this project's own established pattern for it (see
+// reauthenticateAccount()'s fallback and the CurseForge-blocked-mod-
+// download note in CLAUDE.md's "Известные пробелы"): passing nullptr for
+// the QWidget* parent means any native dialog InstanceImportTask's
+// Modrinth/CurseForge sub-tasks might show mid-import (e.g. a
+// CurseForge-blocked-file prompt) would have no parent — same class of
+// gap as everywhere else in this codebase a QWidget* parent is passed as
+// nullptr, not a new one introduced here.
+void StartZipInstanceImport()
+{
+    const std::string initialDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString();
+
+    // OpenFileSelector() is the vendored toolkit's own real file-browser
+    // popup (ImGuiFullscreen.cpp) — lists directories/files under
+    // initial_directory, filtered by glob pattern, with normal MenuButton
+    // gamepad navigation and a "<Parent Directory>" entry to go up one
+    // level. Host::ShouldPreferHostFileSelector() (this project's own
+    // compat shim, HostCompat.cpp) always returns false, so this always
+    // uses that widget rather than trying to defer to some native OS
+    // picker BigScreen has no equivalent of.
+    ImGuiFullscreen::OpenFileSelector(
+        TR("ImportPage", "Choose modpack").toStdString(), false,
+        [](const std::string& path) {
+            // Empty path means cancelled — DrawFileSelector() itself
+            // already called CloseFileSelector() before invoking this,
+            // matching OpenChoiceDialog's own cancel-vs-select asymmetry
+            // (see ShowInstanceActionsMenu()'s comment): a REAL selection
+            // leaves the popup open and expects the callback to close it,
+            // which — same reentrancy reasoning as every other X/Y menu in
+            // this file — has to be deferred through g_pendingAction
+            // rather than done directly from in here.
+            if (path.empty())
+                return;
+            g_pendingAction = [path]() {
+                CloseFileSelector();
+
+                const QString qpath = QString::fromStdString(path);
+                const QFileInfo fi(qpath);
+                const auto name = BigScreenDialogs::InputString(
+                    "Instance Name", "Enter a name for the new instance", fi.completeBaseName().toStdString());
+                if (!name || name->isEmpty())
+                    return;
+
+                auto* importTask = new InstanceImportTask(QUrl::fromLocalFile(qpath), false, nullptr, {});
+                importTask->setName(*name);
+
+                unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(importTask));
+                task->start();
+                BigScreenDialogs::WaitForTask(task.get());
+
+                if (!task->wasSuccessful()) {
+                    BigScreenDialogs::Confirm(StripMnemonic(MW("Add Instanc&e...")).toStdString(),
+                                               "Failed to import instance: " + task->failReason().toStdString(), false, "OK", "OK");
+                }
+            };
+        },
+        { "*.zip", "*.mrpack" }, initialDir);
+}
+
+// Modrinth browse screen state + icon cache. Search results live here
+// (not a local variable) so DrawModrinthBrowse() can redraw the same list
+// across many frames — unlike every earlier Modrinth-related flow in this
+// file (a single blocking Choose() call), this is a real persistent
+// screen so pack icons can load in and search can re-run without
+// re-entering a dialog each time.
+struct ModrinthBrowseState {
+    QList<ModPlatform::IndexedPack::Ptr> packs;
+    QString query;  // empty = browsing by downloads, no search term
+    QString lastError;
+    // Modpack means "create a new instance" (InstallModrinthPack(), the
+    // original use of this screen); any other type means "install one
+    // resource into targetModel/targetInstance" (InstallModrinthResource())
+    // — see DrawModrinthBrowse()'s install branch.
+    ModPlatform::ResourceType resourceType = ModPlatform::ResourceType::Modpack;
+    ResourceFolderModel* targetModel = nullptr;
+    MinecraftInstance* targetInstance = nullptr;
+    std::string screenTitle = "Modrinth";
+    // Pagination — Modrinth's search endpoint takes a plain offset/limit
+    // pair, not a page token (getSearchURL() in ModrinthAPI.h hardcodes
+    // limit=25 itself, not exposed via SearchArgs — kModrinthPageSize
+    // below just mirrors that constant for our own offset math). offset
+    // is the current page's starting index (0 = first page); hasMore is
+    // recomputed after every search from whether a *full* page came back
+    // (Modrinth doesn't return a total count through the fields this
+    // project already parses, so "got fewer than a full page" is the
+    // signal for "this is the last page" — same heuristic a lot of
+    // "Load More" UIs use when a real total isn't available).
+    int offset = 0;
+    bool hasMore = false;
+};
+ModrinthBrowseState g_modrinthBrowse;
+constexpr int kModrinthPageSize = 25;
+
+// Keyed by IndexedPack::logoName, matching the desktop's own cache key
+// (ModpackListModel::requestLogo()/logoLoaded()). Loading is fire-and-
+// forget/async — deliberately NOT run through BigScreenDialogs::WaitForTask
+// like every other network call in this file, since blocking once per
+// visible pack (up to 25) to show a browse list would freeze the screen
+// for several seconds; a generic fallback icon while a real one streams in
+// is a much better gamepad experience than a frozen list.
+std::unordered_map<QString, std::shared_ptr<GSTexture>> g_modrinthIconCache;
+std::unordered_set<QString> g_modrinthIconLoading;
+
+// Fires at most one in-flight NetJob per logo (guarded by
+// g_modrinthIconLoading) — same requestLogo()/metaEntryBase() pattern the
+// desktop's ModpackListModel uses (ModrinthModel.cpp), just writing into
+// this file's own GSTexture cache via BigScreenGui::UploadQImage() instead
+// of a QIcon. The NetJob is a plain `new`, parented to nothing — it frees
+// itself via deleteLater() from its own succeeded/failed handler, the same
+// self-contained lifetime the reference code relies on; no global
+// "in-flight jobs" container needed.
+void RequestModrinthIcon(const ModPlatform::IndexedPack::Ptr& pack)
+{
+    const QString logo = pack->logoName;
+    if (logo.isEmpty() || pack->logoUrl.isEmpty())
+        return;
+    if (g_modrinthIconCache.count(logo) || g_modrinthIconLoading.count(logo))
+        return;
+    g_modrinthIconLoading.insert(logo);
+
+    MetaEntryPtr entry = APPLICATION->metacache()->resolveEntry("ModrinthModpacks", QString("logos/%1").arg(logo));
+    auto* job = new NetJob(QString("Modrinth Icon Download %1").arg(logo), APPLICATION->network());
+    job->addNetAction(Net::ApiRequest::makeCached(QUrl(pack->logoUrl), entry));
+
+    const QString fullPath = entry->getFullPath();
+    QObject::connect(job, &NetJob::succeeded, job, [logo, fullPath, job]() {
+        job->deleteLater();
+        g_modrinthIconLoading.erase(logo);
+        const QImage image(fullPath);
+        if (!image.isNull())
+            g_modrinthIconCache[logo] = BigScreenGui::UploadQImage(image);
+    });
+    QObject::connect(job, &NetJob::failed, job, [logo, job](const QString&) {
+        job->deleteLater();
+        g_modrinthIconLoading.erase(logo);
+    });
+
+    job->start();
+}
+
+// Installs one chosen Modrinth modpack version as a brand-new instance —
+// reuses the exact same InstanceImportTask/ModrinthCreationTask pipeline
+// StartZipInstanceImport() already drives for a local .mrpack file
+// (ModrinthPage::suggestCurrent() on the desktop builds the identical
+// extraInfo map for its own "install from search" flow — confirmed by
+// reading InstanceImportTask::processModrinth(), which pulls "pack_id"/
+// "pack_version_id" back out of m_extra_info to construct the real
+// ModrinthCreationTask internally). setIcon("default") makes
+// processModrinth() pull the pack's own logo into the new instance
+// automatically (installIcon(), same file) — no separate icon-download/
+// cache glue needed for this path.
+// Confirmed via reading ModrinthCreationTask::executeTask() that a plain
+// install with no "original_instance_id" key takes the
+// originalInstanceID().isEmpty() branch straight to createInstance() with
+// no native QMessageBox anywhere in between — safe to drive headless/
+// gamepad-only exactly like this.
+void InstallModrinthPack(const ModPlatform::IndexedPack::Ptr& pack)
+{
+    const std::string dialogTitle = pack->name.toStdString();
+
+    ResourceAPI::VersionSearchArgs versionArgs;
+    versionArgs.pack = pack;
+    versionArgs.resourceType = ModPlatform::ResourceType::Modpack;
+
+    QVector<ModPlatform::IndexedVersion> versions;
+    bool versionsSucceeded = false;
+    QString versionsFailReason;
+    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+        versionArgs, { [&versions, &versionsSucceeded](QVector<ModPlatform::IndexedVersion>& result) {
+                          versions = result;
+                          versionsSucceeded = true;
+                      },
+                       [&versionsFailReason](const QString& reason, int) { versionsFailReason = reason; }, [] {} });
+    if (!versionsTask) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to load versions for this pack.", false, "OK", "OK");
+        return;
+    }
+    versionsTask->start();
+    BigScreenDialogs::WaitForTask(versionsTask.get());
+
+    if (!versionsSucceeded || versions.isEmpty()) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to load versions for this pack: " + versionsFailReason.toStdString(), false, "OK",
+                                    "OK");
+        return;
+    }
+
+    std::vector<std::string> versionLabels;
+    for (const ModPlatform::IndexedVersion& v : versions)
+        versionLabels.push_back(v.getVersionDisplayString().toStdString());
+
+    const auto versionChoice = BigScreenDialogs::Choose(dialogTitle, versionLabels);
+    if (!versionChoice || *versionChoice < 0 || static_cast<size_t>(*versionChoice) >= static_cast<size_t>(versions.size()))
+        return;
+    const ModPlatform::IndexedVersion& chosenVersion = versions[static_cast<int>(*versionChoice)];
+
+    const auto name = BigScreenDialogs::InputString("Instance Name", "Enter a name for the new instance", pack->name.toStdString());
+    if (!name || name->isEmpty())
+        return;
+
+    QMap<QString, QString> extraInfo{ { "pack_id", pack->addonId.toString() }, { "pack_version_id", chosenVersion.fileId.toString() } };
+    auto* importTask = new InstanceImportTask(QUrl(chosenVersion.downloadUrl), true, nullptr, extraInfo);
+    importTask->setName(*name);
+    importTask->setIcon("default");
+
+    unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(importTask));
+    task->start();
+    BigScreenDialogs::WaitForTask(task.get());
+
+    if (!task->wasSuccessful())
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to install modpack: " + task->failReason().toStdString(), false, "OK", "OK");
+}
+
+// Mirrors ModFilterWidget::prepareBasicFilter()'s two defaults (the only
+// part of that Qt-widget class actually needed here) — only meaningful
+// for Mod (see both call sites below for why the other resource types
+// don't use this). Shared by RunModrinthSearch() (filters what appears in
+// the browse list itself, matching ModModel::createSearchArguments() on
+// the desktop) and InstallModrinthResource() (filters the version list
+// for one already-chosen pack, matching createVersionsArguments()) — a
+// real gap caught by testing, not designed in from the start: an earlier
+// version of this code only filtered the version list, so the browse
+// list itself still showed e.g. Fabric-only mods (Sodium, Fabric API) for
+// a NeoForge instance — confirmed live via a screenshot before this fix.
+struct ModCompatFilter {
+    std::optional<std::vector<Version>> versions;
+    std::optional<ModPlatform::ModLoaderTypes> loaders;
+};
+ModCompatFilter GetModCompatibilityFilter(MinecraftInstance* inst)
+{
+    ModCompatFilter filter;
+    if (!inst)
+        return filter;
+
+    // Same real bug DrawInstanceSettingsVersion() already had to work
+    // around (see its own comment) — PackProfile doesn't auto-load, so
+    // getComponentVersion()/getSupportedModLoaders() silently return
+    // empty for an instance whose Version tab was never opened first.
+    // Confirmed live via a temporary diagnostic: without this,
+    // GetModCompatibilityFilter() derived an empty filter for the real
+    // "automodpack" instance (NeoForge/1.21.1) even though its
+    // mmc-pack.json is fully populated on disk — the object just hadn't
+    // been parsed into yet. Same "once per distinct pointer" caching.
+    PackProfile* profile = inst->getPackProfile();
+    static PackProfile* lastProfile = nullptr;
+    if (profile != lastProfile) {
+        profile->reload(Net::Mode::Online);
+        lastProfile = profile;
+    }
+
+    const QString mcVersion = profile->getComponentVersion("net.minecraft");
+    if (!mcVersion.isEmpty())
+        filter.versions = std::vector<Version>{ Version(mcVersion) };
+    filter.loaders = profile->getSupportedModLoaders();
+    return filter;
+}
+
+// Installs one chosen Modrinth resource (Mod/Resource/Shader/Data Pack)
+// into g_modrinthBrowse.targetModel — the current instance's already-
+// existing mods/resourcepacks/shaderpacks/datapacks folder, NOT a new
+// instance (that's InstallModrinthPack() above, for Modpack only).
+// Real desktop equivalent: ResourceDownloadDialog::addResource() +
+// ResourceModel::addPack(), minus the QWidget dialog/ModFilterWidget/
+// GetModDependenciesTask machinery around it — confirmed by reading
+// ResourceDownloadTask.h/.cpp directly that dependency resolution lives
+// entirely OUTSIDE this task (a separate opt-out convenience the desktop
+// only runs for Mods, gated behind ResourceDownloadDialog::confirm()) and
+// isn't needed for a correct, if manual, install: skipping it just means
+// a mod that needs another mod won't load until the user installs that
+// one too — identical to what already happens if someone drops a file
+// into the folder by hand, the status quo this replaces.
+void InstallModrinthResource(const ModPlatform::IndexedPack::Ptr& pack)
+{
+    ResourceFolderModel* model = g_modrinthBrowse.targetModel;
+    MinecraftInstance* inst = g_modrinthBrowse.targetInstance;
+    if (!model || !inst)
+        return;
+
+    const std::string dialogTitle = pack->name.toStdString();
+
+    ResourceAPI::VersionSearchArgs versionArgs;
+    versionArgs.pack = pack;
+    versionArgs.resourceType = g_modrinthBrowse.resourceType;
+    // Only Mods get filtered by MC version/loader compatibility — confirmed
+    // by reading ModModel.cpp vs. ResourcePackResourceModel.cpp/
+    // ShaderPackResourceModel.cpp/DataPackResourceModel.cpp directly: the
+    // other three pass empty loaders/versions unconditionally, matching
+    // the desktop's own behavior (it doesn't protect the user there
+    // either — a resource pack/shader/data pack has no "loader", and MC
+    // version compatibility for those is looser/self-evident from the
+    // pack's own description in practice). This mirrors
+    // ModFilterWidget::prepareBasicFilter()'s two defaults, the only part
+    // of that Qt-widget class actually needed here.
+    if (g_modrinthBrowse.resourceType == ModPlatform::ResourceType::Mod) {
+        const ModCompatFilter filter = GetModCompatibilityFilter(inst);
+        versionArgs.mcVersions = filter.versions;
+        versionArgs.loaders = filter.loaders;
+    }
+
+    QVector<ModPlatform::IndexedVersion> versions;
+    bool versionsSucceeded = false;
+    QString versionsFailReason;
+    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+        versionArgs, { [&versions, &versionsSucceeded](QVector<ModPlatform::IndexedVersion>& result) {
+                          versions = result;
+                          versionsSucceeded = true;
+                      },
+                       [&versionsFailReason](const QString& reason, int) { versionsFailReason = reason; }, [] {} });
+    if (!versionsTask) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to load versions for this pack.", false, "OK", "OK");
+        return;
+    }
+    versionsTask->start();
+    BigScreenDialogs::WaitForTask(versionsTask.get());
+
+    if (!versionsSucceeded || versions.isEmpty()) {
+        BigScreenDialogs::Confirm(dialogTitle,
+                                    "No compatible versions found for this instance: " + versionsFailReason.toStdString(), false, "OK",
+                                    "OK");
+        return;
+    }
+
+    std::vector<std::string> versionLabels;
+    for (const ModPlatform::IndexedVersion& v : versions)
+        versionLabels.push_back(v.getVersionDisplayString().toStdString());
+
+    const auto versionChoice = BigScreenDialogs::Choose(dialogTitle, versionLabels);
+    if (!versionChoice || *versionChoice < 0 || static_cast<size_t>(*versionChoice) >= static_cast<size_t>(versions.size()))
+        return;
+    const ModPlatform::IndexedVersion& chosenVersion = versions[static_cast<int>(*versionChoice)];
+
+    unique_qobject_ptr<Task> task(new ResourceDownloadTask(pack, chosenVersion, model));
+    task->start();
+    BigScreenDialogs::WaitForTask(task.get());
+
+    if (!task->wasSuccessful()) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to download: " + task->failReason().toStdString(), false, "OK", "OK");
+        return;
+    }
+    model->update();
+}
+
+// Runs (or re-runs, for a new search term or page) the actual Modrinth
+// query and fills g_modrinthBrowse — shared by the initial browse-by-
+// downloads load and by DrawModrinthBrowse()'s "Search"/"Clear search"/
+// page-navigation actions. query empty means "no search term" (browse by
+// downloads — see ModrinthAPI::getSearchURL(), which only appends
+// query=... when args.search.has_value()). offset selects the page (0 =
+// first); defaults to 0 so every *new* search (a fresh query, or clearing
+// one) naturally starts back at page 1 — only the explicit page-nav
+// actions in DrawModrinthBrowse() pass a nonzero offset while keeping the
+// same query. Searches under g_modrinthBrowse.resourceType, set by the
+// caller (StartModrinthBrowse()/StartResourceBrowse()) before this runs —
+// Mod/ResourcePack/ShaderPack/DataPack all reuse this unchanged, just a
+// different args.type (confirmed by reading Modrinth's own search-result
+// parser, Modrinth::loadIndexedPack() — resource-type agnostic, same
+// name/description/logoName/logoUrl fields for every type).
+void RunModrinthSearch(const QString& query, int offset = 0)
+{
+    g_modrinthBrowse.query = query;
+    g_modrinthBrowse.offset = offset;
+    g_modrinthBrowse.packs.clear();
+    g_modrinthBrowse.hasMore = false;
+    g_modrinthBrowse.lastError.clear();
+
+    ResourceAPI::SearchArgs args;
+    args.type = g_modrinthBrowse.resourceType;
+    args.offset = offset;
+    args.sorting = ResourceAPI::SortingMethod{ .index = 2, .name = "downloads", .readableName = {} };
+    if (!query.isEmpty())
+        args.search = query;
+    // See ModCompatFilter's comment — Mods only, matching
+    // ModModel::createSearchArguments() on the desktop, so an
+    // incompatible mod (wrong loader/MC version) doesn't even show up in
+    // the browse list, not just fail later when a version is chosen.
+    if (g_modrinthBrowse.resourceType == ModPlatform::ResourceType::Mod && g_modrinthBrowse.targetInstance) {
+        const ModCompatFilter filter = GetModCompatibilityFilter(g_modrinthBrowse.targetInstance);
+        args.versions = filter.versions;
+        args.loaders = filter.loaders;
+    }
+
+    QList<ModPlatform::IndexedPack::Ptr> packs;
+    bool succeeded = false;
+    QString failReason;
+    Task::Ptr searchTask = ModrinthAPI::get().searchProjects(
+        args, { [&packs, &succeeded](QList<ModPlatform::IndexedPack::Ptr>& result) {
+                   packs = result;
+                   succeeded = true;
+               },
+                [&failReason](const QString& reason, int) { failReason = reason; }, [] {} });
+    if (!searchTask) {
+        g_modrinthBrowse.lastError = "Failed to search Modrinth. Check your internet connection.";
+        return;
+    }
+    searchTask->start();
+    BigScreenDialogs::WaitForTask(searchTask.get());
+
+    if (!succeeded) {
+        g_modrinthBrowse.lastError = "Failed to search Modrinth: " + failReason;
+        return;
+    }
+    g_modrinthBrowse.packs = packs;
+    g_modrinthBrowse.hasMore = packs.size() >= kModrinthPageSize;
+    if (packs.isEmpty())
+        g_modrinthBrowse.lastError = offset > 0 ? "No more results." : "No results found.";
+}
+
+// Y → Add Instance → "Modrinth" opens this — runs the initial
+// browse-by-downloads query, then switches to Screen::ModrinthBrowse
+// regardless of success/failure (the screen itself shows
+// g_modrinthBrowse.lastError inline when the list is empty, same as any
+// other real-data list screen in this file — Servers/Worlds/etc. all show
+// their own "nothing here" text rather than a separate error dialog).
+void StartModrinthBrowse()
+{
+    g_modrinthBrowse.resourceType = ModPlatform::ResourceType::Modpack;
+    g_modrinthBrowse.targetModel = nullptr;
+    g_modrinthBrowse.targetInstance = nullptr;
+    g_modrinthBrowse.screenTitle = TR("ModrinthPage", "Modrinth").toStdString();
+    RunModrinthSearch(QString());
+    SetScreen(Screen::ModrinthBrowse);
+}
+
+// X → "Download ..." on any of the Mods/Resource/Shader/Data Packs
+// Instance Settings tabs opens this — same browse screen as
+// StartModrinthBrowse(), just targeting one resource type + the current
+// instance's matching *List() model instead of creating a whole new
+// instance. screenTitle reuses the real "Download Mods"/"Download Packs"
+// text each DrawInstanceSettingsXxx() wrapper already passes into
+// ShowResourceActionsMenu() for its menu entry — same string, now also
+// used as this screen's title.
+void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle)
+{
+    g_modrinthBrowse.resourceType = type;
+    g_modrinthBrowse.targetModel = model;
+    g_modrinthBrowse.targetInstance = inst;
+    g_modrinthBrowse.screenTitle = screenTitle.toStdString();
+    RunModrinthSearch(QString());
+    SetScreen(Screen::ModrinthBrowse);
+}
+
+// Scrollable list of real Modrinth modpacks — icon (streamed in async via
+// RequestModrinthIcon(), falling back to the generic instances icon until
+// it arrives), name, and author+description as the row's title/summary.
+// A confirms (installs via InstallModrinthPack(), deferred through
+// g_pendingAction since this fires from inside the list's own draw loop —
+// same reentrancy reasoning as every X/Y menu action in this file), Y
+// opens a search prompt.
+// Returns where B/"< Back" should go: Instances for a modpack browse
+// (StartModrinthBrowse(), reached from Y on Instances), or back to the
+// Instance Settings tab it was opened from for any single-resource browse
+// (StartResourceBrowse(), reached from X → "Download ..." on Mods/
+// Resource/Shader/Data Packs).
+Screen ModrinthBrowseBackTarget()
+{
+    return g_modrinthBrowse.resourceType == ModPlatform::ResourceType::Modpack ? Screen::Instances : Screen::InstanceSettings;
+}
+
+void DrawModrinthBrowse()
+{
+    const int currentPage = g_modrinthBrowse.offset / kModrinthPageSize + 1;
+    const bool canGoPrev = g_modrinthBrowse.offset > 0;
+    const bool canGoNext = g_modrinthBrowse.hasMore;
+
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Install" },
+                          { glyphs.north, "Search" },
+                          { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Page" },
+                          { glyphs.cancel(false), "Back" } });
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+
+    // Deliberately checked before BeginScreen()/drawing — same ordering
+    // DrawSettings()/DrawInstanceSettings() use for their own LB/RB tab
+    // switching, so this frame's content already reflects the new page
+    // rather than lagging a frame behind. Deferred through g_pendingAction
+    // since RunModrinthSearch() blocks (WaitForTask) and this check runs
+    // mid-frame, same reasoning as the Y-search action below.
+    if (!anyDialogOpen) {
+        if (canGoNext && ImGui::IsKeyPressed(ImGuiKey_GamepadR1, false)) {
+            const int nextOffset = g_modrinthBrowse.offset + kModrinthPageSize;
+            g_pendingAction = [nextOffset]() { RunModrinthSearch(g_modrinthBrowse.query, nextOffset); };
+        } else if (canGoPrev && ImGui::IsKeyPressed(ImGuiKey_GamepadL1, false)) {
+            const int prevOffset = std::max(0, g_modrinthBrowse.offset - kModrinthPageSize);
+            g_pendingAction = [prevOffset]() { RunModrinthSearch(g_modrinthBrowse.query, prevOffset); };
+        }
+    }
+
+    if (BeginScreen(g_modrinthBrowse.screenTitle.c_str())) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "modrinth_browse")) {
+            BeginMenuButtons();
+            ResetFocusHere();
+
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back"))
+                SetScreen(ModrinthBrowseBackTarget());
+
+            if (!g_modrinthBrowse.query.isEmpty()) {
+                const QString clearLabel = QString("\xC3\x97 ") + QObject::tr("Clear search (\"%1\")").arg(g_modrinthBrowse.query);
+                if (MenuButtonWithoutSummary(clearLabel.toUtf8().constData()))
+                    g_pendingAction = []() { RunModrinthSearch(QString()); };
+            }
+
+            // Page indicator — no real total-page count available (see
+            // ModrinthBrowseState's comment on hasMore), so this reads
+            // "Page N" rather than "Page N of M", plus which direction(s)
+            // LB/RB currently do something.
+            {
+                QString pageLabel = QObject::tr("Page %1").arg(currentPage);
+                if (canGoPrev || canGoNext)
+                    pageLabel += QString("  (%1%2%3)")
+                                     .arg(canGoPrev ? "\xE2\x97\x80 LB " : "")
+                                     .arg(canGoPrev && canGoNext ? " " : "")
+                                     .arg(canGoNext ? "RB \xE2\x96\xB6" : "");
+                ImGui::TextUnformatted(pageLabel.toUtf8().constData());
+            }
+
+            if (g_modrinthBrowse.packs.isEmpty() && !g_modrinthBrowse.lastError.isEmpty())
+                ImGui::TextUnformatted(g_modrinthBrowse.lastError.toUtf8().constData());
+
+            for (const ModPlatform::IndexedPack::Ptr& pack : g_modrinthBrowse.packs) {
+                RequestModrinthIcon(pack);
+
+                GSTexture* icon = nullptr;
+                if (auto it = g_modrinthIconCache.find(pack->logoName); it != g_modrinthIconCache.end())
+                    icon = it->second.get();
+                if (!icon)
+                    icon = GetCachedTexture("images/icons/instances.png");
+
+                const QByteArray nameUtf8 = pack->name.toUtf8();
+                QString summary = pack->description;
+                if (!pack->authors.isEmpty())
+                    summary = pack->authors.first().name + " — " + summary;
+                const QByteArray summaryUtf8 = summary.toUtf8();
+
+                ImGui::PushID(pack->addonId.toString().toUtf8().constData());
+                const bool pressed = icon != nullptr
+                    ? MenuImageButton(nameUtf8.constData(), summaryUtf8.constData(),
+                                       static_cast<ImTextureID>(icon->GetNativeHandle()), LayoutScale(56.0f, 56.0f), true, 66.0f)
+                    : MenuButton(nameUtf8.constData(), summaryUtf8.constData());
+                ImGui::PopID();
+
+                if (pressed) {
+                    ModPlatform::IndexedPack::Ptr chosen = pack;
+                    const bool isModpack = g_modrinthBrowse.resourceType == ModPlatform::ResourceType::Modpack;
+                    g_pendingAction = [chosen, isModpack]() {
+                        if (isModpack)
+                            InstallModrinthPack(chosen);
+                        else
+                            InstallModrinthResource(chosen);
+                    };
+                }
+            }
+
+            EndMenuButtons();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+
+    if (!anyDialogOpen && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false)) {
+        g_pendingAction = []() {
+            const auto query =
+                BigScreenDialogs::InputString(g_modrinthBrowse.screenTitle, "Search", g_modrinthBrowse.query.toStdString());
+            if (query)
+                RunModrinthSearch(*query);
+        };
+    }
+}
+
+// Y on the Instances screen opens this. Three creation methods wired up now
+// (Vanilla Minecraft, local zip/.mrpack import, online Modrinth browsing —
+// see StartZipInstanceImport()/StartModrinthBrowse()'s comments) —
+// structured as a proper menu so adding more (CurseForge, needs an API
+// key — still not started) later is just more entries, not a redesign.
+// Same non-blocking OpenChoiceDialog reasoning as ShowInstanceActionsMenu
+// above.
 void ShowAddInstanceMenu()
 {
     ChoiceDialogOptions options;
     options.emplace_back("Vanilla Minecraft", false);
+    options.emplace_back(TR("ImportPage", "Import").toStdString(), false);
+    options.emplace_back(TR("ModrinthPage", "Modrinth").toStdString(), false);
 
     // See ShowInstanceActionsMenu()'s comment on why this closes the dialog
     // itself before acting — DrawChoiceDialog() doesn't do it automatically
@@ -2216,6 +4173,16 @@ void ShowAddInstanceMenu()
                               g_pendingAction = []() {
                                   CloseChoiceDialog();
                                   StartVanillaInstanceCreation();
+                              };
+                          } else if (index == 1) {
+                              g_pendingAction = []() {
+                                  CloseChoiceDialog();
+                                  StartZipInstanceImport();
+                              };
+                          } else if (index == 2) {
+                              g_pendingAction = []() {
+                                  CloseChoiceDialog();
+                                  StartModrinthBrowse();
                               };
                           }
                       });
@@ -2523,6 +4490,31 @@ int main(int argc, char** argv)
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableGamepad;
     io.ConfigFlags |= ImGuiConfigFlags_NavEnableKeyboard;
 
+    // Real user report, root-caused by reading Dear ImGui's own source
+    // (imgui_internal.h): "ImGuiKey_NavGamepadMenu" — Dear ImGui's own
+    // built-in "hold to open a window-switcher overlay" shortcut — is
+    // #define'd directly to ImGuiKey_GamepadFaceLeft, the exact same
+    // physical button BigScreen uses everywhere for its own "X: Actions"
+    // context menu. With ImGuiConfigFlags_NavEnableGamepad on (needed for
+    // any gamepad nav at all), Dear ImGui's NavUpdateWindowing() reacts to
+    // that same held button on its own, showing its built-in window-list
+    // popup for as long as it's held — reported live as "holding X
+    // anywhere briefly shows some popup" — and, since BigScreen's own
+    // choice dialog only actually appears a frame or more after the press
+    // (deferred via g_pendingAction/CloseChoiceDialog for reentrancy, see
+    // DialogHelpers.h), a normal human button-hold duration is long enough
+    // for ImGui's own windowing to activate first and interfere with (or
+    // mask) BigScreen's own menu — matching the "X menu doesn't open"
+    // half of the same report. This built-in feature (an Alt-Tab-style
+    // switcher between simultaneously open ImGui windows) has no meaning
+    // for BigScreen's own single-active-screen architecture, so it's
+    // disabled outright rather than fighting a random hold-duration race
+    // against it. ConfigNavWindowingWithGamepad lives on the *internal*
+    // ImGuiContext (imgui_internal.h — no public ImGuiIO field controls
+    // this specifically), transitively already included here via
+    // ImGuiFullscreen.h.
+    ImGui::GetCurrentContext()->ConfigNavWindowingWithGamepad = false;
+
     ImGui::StyleColorsDark();
     ImGui_ImplSDL2_InitForOpenGL(window, gl_context);
     ImGui_ImplOpenGL3_Init(glsl_version);
@@ -2574,6 +4566,12 @@ int main(int argc, char** argv)
         SetScreen(Screen::Console);
     };
 
+    // Bridges LaunchController::offerToOpenAccountManager() (see
+    // BigScreenLaunchController's override) — fires when a launch is
+    // attempted with zero valid accounts and the user says they want to
+    // add one now.
+    BigScreenLaunchController::onOpenAccounts = []() { SetScreen(Screen::Accounts); };
+
     // BigScreen-only settings (Settings > Appearance) — not real desktop
     // keys, so registered here rather than in the shared
     // Application::init() registerSetting() block.
@@ -2587,7 +4585,7 @@ int main(int argc, char** argv)
     // right after creation is visually identical to creating it fullscreen
     // outright, just very briefly windowed first.
     APPLICATION->settings()->registerSetting("BigScreenFullscreen", true);
-    SDL_SetWindowFullscreen(window, APPLICATION->settings()->get("BigScreenFullscreen").toBool() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
+    SDL_SetWindowFullscreen(window, WantFullscreen() ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
 
     // TEMPORARY diagnostic: BIGSCREEN_AUTOLAUNCH=<instance id> triggers the
     // exact same launch codepath a real "A: Launch" press would, without
@@ -2602,6 +4600,138 @@ int main(int argc, char** argv)
             }
             SDL_Log("[autolaunch] launching %s", qUtf8Printable(id));
             APPLICATION->launch(inst, LaunchMode::Normal, nullptr, nullptr, QString(), &BigScreenLaunchController::create);
+        });
+    }
+
+    // Kept diagnostic (like BIGSCREEN_AUTOLAUNCH): BIGSCREEN_TEST_IMPORT=
+    // <path to a zip> runs the exact same InstanceImportTask pipeline
+    // StartZipInstanceImport() does — wrapInstanceTask()/start()/
+    // WaitForTask() — skipping only the interactive file-selector/name-
+    // prompt steps (name is fixed to a "-DELETE-ME" suffixed one so it's
+    // unmistakable and safe to clean up immediately after, same pattern as
+    // this project's earlier safe destructive-operation tests). Logs
+    // success/failure and the resulting instance count so a real .zip's
+    // outcome (even an expected failure, e.g. a plain world-save zip that
+    // isn't a valid pack format) can be confirmed without needing gamepad/
+    // keyboard input — this is exactly what confirmed the import pipeline
+    // itself works end-to-end (real translated failReason, zero stray
+    // instances) independent from the file-selector UI.
+    if (const char* importPath = std::getenv("BIGSCREEN_TEST_IMPORT")) {
+        QTimer::singleShot(500, &app, [path = QString::fromUtf8(importPath)]() {
+            const int countBefore = APPLICATION->instances()->rowCount();
+            SDL_Log("[test-import] instance count before: %d", countBefore);
+
+            auto* importTask = new InstanceImportTask(QUrl::fromLocalFile(path), false, nullptr, {});
+            importTask->setName("BigScreenTestImport-DELETE-ME");
+
+            unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(importTask));
+            task->start();
+            BigScreenDialogs::WaitForTask(task.get());
+
+            const int countAfter = APPLICATION->instances()->rowCount();
+            SDL_Log("[test-import] wasSuccessful=%d failReason='%s' countAfter=%d", task->wasSuccessful(),
+                    task->failReason().toUtf8().constData(), countAfter);
+
+            if (task->wasSuccessful()) {
+                InstanceList* instances = APPLICATION->instances();
+                for (int i = 0; i < instances->rowCount(); ++i) {
+                    MinecraftInstance* inst = instances->at(i);
+                    if (inst && inst->name() == "BigScreenTestImport-DELETE-ME") {
+                        SDL_Log("[test-import] cleaning up test instance");
+                        instances->trashInstance(inst->id());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Kept diagnostic (like BIGSCREEN_AUTOLAUNCH/BIGSCREEN_TEST_IMPORT):
+    // BIGSCREEN_TEST_COPY=<source instance id> runs the same
+    // InstanceCopyTask pipeline the "Copy..." action does, skipping only
+    // the interactive name prompt (fixed to a "-DELETE-ME" name, cleaned
+    // up immediately after — same safe pattern as BIGSCREEN_TEST_IMPORT
+    // above). Confirmed live: real instance count 8->9->8, zero residue
+    // left on disk after cleanup.
+    if (const char* copySourceId = std::getenv("BIGSCREEN_TEST_COPY")) {
+        QTimer::singleShot(500, &app, [id = QString::fromUtf8(copySourceId)]() {
+            MinecraftInstance* source = APPLICATION->instances()->getInstanceById(id);
+            if (!source) {
+                SDL_Log("[test-copy] no such instance: %s", qUtf8Printable(id));
+                return;
+            }
+            const int countBefore = APPLICATION->instances()->rowCount();
+            SDL_Log("[test-copy] copying '%s', instance count before: %d", qUtf8Printable(source->name()), countBefore);
+
+            auto* copyTask = new InstanceCopyTask(source, InstanceCopyPrefs());
+            copyTask->setName("BigScreenTestCopy-DELETE-ME");
+            copyTask->setGroup(APPLICATION->instances()->getInstanceGroup(source->id()));
+            copyTask->setIcon(source->iconKey());
+
+            unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(copyTask));
+            task->start();
+            BigScreenDialogs::WaitForTask(task.get());
+
+            const int countAfter = APPLICATION->instances()->rowCount();
+            SDL_Log("[test-copy] wasSuccessful=%d failReason='%s' countAfter=%d", task->wasSuccessful(),
+                    task->failReason().toUtf8().constData(), countAfter);
+
+            if (task->wasSuccessful()) {
+                InstanceList* instances = APPLICATION->instances();
+                for (int i = 0; i < instances->rowCount(); ++i) {
+                    MinecraftInstance* inst = instances->at(i);
+                    if (inst && inst->name() == "BigScreenTestCopy-DELETE-ME") {
+                        SDL_Log("[test-copy] cleaning up test instance");
+                        instances->trashInstance(inst->id());
+                        break;
+                    }
+                }
+            }
+        });
+    }
+
+    // Kept diagnostic (like BIGSCREEN_TEST_COPY/BIGSCREEN_TEST_IMPORT):
+    // BIGSCREEN_TEST_EXPORT=<source instance id>:<output dir> runs the
+    // same MMCZip::ExportToZipTask pipeline StartInstanceExport() does,
+    // skipping only the interactive file-selector step. Confirmed live: a
+    // real small instance exported to a valid, correctly-structured zip
+    // (verified with `unzip -l` — real minecraft/config, minecraft/logs,
+    // instance.cfg, mmc-pack.json all present), with zero side effects on
+    // the source instance's own folder (its icon is built-in, so the
+    // icon-copy branch correctly no-ops).
+    if (const char* exportSpec = std::getenv("BIGSCREEN_TEST_EXPORT")) {
+        QTimer::singleShot(500, &app, [spec = QString::fromUtf8(exportSpec)]() {
+            const int sep = spec.lastIndexOf(':');
+            if (sep < 0) {
+                SDL_Log("[test-export] bad spec, expected <instance id>:<output dir>");
+                return;
+            }
+            const QString id = spec.left(sep);
+            const QString dir = spec.mid(sep + 1);
+
+            MinecraftInstance* inst = APPLICATION->instances()->getInstanceById(id);
+            if (!inst) {
+                SDL_Log("[test-export] no such instance: %s", qUtf8Printable(id));
+                return;
+            }
+
+            const QString outputPath = FS::PathCombine(dir, FS::RemoveInvalidFilenameChars(inst->name()) + ".zip");
+            SDL_Log("[test-export] exporting '%s' to '%s'", qUtf8Printable(inst->name()), qUtf8Printable(outputPath));
+
+            QFileInfoList files;
+            if (!MMCZip::collectFileListRecursively(inst->instanceRoot(), nullptr, &files, nullptr)) {
+                SDL_Log("[test-export] collectFileListRecursively failed");
+                return;
+            }
+            SDL_Log("[test-export] collected %d files", files.size());
+
+            unique_qobject_ptr<Task> task(new MMCZip::ExportToZipTask(outputPath, inst->instanceRoot(), files, "", true));
+            task->start();
+            BigScreenDialogs::WaitForTask(task.get());
+
+            const QFileInfo outFile(outputPath);
+            SDL_Log("[test-export] wasSuccessful=%d failReason='%s' outputExists=%d outputSize=%lld", task->wasSuccessful(),
+                    task->failReason().toUtf8().constData(), outFile.exists(), static_cast<long long>(outFile.size()));
         });
     }
 
@@ -2644,16 +4774,59 @@ int main(int argc, char** argv)
                 g_settingsSubTab = 0;
                 SetScreen(Screen::Settings);
             } else if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands" ||
-                       name == "instance_settings_mods") {
+                       name == "instance_settings_mods" || name == "instance_settings_resourcepacks" ||
+                       name == "instance_settings_shaderpacks" || name == "instance_settings_datapacks" ||
+                       name == "instance_settings_worlds" || name == "instance_settings_logs" ||
+                       name == "instance_settings_version" || name == "instance_settings_servers" ||
+                       name == "instance_settings_screenshots") {
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
                     g_instanceSettingsTarget = instances->at(0);
-                    if (name == "instance_settings_mods") {
-                        g_instanceTopTab = 1;  // "Mods"
-                        g_instanceSubTab = 0;
-                    } else {
+
+                    if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands") {
                         g_instanceTopTab = 0;  // "Settings"
                         g_instanceSubTab = (name == "instance_settings_java") ? 1 : (name == "instance_settings_commands") ? 3 : 0;
+                    } else {
+                        // Data Packs specifically needs
+                        // "GlobalDataPacksEnabled" on to even appear (see
+                        // BuildInstanceTopTabs()) — force it on for this
+                        // diagnostic so the tab is actually reachable,
+                        // same as a real user flipping the toggle in
+                        // Settings would.
+                        if (name == "instance_settings_datapacks")
+                            g_instanceSettingsTarget->settings()->set("GlobalDataPacksEnabled", true);
+
+                        // Look the target tab up by name in the real,
+                        // per-instance tab set (BuildInstanceTopTabs())
+                        // rather than a hardcoded index — that set isn't
+                        // fixed-size (Data Packs is conditional; Resource
+                        // vs. Texture Packs share one slot under different
+                        // names), so a hardcoded index would silently
+                        // land on the wrong tab whenever that set changes
+                        // shape.
+                        const char* wantedTab = (name == "instance_settings_mods")            ? "Mods"
+                                                 : (name == "instance_settings_resourcepacks") ? nullptr  // matched below, either name
+                                                 : (name == "instance_settings_shaderpacks")   ? "Shader Packs"
+                                                 : (name == "instance_settings_datapacks")     ? "Data Packs"
+                                                 : (name == "instance_settings_worlds")        ? "Worlds"
+                                                 : (name == "instance_settings_logs")          ? "Logs"
+                                                 : (name == "instance_settings_version")       ? "Version"
+                                                 : (name == "instance_settings_servers")       ? "Servers"
+                                                 : (name == "instance_settings_screenshots")   ? "Screenshots"
+                                                                                                : nullptr;
+
+                        InstanceTopTab tabs[kMaxInstanceTopTabs];
+                        const int tabCount = BuildInstanceTopTabs(g_instanceSettingsTarget, tabs);
+                        g_instanceTopTab = 0;
+                        for (int i = 0; i < tabCount; ++i) {
+                            const std::string tabName = tabs[i].name;
+                            if ((wantedTab && tabName == wantedTab) ||
+                                (name == "instance_settings_resourcepacks" && (tabName == "Resource Packs" || tabName == "Texture Packs"))) {
+                                g_instanceTopTab = i;
+                                break;
+                            }
+                        }
+                        g_instanceSubTab = 0;
                     }
                     SetScreen(Screen::InstanceSettings);
                 }
@@ -2663,6 +4836,41 @@ int main(int argc, char** argv)
                     SetScreen(Screen::Instances);
                     ShowInstanceActionsMenu(instances->at(0));
                 }
+            } else if (name == "add_instance") {
+                // Jumps straight to the Y-button "Add Instance" menu,
+                // bypassing the Y keypress itself.
+                SetScreen(Screen::Instances);
+                ShowAddInstanceMenu();
+            } else if (name == "modrinth_browse") {
+                // Jumps straight to the Modrinth browse screen — runs the
+                // real initial browse-by-downloads search itself
+                // (StartModrinthBrowse()), for screenshotting the icon/
+                // description list without needing gamepad input to
+                // navigate Y → "Modrinth" first.
+                StartModrinthBrowse();
+            } else if (name == "instance_mods_browse") {
+                // Same idea, but for the "Download ..." resource-browse
+                // path (StartResourceBrowse()) instead of the whole-
+                // modpack one — targets the first real instance's Mods
+                // list, so the mod-loader/MC-version compatibility filter
+                // (InstallModrinthResource()) is exercised against a real
+                // instance's real PackProfile, not a mock.
+                MinecraftInstance* inst = APPLICATION->instances()->getInstanceById("automodpack");
+                if (!inst && APPLICATION->instances()->rowCount() > 0)
+                    inst = APPLICATION->instances()->at(0);
+                if (inst) {
+                    g_instanceSettingsTarget = inst;
+                    StartResourceBrowse(inst, inst->loaderModList(), ModPlatform::ResourceType::Mod, TR("ModFolderPage", "Download Mods"));
+                }
+            } else if (name == "add_instance_import") {
+                // Jumps straight to the zip-import file selector — this is
+                // exactly what caught the file selector's fixed-size-
+                // overflow-at-150%-scale bug (ImGuiFullscreen.cpp's
+                // DrawFileSelector()), kept for the same reason
+                // instance_settings_* was kept: a real, reusable way to
+                // reach this specific dialog for a screenshot.
+                SetScreen(Screen::Instances);
+                StartZipInstanceImport();
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
         });
@@ -2713,39 +4921,69 @@ int main(int argc, char** argv)
         //
         // SDL_WINDOW_INPUT_FOCUS alone turned out not to be reliable enough
         // on its own, though — confirmed live (a periodic diagnostic, no
-        // other window ever touched) that on this real Wayland/KWin
-        // session, once BigScreen actually switches to
-        // SDL_WINDOW_FULLSCREEN_DESKTOP (which happens shortly after window
-        // creation, via a *second* SDL_SetWindowFullscreen() call — see
-        // where BigScreenFullscreen is applied), the flag reads correctly
-        // true for the very first sample and then gets stuck false forever
-        // after, even with BigScreen the only thing on screen and no
-        // competing window ever created — this is what broke stick/gamepad
-        // input in fullscreen mode generally, not something specific to
-        // the earlier unfocused-input fix. A real quirk in how this
-        // compositor's xdg-shell handles the windowed->fullscreen
-        // transition's focus renegotiation, not something fixable from
-        // this side of the SDL/Wayland boundary. (The earlier windowed-mode
-        // test that first validated this whole gating approach — a konsole
-        // window stealing focus — never exercised the fullscreen path, so
-        // it didn't catch this.)
+        // other window ever touched) that on a real Wayland/KWin session,
+        // once BigScreen actually switches to SDL_WINDOW_FULLSCREEN_DESKTOP
+        // (which happens shortly after window creation, via a *second*
+        // SDL_SetWindowFullscreen() call — see where BigScreenFullscreen is
+        // applied), the flag reads correctly true for the very first sample
+        // and then gets stuck false forever after, even with BigScreen the
+        // only thing on screen and no competing window ever created — a
+        // real quirk in how that compositor's xdg-shell handles the
+        // windowed->fullscreen transition's focus renegotiation, not
+        // something fixable from this side of the SDL/Wayland boundary.
         //
-        // Fixed by not trusting SDL's flag once fullscreen, and instead
-        // asking Qt directly whether one of *its own* top-level widgets is
-        // currently active. BigScreen never creates a QWidget of its own,
-        // so QApplication::activeWindow() is reliably null unless a real
-        // native dialog (the launch progress window, an instance console,
-        // an MSA login form, ...) is actually up and focused — exactly the
-        // case this gating exists to catch, and a signal Qt tracks
-        // entirely independently of SDL's window state. Still ANDed with
-        // SDL's flag while windowed (verified reliable there, and it adds
-        // real coverage SDL_WINDOW_FULLSCREEN_DESKTOP wouldn't give: e.g.
-        // alt-tabbing to an unrelated non-Qt app while BigScreen runs in a
-        // window rather than fullscreen).
+        // REGRESSION, found later on a real X11 session (confirmed live:
+        // launched fullscreen, opened an unrelated konsole window on top —
+        // sdlFocused correctly dropped to 0 the moment it stole focus, but
+        // the fullscreen branch below was ignoring that flag entirely, so
+        // windowFocused stayed 1 and BigScreen kept processing gamepad nav
+        // in the background — exactly the "captures input while unfocused"
+        // class of bug this whole mechanism exists to prevent). The
+        // original fix over-corrected: it blanket-distrusts
+        // SDL_WINDOW_INPUT_FOCUS for *every* fullscreen session because one
+        // specific compositor's xdg-shell mishandles it, but on X11 (and
+        // plausibly other Wayland compositors without that specific KWin
+        // bug) the flag tracks real focus changes correctly and dropping it
+        // entirely throws away a signal `noNativeDialogActive` alone can't
+        // replace — that one only ever catches "a real Qt QWidget dialog is
+        // up," never "some unrelated *other* application stole focus while
+        // BigScreen is still the fullscreen window."
+        //
+        // Fixed by gating the distrust on the actual video backend
+        // (SDL_GetCurrentVideoDriver(), the same probe the startup
+        // [video-diag] log already uses) instead of on fullscreen alone —
+        // computed once (the backend can't change mid-session): only
+        // "wayland" specifically falls back to the QApplication-only check;
+        // every other backend (x11, and presumably any Wayland compositor
+        // without KWin's specific xdg-shell quirk) gets the same
+        // `sdlFocused && noNativeDialogActive` check windowed mode already
+        // used successfully.
+        static const bool isWaylandBackend = []() {
+            const char* driver = SDL_GetCurrentVideoDriver();
+            return driver && std::string_view(driver) == "wayland";
+        }();
         const bool isFullscreen = (SDL_GetWindowFlags(window) & SDL_WINDOW_FULLSCREEN_DESKTOP) == SDL_WINDOW_FULLSCREEN_DESKTOP;
         const bool sdlFocused = (SDL_GetWindowFlags(window) & SDL_WINDOW_INPUT_FOCUS) != 0;
         const bool noNativeDialogActive = QApplication::activeWindow() == nullptr;
-        const bool windowFocused = isFullscreen ? noNativeDialogActive : (sdlFocused && noNativeDialogActive);
+        const bool windowFocused =
+            (isFullscreen && isWaylandBackend) ? noNativeDialogActive : (sdlFocused && noNativeDialogActive);
+
+        // Kept diagnostic: periodic focus-state log independent of gamepad
+        // events — this is what caught the isWaylandBackend regression
+        // above (real X11 session, sdlFocused correctly dropped to 0 when
+        // an unrelated konsole window stole focus, but windowFocused
+        // stayed 1 because the old code ignored sdlFocused unconditionally
+        // whenever fullscreen). Doesn't need live gamepad activity to
+        // trigger, unlike the existing per-event log lines below.
+        if (qEnvironmentVariableIsSet("BIGSCREEN_DEBUG_FOCUS")) {
+            static double lastLog = 0.0;
+            const double now = ImGui::GetTime();
+            if (now - lastLog > 1.0) {
+                lastLog = now;
+                SDL_Log("[focus-diag] isFullscreen=%d sdlFocused=%d noNativeDialogActive=%d windowFocused=%d", isFullscreen, sdlFocused,
+                        noNativeDialogActive, windowFocused);
+            }
+        }
 
         SDL_Event event;
         while (SDL_PollEvent(&event)) {
@@ -2814,8 +5052,8 @@ int main(int argc, char** argv)
         // than threading a "this setting just changed" signal all the way
         // from DrawToggleSetting() back to here.
         {
-            static bool lastAppliedFullscreen = APPLICATION->settings()->get("BigScreenFullscreen").toBool();
-            const bool wantFullscreen = APPLICATION->settings()->get("BigScreenFullscreen").toBool();
+            static bool lastAppliedFullscreen = WantFullscreen();
+            const bool wantFullscreen = WantFullscreen();
             if (wantFullscreen != lastAppliedFullscreen) {
                 lastAppliedFullscreen = wantFullscreen;
                 SDL_SetWindowFullscreen(window, wantFullscreen ? SDL_WINDOW_FULLSCREEN_DESKTOP : 0);
@@ -3008,6 +5246,9 @@ int main(int argc, char** argv)
                     break;
                 case Screen::Quit:
                     DrawQuit(done);
+                    break;
+                case Screen::ModrinthBrowse:
+                    DrawModrinthBrowse();
                     break;
             }
 

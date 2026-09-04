@@ -10,8 +10,10 @@
 #include "ui/dialogs/MSALoginDialog.h"
 
 #include <QCoreApplication>
+#include <QRegularExpression>
 
 std::function<void(MinecraftInstance*)> BigScreenLaunchController::onShowConsole;
+std::function<void()> BigScreenLaunchController::onOpenAccounts;
 
 namespace {
 // This class's own tr() would use "BigScreenLaunchController" as the
@@ -147,4 +149,107 @@ void BigScreenLaunchController::showInstanceConsole(const QString&)
     // main.cpp registered at startup.
     if (onShowConsole)
         onShowConsole(instance());
+}
+
+bool BigScreenLaunchController::offerToOpenAccountManager()
+{
+    const bool wantsToOpen = BigScreenDialogs::Confirm(
+        LC("No Accounts").toStdString(),
+        LC("In order to play Minecraft, you must have at least one Microsoft "
+           "account which owns Minecraft logged in. "
+           "Would you like to open the account manager to add an account now?")
+            .toStdString(),
+        false);
+    if (wantsToOpen && onOpenAccounts)
+        onOpenAccounts();
+    // Unlike the desktop's real "Yes" path — which opens a *modal* Settings
+    // dialog that blocks until closed, so decideAccount() can fall through
+    // and re-check accounts right after — BigScreen's Screen::Accounts
+    // switch doesn't block at all. There's no way to have picked (let alone
+    // logged into) an account by the time this returns either way, so this
+    // always aborts the current launch attempt; the user just re-launches
+    // once they've actually added an account on the Accounts screen.
+    return false;
+}
+
+MinecraftAccountPtr BigScreenLaunchController::selectAccountToUse(bool* useAsDefault)
+{
+    if (useAsDefault)
+        *useAsDefault = false;
+
+    AccountList* accounts = APPLICATION->accounts();
+    const int count = accounts->count();
+    if (count == 0)
+        return nullptr;
+
+    // Same "Offline account"/"Microsoft account" summary text the Accounts
+    // screen's own list already uses (main.cpp) — not from
+    // ProfileSelectDialog (a plain QListView with a custom item delegate,
+    // no separate translatable summary string to reuse).
+    std::vector<std::string> labels;
+    std::vector<MinecraftAccountPtr> validAccounts;
+    for (int i = 0; i < count; ++i) {
+        MinecraftAccountPtr account = accounts->at(i);
+        if (!account)
+            continue;
+        const QString kind = account->accountType() == AccountType::Offline ? QObject::tr("Offline account") : QObject::tr("Microsoft account");
+        labels.push_back((account->profileName() + "  \xE2\x80\x94  " + kind).toStdString());
+        validAccounts.push_back(account);
+    }
+    if (labels.empty())
+        return nullptr;
+
+    const auto choice = BigScreenDialogs::Choose(LC("Which account would you like to use?").toStdString(), labels);
+    if (!choice || *choice < 0 || static_cast<size_t>(*choice) >= validAccounts.size())
+        return nullptr;
+
+    // BigScreen has no separate "use as global default" checkbox UI the
+    // way ProfileSelectDialog's picker does (GlobalDefaultCheckbox) —
+    // always setting the picked account as default is the simplest,
+    // lowest-friction choice for a single-user handheld: once you've
+    // picked once, launching again shouldn't ask again.
+    if (useAsDefault)
+        *useAsDefault = true;
+    return validAccounts[static_cast<size_t>(*choice)];
+}
+
+bool BigScreenLaunchController::checkJvmArgsValid(const QString& jvmargs)
+{
+    // Same detection regexes as JavaCommon::checkJVMArgs() (JavaCommon.cpp)
+    // — real strings copied verbatim from there too, but looked up under
+    // context "QObject" rather than LC()'s usual "LaunchController":
+    // JavaCommon::checkJVMArgs() is a plain namespace function (not a
+    // class member), and its QObject::tr(...) calls — confirmed live via a
+    // temporary translation-context probe, not guessed — resolve under
+    // "QObject" itself, the same context any tr() call outside an
+    // enclosing class ends up filed under.
+    static const QRegularExpression memRegex("-Xm[sx]");
+    static const QRegularExpression versionRegex("-version:.*");
+
+    if (jvmargs.contains("-XX:PermSize=") || jvmargs.contains(memRegex) || jvmargs.contains("-XX-MaxHeapSize") ||
+        jvmargs.contains("-XX:InitialHeapSize")) {
+        BigScreenDialogs::Confirm(
+            QCoreApplication::translate("QObject", "JVM arguments warning").toStdString(),
+            QCoreApplication::translate("QObject", "You tried to manually set a JVM memory option (using \"-XX:PermSize\", "
+                                                    "\"-XX-MaxHeapSize\", \"-XX:InitialHeapSize\", \"-Xmx\" "
+                                                    "or \"-Xms\").\n"
+                                                    "There are dedicated boxes for these in the settings (Java tab, in the Memory group at "
+                                                    "the top).\n"
+                                                    "This message will be displayed until you remove them from the JVM arguments.")
+                .toStdString(),
+            false, "OK", "OK");
+        return false;
+    }
+    if (jvmargs.contains(versionRegex)) {
+        BigScreenDialogs::Confirm(
+            QCoreApplication::translate("QObject", "JVM arguments warning").toStdString(),
+            QCoreApplication::translate("QObject", "You tried to pass required Java version argument to the JVM (using "
+                                                    "\"-version:xxx\"). This is not safe and will not be "
+                                                    "allowed.\n"
+                                                    "This message will be displayed until you remove this from the JVM arguments.")
+                .toStdString(),
+            false, "OK", "OK");
+        return false;
+    }
+    return true;
 }

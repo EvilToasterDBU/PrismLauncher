@@ -22,6 +22,9 @@ class BigScreenLaunchController : public LaunchController {
     // to that screen's state (a plain anonymous-namespace global in
     // main.cpp), so a callback is the simplest bridge.
     static std::function<void(MinecraftInstance*)> onShowConsole;
+    // Same bridge, for offerToOpenAccountManager() below — routes to
+    // BigScreen's own Screen::Accounts.
+    static std::function<void()> onOpenAccounts;
 
    protected:
     bool askPlayDemo() const override;
@@ -30,4 +33,7 @@ class BigScreenLaunchController : public LaunchController {
     bool confirmKillInstance() override;
     bool waitForTask(Task* task) override;
     void showInstanceConsole(const QString& page = QString()) override;
+    bool offerToOpenAccountManager() override;
+    MinecraftAccountPtr selectAccountToUse(bool* useAsDefault) override;
+    bool checkJvmArgsValid(const QString& jvmargs) override;
 };
