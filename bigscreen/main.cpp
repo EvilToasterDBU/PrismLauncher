@@ -1744,8 +1744,25 @@ void DrawInstanceSettingsMods()
             mods->setResourceEnabled(indexes, enabled ? EnableAction::ENABLE : EnableAction::DISABLE);
         }
 
-        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false))
-            ShowModActionsMenu(mods, mod.name(), mod.fileinfo().fileName());
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)) {
+            // ResourceFolderModel::uninstallResource() (see its own
+            // implementation) matches against the *base* filename, and
+            // itself strips a trailing ".disabled" — the suffix
+            // PrismLauncher appends on disk when a mod is toggled off —
+            // before comparing, but only from its own internal copy, not
+            // from whatever the caller passes in. mod.fileinfo().fileName()
+            // reports the file exactly as it sits on disk right now, so for
+            // a currently-disabled mod that's already ".disabled"-suffixed,
+            // and passing it through unstripped never matches, so the
+            // delete silently no-ops. Confirmed live: worked once (the
+            // first mod deleted happened to be enabled), then stopped
+            // working — the user's list has both enabled and disabled
+            // mods, and every later attempt landed on a disabled one.
+            QString fileName = mod.fileinfo().fileName();
+            if (!mod.enabled() && fileName.endsWith(".disabled"))
+                fileName.chop(9);
+            ShowModActionsMenu(mods, mod.name(), fileName);
+        }
     }
 }
 
