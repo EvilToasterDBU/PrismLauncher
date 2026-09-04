@@ -57,6 +57,8 @@
 #include "minecraft/auth/AccountList.h"
 #include "minecraft/auth/AuthFlow.h"
 #include "minecraft/auth/MinecraftAccount.h"
+#include "minecraft/mod/ModFolderModel.h"
+#include "minecraft/mod/Resource.h"
 #include "settings/SettingsObject.h"
 
 #include <QColor>
@@ -1571,13 +1573,72 @@ void DrawInstanceSettingsNotes()
     DrawTextSetting("notes", TR("NotesPage", "Notes"), "Freeform notes about this instance.", false, s);
 }
 
+// The desktop's ModFolderPage equivalent — enable/disable/delete only (no
+// browsing/installing new mods yet, matching M5's still-open "mod/modpack
+// browsing" scope; adding one from Modrinth/CurseForge needs the same kind
+// of larger browsing UI that's deferred there). loaderModList() lazily
+// creates the model but doesn't populate it — matches the desktop page's
+// own on-open update() call — so this triggers exactly one update() the
+// first time this tab is drawn for a given instance (tracked by comparing
+// the model pointer, which is stable for a given MinecraftInstance's
+// lifetime), then just re-polls size()/at() every frame the same way every
+// other BigScreen list already does (Instances, Accounts, ...) — no signal
+// wiring needed, the model's own QFileSystemWatcher keeps it current in
+// the background regardless of whether this tab is being drawn.
+void DrawInstanceSettingsMods()
+{
+    ModFolderModel* mods = g_instanceSettingsTarget->loaderModList();
+
+    static ModFolderModel* lastModel = nullptr;
+    if (mods != lastModel) {
+        mods->update();
+        lastModel = mods;
+    }
+
+    const int count = static_cast<int>(mods->size());
+    if (count == 0) {
+        ImGui::TextUnformatted("No mods installed.");
+        return;
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+
+    for (int i = 0; i < count; ++i) {
+        Resource& mod = mods->at(i);
+        bool enabled = mod.enabled();
+        const QByteArray nameUtf8 = mod.name().toUtf8();
+
+        if (ToggleButton(nameUtf8.constData(), nullptr, &enabled)) {
+            const QModelIndexList indexes = { mods->index(i, 0) };
+            mods->setResourceEnabled(indexes, enabled ? EnableAction::ENABLE : EnableAction::DISABLE);
+        }
+
+        // X deletes the focused mod (confirmed first) — same
+        // g_pendingAction-deferred BigScreenDialogs::Confirm pattern
+        // ShowInstanceActionsMenu's own "Delete" uses, needed for the same
+        // reason: this runs mid-frame, and Confirm()'s blocking pump loop
+        // can't start from inside an already-open frame.
+        if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)) {
+            ModFolderModel* modsForDelete = mods;
+            const QString modName = mod.name();
+            const QString fileName = mod.fileinfo().fileName();
+            g_pendingAction = [modsForDelete, modName, fileName]() {
+                const QString message = QString("Are you sure you want to delete \"%1\"?\nThis cannot be undone.").arg(modName);
+                if (!BigScreenDialogs::Confirm("Confirm Deletion", message.toStdString(), false, "Delete", "Cancel"))
+                    return;
+                modsForDelete->uninstallResource(fileName);
+            };
+        }
+    }
+}
+
 struct InstanceSettingsTab {
     const char* name;
     void (*draw)();
 };
 static const InstanceSettingsTab kInstanceSettingsTabs[] = {
-    { "General", &DrawInstanceSettingsGeneral }, { "Java", &DrawInstanceSettingsJava },     { "Tweaks", &DrawInstanceSettingsTweaks },
-    { "Commands", &DrawInstanceSettingsCommands }, { "Notes", &DrawInstanceSettingsNotes },
+    { "General", &DrawInstanceSettingsGeneral }, { "Java", &DrawInstanceSettingsJava },       { "Tweaks", &DrawInstanceSettingsTweaks },
+    { "Commands", &DrawInstanceSettingsCommands }, { "Mods", &DrawInstanceSettingsMods },      { "Notes", &DrawInstanceSettingsNotes },
 };
 int g_instanceSettingsTab = 0;
 
@@ -1593,9 +1654,17 @@ void DrawInstanceSettings()
 
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
-        SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
-                          { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
-                          { glyphs.cancel(false), "Back" } });
+        const bool onModsTab = std::string(kInstanceSettingsTabs[g_instanceSettingsTab].name) == "Mods";
+        if (onModsTab) {
+            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                              { glyphs.west, "Delete" },
+                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { glyphs.cancel(false), "Back" } });
+        } else {
+            SetFooterHints({ { glyphs.confirm(false), "Toggle / Change" },
+                              { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Category" },
+                              { glyphs.cancel(false), "Back" } });
+        }
     }
 
     const int tabCount = static_cast<int>(std::size(kInstanceSettingsTabs));
@@ -2339,11 +2408,15 @@ int main(int argc, char** argv)
                 g_settingsTab = 7;
                 g_settingsSubTab = 0;
                 SetScreen(Screen::Settings);
-            } else if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands") {
+            } else if (name == "instance_settings" || name == "instance_settings_java" || name == "instance_settings_commands" ||
+                       name == "instance_settings_mods") {
                 InstanceList* instances = APPLICATION->instances();
                 if (instances->rowCount() > 0) {
                     g_instanceSettingsTarget = instances->at(0);
-                    g_instanceSettingsTab = (name == "instance_settings_java") ? 1 : (name == "instance_settings_commands") ? 3 : 0;
+                    g_instanceSettingsTab = (name == "instance_settings_java")     ? 1
+                                             : (name == "instance_settings_commands") ? 3
+                                             : (name == "instance_settings_mods")     ? 4
+                                                                                       : 0;
                     SetScreen(Screen::InstanceSettings);
                 }
             } else if (name == "instance_actions") {
