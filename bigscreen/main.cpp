@@ -67,9 +67,13 @@
 #include "minecraft/PackProfile.h"
 #include "minecraft/World.h"
 #include "minecraft/WorldList.h"
+#include "modplatform/CheckUpdateTask.h"
 #include "modplatform/ModIndex.h"
 #include "modplatform/ResourceAPI.h"
+#include "modplatform/flame/FlameAPI.h"
+#include "modplatform/flame/FlameCheckUpdate.h"
 #include "modplatform/modrinth/ModrinthAPI.h"
+#include "modplatform/modrinth/ModrinthCheckUpdate.h"
 #include "net/ApiRequest.h"
 #include "net/NetJob.h"
 
@@ -92,6 +96,7 @@
 #include <QColor>
 #include <QApplication>
 #include <QCoreApplication>
+#include <QCryptographicHash>
 #include <QDir>
 #include <QFile>
 #include <QFileInfo>
@@ -100,6 +105,7 @@
 #include <QPainter>
 #include <QPixmap>
 #include <QProcess>
+#include <QRegularExpression>
 #include <QStandardPaths>
 #include <QTime>
 #include <QUrl>
@@ -692,16 +698,26 @@ void SwitchToDesktopMode()
 // in the vendored ImGuiFullscreen.cpp), so acting here too in the same
 // frame would both close the popup *and* pop our own screen stack.
 
-// Defined near DrawModrinthBrowse() (depends on g_modrinthBrowse, declared
-// there) — forward-declared here since HandleBackButton() needs it and is
-// defined earlier in the file.
+// Both defined near DrawModrinthBrowse() (depend on g_modrinthBrowse/
+// g_modrinthDetailPack, declared there) — forward-declared here since
+// HandleBackButton() needs them and is defined earlier in the file.
 Screen ModrinthBrowseBackTarget();
+// Returns true if a pack-detail view (opened via X on a browse-list row)
+// was open and got closed by this call — same "sub-state back" pattern
+// already used for Instance Settings' Logs/Screenshots list-vs-viewer
+// toggle: B here should return to the pack LIST first, not leave the
+// whole ModrinthBrowse screen in one press.
+bool CloseModrinthDetailIfOpen();
 void HandleBackButton()
 {
     if (IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen())
         return;
     if (!WantsToCloseMenu())
         return;
+    if (g_screen == Screen::ModrinthBrowse && CloseModrinthDetailIfOpen()) {
+        ResetCloseMenuIfNeeded();
+        return;
+    }
 
     switch (g_screen) {
         case Screen::Landing:
@@ -1816,7 +1832,10 @@ void DrawInstanceSettingsNotes()
 // Resource/Texture/Shader/Data Packs reuse the shared
 // ExternalResourcesPage base text instead — see each
 // DrawInstanceSettingsXxx() wrapper below for exactly which).
-void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle);
+void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle,
+                          ModPlatform::ResourceProvider provider = ModPlatform::ResourceProvider::MODRINTH);
+void CheckResourceUpdates(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType resourceType,
+                           const QString& dialogTitle);
 void ShowResourceActionsMenu(ResourceFolderModel* model,
                               ModPlatform::ResourceType resourceType,
                               const QString& resourceName,
@@ -1860,14 +1879,36 @@ void ShowResourceActionsMenu(ResourceFolderModel* model,
                         break;
                     }
                     case 1:
-                        // No real equivalent for this exact status sentence
-                        // — BigScreen-only, describing a BigScreen-specific
-                        // gap.
-                        OpenInfoMessageDialog(checkForUpdatesText.toStdString(), "Checking for updates isn't implemented yet.");
+                        CheckResourceUpdates(g_instanceSettingsTarget, model, resourceType, checkForUpdatesText);
                         break;
-                    case 2:
-                        StartResourceBrowse(g_instanceSettingsTarget, model, resourceType, downloadText);
+                    case 2: {
+                        // Which backend to browse — a second, small
+                        // OpenChoiceDialog rather than a 2-item menu baked
+                        // into the outer one, so the outer menu's shape
+                        // (Delete/Check for Updates/Download) doesn't have
+                        // to change depending on how many providers exist.
+                        // Safe to open directly (not deferred) since this
+                        // whole switch already runs from g_pendingAction,
+                        // i.e. the top of a frame, not from inside a
+                        // callback — same reasoning as ShowAddInstanceMenu().
+                        ChoiceDialogOptions providerOptions;
+                        providerOptions.emplace_back(TR("ModrinthPage", "Modrinth").toStdString(), false);
+                        providerOptions.emplace_back("CurseForge", false);
+                        OpenChoiceDialog(downloadText.toStdString(), false, std::move(providerOptions),
+                                          [model, resourceType, downloadText](s32 providerIndex, const std::string&, bool) {
+                                              if (providerIndex < 0)
+                                                  return;
+                                              const ModPlatform::ResourceProvider provider = providerIndex == 1
+                                                  ? ModPlatform::ResourceProvider::FLAME
+                                                  : ModPlatform::ResourceProvider::MODRINTH;
+                                              g_pendingAction = [model, resourceType, downloadText, provider]() {
+                                                  CloseChoiceDialog();
+                                                  StartResourceBrowse(g_instanceSettingsTarget, model, resourceType, downloadText,
+                                                                       provider);
+                                              };
+                                          });
                         break;
+                    }
                 }
             };
         });
@@ -3773,6 +3814,20 @@ struct ModrinthBrowseState {
     ResourceFolderModel* targetModel = nullptr;
     MinecraftInstance* targetInstance = nullptr;
     std::string screenTitle = "Modrinth";
+    // Which backend this browse is querying. Added when CurseForge support
+    // was bolted on: ResourceAPI (searchProjects/getProjectVersions/
+    // getProjectInfo) and IndexedPack/IndexedVersion are already fully
+    // shared between ModrinthAPI and FlameAPI — confirmed by reading both
+    // headers directly, not assumed from the similar shape — so every
+    // function below (RunModrinthSearch, InstallModrinthPack,
+    // InstallModrinthResource, ShowModrinthPackDetail) dispatches off this
+    // field (or, once a specific pack is in hand, off IndexedPack::provider
+    // directly) rather than hardcoding ModrinthAPI::get(). Names in this
+    // whole subsystem still say "Modrinth" — left alone rather than a wide
+    // rename, since every identifier already reads fine as "the online
+    // resource browse screen" and a rename touching ~40 call sites for a
+    // cosmetic reason isn't worth the risk of a slip.
+    ModPlatform::ResourceProvider provider = ModPlatform::ResourceProvider::MODRINTH;
     // Pagination — Modrinth's search endpoint takes a plain offset/limit
     // pair, not a page token (getSearchURL() in ModrinthAPI.h hardcodes
     // limit=25 itself, not exposed via SearchArgs — kModrinthPageSize
@@ -3788,6 +3843,20 @@ struct ModrinthBrowseState {
 };
 ModrinthBrowseState g_modrinthBrowse;
 constexpr int kModrinthPageSize = 25;
+
+// Single dispatch point for "which ResourceAPI backend" — every caller in
+// this file goes through this rather than hardcoding ModrinthAPI::get(),
+// so CurseForge support is additive everywhere it's used.
+const ResourceAPI& GetResourceAPI(ModPlatform::ResourceProvider provider)
+{
+    switch (provider) {
+        case ModPlatform::ResourceProvider::FLAME:
+            return FlameAPI::get();
+        case ModPlatform::ResourceProvider::MODRINTH:
+        default:
+            return ModrinthAPI::get();
+    }
+}
 
 // Keyed by IndexedPack::logoName, matching the desktop's own cache key
 // (ModpackListModel::requestLogo()/logoLoaded()). Loading is fire-and-
@@ -3836,6 +3905,271 @@ void RequestModrinthIcon(const ModPlatform::IndexedPack::Ptr& pack)
     job->start();
 }
 
+// Pack-detail view state (X on a focused browse-list row) — same "sub-
+// state within one screen" shape already used for Instance Settings'
+// Logs/Screenshots list-vs-viewer toggle. Non-null pack means
+// DrawModrinthBrowse() renders DrawModrinthPackDetail() instead of the
+// list; B closes it back to the list (see CloseModrinthDetailIfOpen(),
+// wired into HandleBackButton()) rather than leaving the whole screen.
+ModPlatform::IndexedPack::Ptr g_modrinthDetailPack;
+std::unordered_map<QString, std::shared_ptr<GSTexture>> g_modrinthGalleryCache;  // keyed by GalleryImage::url
+std::unordered_set<QString> g_modrinthGalleryLoading;
+
+// Same self-owning NetJob/metacache pattern as RequestModrinthIcon() —
+// not generalized into one shared function since the cache key differs
+// (logoName there, the full gallery image URL here) and each already has
+// its own single, small call site.
+void RequestModrinthGalleryImage(const QString& url)
+{
+    if (url.isEmpty() || g_modrinthGalleryCache.count(url) || g_modrinthGalleryLoading.count(url))
+        return;
+    g_modrinthGalleryLoading.insert(url);
+
+    // Cache key derived from the URL itself (not a short id like
+    // logoName) — QCryptographicHash keeps the on-disk cache filename
+    // short/safe regardless of how long/encoded the real URL is.
+    const QString cacheName =
+        QCryptographicHash::hash(url.toUtf8(), QCryptographicHash::Md5).toHex() + "." + QFileInfo(QUrl(url).path()).suffix();
+    MetaEntryPtr entry = APPLICATION->metacache()->resolveEntry("ModrinthModpacks", QString("gallery/%1").arg(cacheName));
+    auto* job = new NetJob(QString("Modrinth Gallery Image Download"), APPLICATION->network());
+    job->addNetAction(Net::ApiRequest::makeCached(QUrl(url), entry));
+
+    const QString fullPath = entry->getFullPath();
+    QObject::connect(job, &NetJob::succeeded, job, [url, fullPath, job]() {
+        job->deleteLater();
+        g_modrinthGalleryLoading.erase(url);
+        const QImage image(fullPath);
+        if (!image.isNull())
+            g_modrinthGalleryCache[url] = BigScreenGui::UploadQImage(image);
+    });
+    QObject::connect(job, &NetJob::failed, job, [url, job](const QString&) {
+        job->deleteLater();
+        g_modrinthGalleryLoading.erase(url);
+    });
+
+    job->start();
+}
+
+// X on a focused browse-list row opens this — fetches the pack's full
+// description/gallery (getProjectInfo(), the same call
+// ModrinthPage::onSelectionChanged() makes on the desktop for its own
+// detail panel — see the reference screenshot that prompted this) if not
+// already cached on the pack object itself (extraDataLoaded, set by
+// ResourceAPI::getProjectInfo() — a real IndexedPack::Ptr is shared with
+// g_modrinthBrowse.packs, so this only ever fetches once per pack even if
+// reopened later in the same session).
+void ShowModrinthPackDetail(const ModPlatform::IndexedPack::Ptr& pack)
+{
+    if (!pack->extraDataLoaded) {
+        ResourceAPI::ProjectInfoArgs args;
+        args.pack = pack;
+        bool succeeded = false;
+        Task::Ptr infoTask = GetResourceAPI(pack->provider).getProjectInfo(
+            args, { [&succeeded](ModPlatform::IndexedPack::Ptr&) { succeeded = true; }, [](const QString&, int) {}, [] {} });
+        if (infoTask) {
+            infoTask->start();
+            BigScreenDialogs::WaitForTask(infoTask.get());
+        }
+        // Proceeds either way — a failed fetch just means the detail view
+        // shows an empty description/no screenshots (extraDataLoaded stays
+        // false, so a retry is possible if the user reopens it), not worth
+        // a separate error dialog for what's fundamentally an optional
+        // "more info" view.
+        (void)succeeded;
+    }
+    g_modrinthDetailPack = pack;
+}
+
+bool CloseModrinthDetailIfOpen()
+{
+    if (!g_modrinthDetailPack)
+        return false;
+    g_modrinthDetailPack.reset();
+    return true;
+}
+
+// Modrinth's real `body` field is Markdown (confirmed by fetching a real
+// project's JSON directly and inspecting it) — a full renderer is out of
+// scope for a quick detail view, but leaving image/reference-link syntax
+// in verbatim is actively worse than plain prose (screenshots are already
+// shown separately as real images below this text, so inline
+// ![alt](url) noise is pure clutter, not lost information). Strips just
+// those two patterns and heading '#' markers; everything else (bold
+// **/__, links [text](url), lists) is left as literal characters — still
+// readable, not worth a full parser for.
+QString CleanModrinthBodyForDisplay(const QString& body)
+{
+    QString text = body;
+    // Images — dropped entirely, not just unlinked: the real screenshots
+    // are already shown above as actual images, so inline
+    // ![alt](url)/![alt][ref] markdown here is pure duplicate noise, not
+    // lost information.
+    static const QRegularExpression imageInlineRe(R"(!\[[^\]]*\]\([^)]*\))");
+    text.remove(imageInlineRe);
+    static const QRegularExpression imageRefRe(R"(!\[[^\]]*\]\[[^\]]*\])");
+    text.remove(imageRefRe);
+    // Links — keep the human-readable label, drop the URL/reference id.
+    // Confirmed by screenshot this matters, not just theoretical: a real
+    // pack's body ("Fabulously Optimized") rendered raw [](https://...)
+    // for several empty-label links and [text][16]-style reference links
+    // before this was added — both unreadable without a real renderer.
+    static const QRegularExpression linkInlineRe(R"(\[([^\]]*)\]\([^)]*\))");
+    text.replace(linkInlineRe, "\\1");
+    static const QRegularExpression linkRefRe(R"(\[([^\]]*)\]\[[^\]]*\])");
+    text.replace(linkRefRe, "\\1");
+    // Reference-style link/image *definitions* (e.g. "[16]: https://..."),
+    // normally collected at the bottom of the document — meaningless once
+    // every reference using them above has already been resolved to plain
+    // text by the two replacements above.
+    static const QRegularExpression linkDefRe(R"(^\[[^\]]+\]:\s*\S.*$)", QRegularExpression::MultilineOption);
+    text.remove(linkDefRe);
+    static const QRegularExpression headingRe(R"(^#{1,6}\s*)", QRegularExpression::MultilineOption);
+    text.remove(headingRe);
+    // The above can leave short runs of now-empty or whitespace-only
+    // lines behind (a removed image/link-definition line, a heading that
+    // had nothing but a stripped image on it) — collapse 3+ consecutive
+    // newlines down to a single blank line so the result doesn't read as
+    // mysteriously gappy.
+    static const QRegularExpression extraBlankLinesRe(R"(\n{3,})");
+    text.replace(extraBlankLinesRe, "\n\n");
+    return text.trimmed();
+}
+
+// CurseForge's mod description (FlameAPI::getModDescription(), fetched via
+// FlameMod::loadBody()) is HTML, not Markdown — confirmed by reading the
+// desktop's own consumer (nothing on the desktop side renders it as plain
+// text either; ResourceUpdateDialog etc. don't display it at all, this
+// detail view is BigScreen's own addition) — so it needs a different
+// cleanup than CleanModrinthBodyForDisplay()'s Markdown-focused one rather
+// than reusing it and leaving raw HTML tags on screen. Strips tags plus
+// the handful of entities real descriptions actually use; not a full HTML
+// parser (list/table structure is lost as plain runs of text) — matches
+// this project's established "readable, not a renderer" bar for detail-
+// view body text.
+QString CleanHtmlForDisplay(const QString& html)
+{
+    QString text = html;
+    // <br>/<p>/<div>/list-item boundaries become newlines before the tags
+    // themselves are stripped, so paragraph/list structure survives as
+    // blank lines instead of collapsing into one unreadable run.
+    static const QRegularExpression blockBreakRe(R"(<\s*(br|/p|/div|/li|/h[1-6])\s*/?\s*>)", QRegularExpression::CaseInsensitiveOption);
+    text.replace(blockBreakRe, "\n");
+    static const QRegularExpression tagRe(R"(<[^>]*>)");
+    text.remove(tagRe);
+    text.replace("&amp;", "&");
+    text.replace("&lt;", "<");
+    text.replace("&gt;", ">");
+    text.replace("&quot;", "\"");
+    text.replace("&#39;", "'");
+    text.replace("&nbsp;", " ");
+    static const QRegularExpression extraBlankLinesRe(R"(\n{3,})");
+    text.replace(extraBlankLinesRe, "\n\n");
+    return text.trimmed();
+}
+
+void DrawModrinthPackDetail()
+{
+    const ModPlatform::IndexedPack::Ptr pack = g_modrinthDetailPack;
+    SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Back" } });
+
+    if (BeginScreen(pack->name.toStdString().c_str())) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "modrinth_pack_detail")) {
+            // "< Back" is the ONLY real nav-menu item on this whole
+            // screen — everything below it (author line, screenshots,
+            // description) is read-only content with nothing focusable
+            // in it at all, so Dear ImGui's normal "nav-focus movement
+            // auto-scrolls the window" mechanism never triggers for it —
+            // confirmed live: after focus lands on "< Back", further
+            // D-pad Down presses report the exact same NavId every time
+            // (nothing else to move focus *to*), and a long description
+            // stays stuck showing only its very top. BeginMenuButtons()/
+            // EndMenuButtons() bracket only this one button — the rest
+            // below is handled entirely by hand (manual scroll, see
+            // below), not through the MenuButtons widget family.
+            BeginMenuButtons();
+            ResetFocusHere();
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back"))
+                CloseModrinthDetailIfOpen();
+            EndMenuButtons();
+
+            // ImGuiChildFlags_NavFlattened here too, for the same reason
+            // as the gallery child below — this child has to not be an
+            // isolated nav boundary, or moving focus out of "< Back" (the
+            // one item above it) toward here — and B eventually working
+            // to leave the screen at all — could misbehave.
+            ImGui::BeginChild("modrinth_pack_detail_content", ImVec2(0.0f, 0.0f), ImGuiChildFlags_NavFlattened);
+
+            // Manual D-pad-driven vertical scroll — the repeat-while-held
+            // semantics (IsKeyPressed(..., true)) match every other held-
+            // key case already in this file (e.g. the LB/RB tab-switch
+            // checks elsewhere), so holding Down/Up scrolls continuously
+            // at Dear ImGui's own built-in hold-then-repeat pacing rather
+            // than needing one press per line. The stick is already
+            // mirrored onto these same D-pad keys by the per-frame stick-
+            // to-D-pad code near the top of this file, so this covers
+            // stick-driven scrolling too, for free.
+            if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadDown, true))
+                ImGui::SetScrollY(ImGui::GetScrollY() + LayoutScale(60.0f));
+            else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadUp, true))
+                ImGui::SetScrollY(ImGui::GetScrollY() - LayoutScale(60.0f));
+
+            if (!pack->authors.isEmpty())
+                ImGui::TextUnformatted(pack->authors.first().name.toUtf8().constData());
+
+            if (!pack->extraData.gallery.isEmpty()) {
+                // BigScreen-only label — no real desktop equivalent (this
+                // gallery strip has no analog in ModrinthPage's own detail
+                // panel, which embeds images inline in the description
+                // instead), left untranslated like every other tab-name/
+                // section-heading literal in this file (e.g. the
+                // InstanceTopTab names just above).
+                ImGui::TextUnformatted("Screenshots");
+                // ImGuiChildFlags_NavFlattened here for consistency with
+                // its sibling above — this particular child turned out
+                // not to be the actual cause of the reported "can't
+                // navigate at all" (confirmed via a real A/B rebuild: nav
+                // reached the same single focusable item with or without
+                // this flag), since nothing inside was ever the thing
+                // blocking movement — the real fix is the manual scroll
+                // above. Still correct/required in general for a nested
+                // child with no focusable content of its own, so kept.
+                ImGui::BeginChild("modrinth_pack_gallery", ImVec2(0.0f, LayoutScale(160.0f)), ImGuiChildFlags_NavFlattened,
+                                   ImGuiWindowFlags_HorizontalScrollbar);
+                // Manual Left/Right scroll for this row specifically —
+                // same reasoning as the vertical case above, just X
+                // instead of Y, and only while this child (not the outer
+                // one) is current.
+                if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadRight, true))
+                    ImGui::SetScrollX(ImGui::GetScrollX() + LayoutScale(240.0f));
+                else if (ImGui::IsKeyPressed(ImGuiKey_GamepadDpadLeft, true))
+                    ImGui::SetScrollX(ImGui::GetScrollX() - LayoutScale(240.0f));
+                for (const ModPlatform::GalleryImage& image : pack->extraData.gallery) {
+                    RequestModrinthGalleryImage(image.url);
+                    if (auto it = g_modrinthGalleryCache.find(image.url); it != g_modrinthGalleryCache.end()) {
+                        const ImVec2 size = LayoutScale(220.0f, 140.0f);
+                        ImGui::Image(static_cast<ImTextureID>(it->second->GetNativeHandle()), size);
+                    } else {
+                        ImGui::Dummy(LayoutScale(220.0f, 140.0f));
+                    }
+                    ImGui::SameLine();
+                }
+                ImGui::EndChild();
+            }
+
+            QString description = pack->description;
+            if (!pack->extraData.body.isEmpty()) {
+                description = pack->provider == ModPlatform::ResourceProvider::FLAME ? CleanHtmlForDisplay(pack->extraData.body)
+                                                                                      : CleanModrinthBodyForDisplay(pack->extraData.body);
+            }
+            ImGui::TextWrapped("%s", description.toUtf8().constData());
+
+            ImGui::EndChild();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+}
+
 // Installs one chosen Modrinth modpack version as a brand-new instance —
 // reuses the exact same InstanceImportTask/ModrinthCreationTask pipeline
 // StartZipInstanceImport() already drives for a local .mrpack file
@@ -3863,7 +4197,7 @@ void InstallModrinthPack(const ModPlatform::IndexedPack::Ptr& pack)
     QVector<ModPlatform::IndexedVersion> versions;
     bool versionsSucceeded = false;
     QString versionsFailReason;
-    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+    Task::Ptr versionsTask = GetResourceAPI(pack->provider).getProjectVersions(
         versionArgs, { [&versions, &versionsSucceeded](QVector<ModPlatform::IndexedVersion>& result) {
                           versions = result;
                           versionsSucceeded = true;
@@ -3895,6 +4229,12 @@ void InstallModrinthPack(const ModPlatform::IndexedPack::Ptr& pack)
     if (!name || name->isEmpty())
         return;
 
+    // Same extraInfo keys for both providers — InstanceImportTask::
+    // processModrinth()/processFlame() both read "pack_id"/"pack_version_id"
+    // (confirmed by reading both directly); which process*() runs is
+    // decided by auto-detecting the downloaded archive's own content
+    // (modrinth.index.json vs manifest.json), not by anything passed in
+    // here, so no provider branch is needed at this call site at all.
     QMap<QString, QString> extraInfo{ { "pack_id", pack->addonId.toString() }, { "pack_version_id", chosenVersion.fileId.toString() } };
     auto* importTask = new InstanceImportTask(QUrl(chosenVersion.downloadUrl), true, nullptr, extraInfo);
     importTask->setName(*name);
@@ -3997,7 +4337,7 @@ void InstallModrinthResource(const ModPlatform::IndexedPack::Ptr& pack)
     QVector<ModPlatform::IndexedVersion> versions;
     bool versionsSucceeded = false;
     QString versionsFailReason;
-    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+    Task::Ptr versionsTask = GetResourceAPI(pack->provider).getProjectVersions(
         versionArgs, { [&versions, &versionsSucceeded](QVector<ModPlatform::IndexedVersion>& result) {
                           versions = result;
                           versionsSucceeded = true;
@@ -4037,6 +4377,145 @@ void InstallModrinthResource(const ModPlatform::IndexedPack::Ptr& pack)
     model->update();
 }
 
+// X → "Check for Updates" on any of the Mods/Resource/Texture/Shader/Data
+// Packs tabs opens this — was a stub (OpenInfoMessageDialog placeholder)
+// until now. Runs the real desktop update-check machinery
+// (ModrinthCheckUpdate/FlameCheckUpdate) directly: both are plain Task
+// subclasses (confirmed by reading modplatform/CheckUpdateTask.h and both
+// derived headers) — the ~500-line QWidget in ResourceUpdateDialog.cpp is
+// only the per-item review UI (checkboxes, changelog display, metadata-
+// resolution fallback for resources with no known origin) wrapped around
+// that same task; none of that is needed to run a check and get back a
+// list of available updates, each already carrying a ready-to-run
+// ResourceDownloadTask (CheckUpdateTask::Update::download).
+// Bounded scope, same trade-off already made for install (raw zip
+// export skips the include/exclude tree, ResourceDownloadTask skips
+// dependency auto-install): only resources with existing origin metadata
+// (Resource::metadata(), set when installed via ResourceDownloadTask) are
+// checked — a resource dropped into the folder by hand has none and is
+// silently skipped, same as it would be without ever opening the desktop's
+// own review dialog for it. No per-item picker either — one "Update all
+// found?" confirmation, then every update downloads sequentially (not
+// ConcurrentTask — simpler, and this isn't a hot path).
+void CheckResourceUpdates(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType resourceType,
+                           const QString& dialogTitle)
+{
+    QList<Resource*> modrinthCandidates;
+    QList<Resource*> flameCandidates;
+    for (Resource* r : model->allResources()) {
+        auto metadata = r->metadata();
+        if (!metadata)
+            continue;
+        if (metadata->provider == ModPlatform::ResourceProvider::FLAME)
+            flameCandidates.append(r);
+        else
+            modrinthCandidates.append(r);
+    }
+
+    if (modrinthCandidates.isEmpty() && flameCandidates.isEmpty()) {
+        OpenInfoMessageDialog(dialogTitle.toStdString(), "No resources with a known origin to check for updates.");
+        return;
+    }
+
+    // Only Mods get version/loader filtering — same restriction install
+    // already has (GetModCompatibilityFilter()'s own comment: the other
+    // three resource types have no loader concept and the desktop doesn't
+    // filter them by MC version either).
+    std::vector<Version> mcVersions;
+    QList<ModPlatform::ModLoaderType> loadersList;
+    if (resourceType == ModPlatform::ResourceType::Mod) {
+        const ModCompatFilter filter = GetModCompatibilityFilter(inst);
+        mcVersions = filter.versions.value_or(std::vector<Version>{});
+        if (filter.loaders)
+            loadersList = ModPlatform::modLoaderTypesToList(*filter.loaders);
+    }
+
+    std::vector<CheckUpdateTask::Update> updates;
+    QString checkError;
+
+    if (!modrinthCandidates.isEmpty()) {
+        unique_qobject_ptr<ModrinthCheckUpdate> checkTask(new ModrinthCheckUpdate(modrinthCandidates, mcVersions, loadersList, model));
+        checkTask->start();
+        BigScreenDialogs::WaitForTask(checkTask.get());
+        if (checkTask->wasSuccessful()) {
+            auto result = checkTask->getUpdates();
+            updates.insert(updates.end(), std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+        } else {
+            checkError = checkTask->failReason();
+        }
+    }
+    if (!flameCandidates.isEmpty()) {
+        unique_qobject_ptr<FlameCheckUpdate> checkTask(new FlameCheckUpdate(flameCandidates, mcVersions, loadersList, model));
+        checkTask->start();
+        BigScreenDialogs::WaitForTask(checkTask.get());
+        if (checkTask->wasSuccessful()) {
+            auto result = checkTask->getUpdates();
+            updates.insert(updates.end(), std::make_move_iterator(result.begin()), std::make_move_iterator(result.end()));
+        } else if (checkError.isEmpty()) {
+            checkError = checkTask->failReason();
+        }
+    }
+
+    if (updates.empty()) {
+        const std::string message =
+            checkError.isEmpty() ? "No updates found." : ("Check failed: " + checkError.toStdString());
+        OpenInfoMessageDialog(dialogTitle.toStdString(), message);
+        return;
+    }
+
+    // Per-item checkbox picker (ChooseMultiple()) rather than one "Update
+    // all?" confirm — everything starts checked (defaults to all-true when
+    // the seed vector is empty), matching "Update All" as the fast path,
+    // but lets the player uncheck specific mods first. Real desktop
+    // wording reused for the labels ("Mod name: %1<br>...<br>Version Type:
+    // %1" etc. from ReviewMessageBox.cpp is HTML/tree-view shaped, not
+    // reusable as a flat list row) — the row text itself is BigScreen's
+    // own "name (old → new)" format.
+    // ICON_FA_CHEVRON_RIGHT, not a raw Unicode arrow (U+2192) — same
+    // lesson as the Modrinth browse pagination indicator (section 32):
+    // this font atlas only has Basic Latin/Latin-1 + explicit Cyrillic +
+    // the FA/PromptFont icon ranges loaded (GuiManager.cpp's LoadFonts()),
+    // so an arbitrary Unicode arrow renders as a missing-glyph box.
+    std::vector<std::string> labels;
+    labels.reserve(updates.size());
+    for (const CheckUpdateTask::Update& u : updates) {
+        std::string label = u.name.toStdString();
+        if (!u.oldVersion.isEmpty() || !u.newVersion.isEmpty()) {
+            label += " (";
+            label += (u.oldVersion.isEmpty() ? "?" : u.oldVersion.toStdString());
+            label += " ";
+            label += ICON_FA_CHEVRON_RIGHT;
+            label += " ";
+            label += (u.newVersion.isEmpty() ? "?" : u.newVersion.toStdString());
+            label += ")";
+        }
+        labels.push_back(label);
+    }
+
+    const std::vector<bool> checked = BigScreenDialogs::ChooseMultiple(
+        TR("ResourceUpdateDialog", "Confirm resources to update").toStdString(), labels);
+
+    const bool anyChecked = std::any_of(checked.begin(), checked.end(), [](bool c) { return c; });
+    if (!anyChecked)
+        return;
+
+    int succeeded = 0;
+    int attempted = 0;
+    for (size_t i = 0; i < updates.size(); ++i) {
+        if (!checked[i] || !updates[i].download)
+            continue;
+        ++attempted;
+        updates[i].download->start();
+        BigScreenDialogs::WaitForTask(updates[i].download.get());
+        if (updates[i].download->wasSuccessful())
+            ++succeeded;
+    }
+    model->update();
+
+    const QString summary = QString("Updated %1 of %2.").arg(succeeded).arg(attempted);
+    OpenInfoMessageDialog(dialogTitle.toStdString(), summary.toStdString());
+}
+
 // Runs (or re-runs, for a new search term or page) the actual Modrinth
 // query and fills g_modrinthBrowse — shared by the initial browse-by-
 // downloads load and by DrawModrinthBrowse()'s "Search"/"Clear search"/
@@ -4063,7 +4542,17 @@ void RunModrinthSearch(const QString& query, int offset = 0)
     ResourceAPI::SearchArgs args;
     args.type = g_modrinthBrowse.resourceType;
     args.offset = offset;
-    args.sorting = ResourceAPI::SortingMethod{ .index = 2, .name = "downloads", .readableName = {} };
+    // "Sort by downloads" — the two providers number their own sort
+    // fields completely differently (confirmed by reading both
+    // getSortingMethods() directly, not assumed from the shared shape):
+    // Modrinth's index 2 is "downloads", but CurseForge's index 2 is
+    // "Popularity" — its downloads sort is index 6 ("TotalDownloads").
+    // Reusing Modrinth's index for a Flame search would silently sort by
+    // the wrong field instead of failing loudly, so this is picked per
+    // provider rather than hardcoded once.
+    args.sorting = g_modrinthBrowse.provider == ModPlatform::ResourceProvider::FLAME
+        ? ResourceAPI::SortingMethod{ .index = 6, .name = "TotalDownloads", .readableName = {} }
+        : ResourceAPI::SortingMethod{ .index = 2, .name = "downloads", .readableName = {} };
     if (!query.isEmpty())
         args.search = query;
     // See ModCompatFilter's comment — Mods only, matching
@@ -4079,21 +4568,21 @@ void RunModrinthSearch(const QString& query, int offset = 0)
     QList<ModPlatform::IndexedPack::Ptr> packs;
     bool succeeded = false;
     QString failReason;
-    Task::Ptr searchTask = ModrinthAPI::get().searchProjects(
+    Task::Ptr searchTask = GetResourceAPI(g_modrinthBrowse.provider).searchProjects(
         args, { [&packs, &succeeded](QList<ModPlatform::IndexedPack::Ptr>& result) {
                    packs = result;
                    succeeded = true;
                },
                 [&failReason](const QString& reason, int) { failReason = reason; }, [] {} });
     if (!searchTask) {
-        g_modrinthBrowse.lastError = "Failed to search Modrinth. Check your internet connection.";
+        g_modrinthBrowse.lastError = "Failed to search. Check your internet connection.";
         return;
     }
     searchTask->start();
     BigScreenDialogs::WaitForTask(searchTask.get());
 
     if (!succeeded) {
-        g_modrinthBrowse.lastError = "Failed to search Modrinth: " + failReason;
+        g_modrinthBrowse.lastError = "Failed to search: " + failReason;
         return;
     }
     g_modrinthBrowse.packs = packs;
@@ -4102,18 +4591,26 @@ void RunModrinthSearch(const QString& query, int offset = 0)
         g_modrinthBrowse.lastError = offset > 0 ? "No more results." : "No results found.";
 }
 
-// Y → Add Instance → "Modrinth" opens this — runs the initial
+// Y → Add Instance → "Modrinth"/"CurseForge" opens this — runs the initial
 // browse-by-downloads query, then switches to Screen::ModrinthBrowse
 // regardless of success/failure (the screen itself shows
 // g_modrinthBrowse.lastError inline when the list is empty, same as any
 // other real-data list screen in this file — Servers/Worlds/etc. all show
 // their own "nothing here" text rather than a separate error dialog).
-void StartModrinthBrowse()
+// provider defaults to MODRINTH so every call site that predates
+// CurseForge support keeps working unchanged.
+void StartModrinthBrowse(ModPlatform::ResourceProvider provider = ModPlatform::ResourceProvider::MODRINTH)
 {
+    g_modrinthBrowse.provider = provider;
     g_modrinthBrowse.resourceType = ModPlatform::ResourceType::Modpack;
     g_modrinthBrowse.targetModel = nullptr;
     g_modrinthBrowse.targetInstance = nullptr;
-    g_modrinthBrowse.screenTitle = TR("ModrinthPage", "Modrinth").toStdString();
+    // "CurseForge" has no real desktop translation to reuse — FlamePage::
+    // displayName() (launcher/ui/pages/modplatform/flame/FlamePage.h)
+    // returns a bare, untranslated literal, unlike ModrinthPage's own
+    // TR()'d "Modrinth" — so this stays BigScreen's own English text.
+    g_modrinthBrowse.screenTitle =
+        provider == ModPlatform::ResourceProvider::FLAME ? "CurseForge" : TR("ModrinthPage", "Modrinth").toStdString();
     RunModrinthSearch(QString());
     SetScreen(Screen::ModrinthBrowse);
 }
@@ -4126,8 +4623,10 @@ void StartModrinthBrowse()
 // text each DrawInstanceSettingsXxx() wrapper already passes into
 // ShowResourceActionsMenu() for its menu entry — same string, now also
 // used as this screen's title.
-void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle)
+void StartResourceBrowse(MinecraftInstance* inst, ResourceFolderModel* model, ModPlatform::ResourceType type, const QString& screenTitle,
+                          ModPlatform::ResourceProvider provider)
 {
+    g_modrinthBrowse.provider = provider;
     g_modrinthBrowse.resourceType = type;
     g_modrinthBrowse.targetModel = model;
     g_modrinthBrowse.targetInstance = inst;
@@ -4155,6 +4654,17 @@ Screen ModrinthBrowseBackTarget()
 
 void DrawModrinthBrowse()
 {
+    // X on a focused row opens the detail view (see
+    // ShowModrinthPackDetail()) — once open, it takes over this screen's
+    // rendering entirely until B closes it (CloseModrinthDetailIfOpen(),
+    // wired into HandleBackButton()) rather than sharing this function's
+    // list-drawing code, same as how the list/viewer split works for
+    // Instance Settings' Logs/Screenshots tabs.
+    if (g_modrinthDetailPack) {
+        DrawModrinthPackDetail();
+        return;
+    }
+
     const int currentPage = g_modrinthBrowse.offset / kModrinthPageSize + 1;
     const bool canGoPrev = g_modrinthBrowse.offset > 0;
     const bool canGoNext = g_modrinthBrowse.hasMore;
@@ -4162,6 +4672,7 @@ void DrawModrinthBrowse()
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
         SetFooterHints({ { glyphs.confirm(false), "Install" },
+                          { glyphs.west, "Info" },
                           { glyphs.north, "Search" },
                           { ICON_PF_XBOX_LB "/" ICON_PF_XBOX_RB, "Page" },
                           { glyphs.cancel(false), "Back" } });
@@ -4257,6 +4768,8 @@ void DrawModrinthBrowse()
                     ? MenuImageButton(nameUtf8.constData(), summaryUtf8.constData(),
                                        static_cast<ImTextureID>(icon->GetNativeHandle()), LayoutScale(56.0f, 56.0f), true, 66.0f)
                     : MenuButton(nameUtf8.constData(), summaryUtf8.constData());
+                const bool wantsInfo =
+                    !anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false);
                 ImGui::PopID();
 
                 if (pressed) {
@@ -4268,6 +4781,9 @@ void DrawModrinthBrowse()
                         else
                             InstallModrinthResource(chosen);
                     };
+                } else if (wantsInfo) {
+                    ModPlatform::IndexedPack::Ptr chosen = pack;
+                    g_pendingAction = [chosen]() { ShowModrinthPackDetail(chosen); };
                 }
             }
 
@@ -4287,11 +4803,11 @@ void DrawModrinthBrowse()
     }
 }
 
-// Y on the Instances screen opens this. Three creation methods wired up now
-// (Vanilla Minecraft, local zip/.mrpack import, online Modrinth browsing —
-// see StartZipInstanceImport()/StartModrinthBrowse()'s comments) —
-// structured as a proper menu so adding more (CurseForge, needs an API
-// key — still not started) later is just more entries, not a redesign.
+// Y on the Instances screen opens this. Four creation methods wired up now
+// (Vanilla Minecraft, local zip/.mrpack import, online Modrinth browsing,
+// online CurseForge browsing — see StartZipInstanceImport()/
+// StartModrinthBrowse()'s comments) — a proper menu, so this stayed a
+// simple "add one more entry" change, not a redesign.
 // Same non-blocking OpenChoiceDialog reasoning as ShowInstanceActionsMenu
 // above.
 void ShowAddInstanceMenu()
@@ -4300,6 +4816,7 @@ void ShowAddInstanceMenu()
     options.emplace_back("Vanilla Minecraft", false);
     options.emplace_back(TR("ImportPage", "Import").toStdString(), false);
     options.emplace_back(TR("ModrinthPage", "Modrinth").toStdString(), false);
+    options.emplace_back("CurseForge", false);  // no real desktop translation — see StartModrinthBrowse()'s comment
 
     // See ShowInstanceActionsMenu()'s comment on why this closes the dialog
     // itself before acting — DrawChoiceDialog() doesn't do it automatically
@@ -4323,7 +4840,12 @@ void ShowAddInstanceMenu()
                           } else if (index == 2) {
                               g_pendingAction = []() {
                                   CloseChoiceDialog();
-                                  StartModrinthBrowse();
+                                  StartModrinthBrowse(ModPlatform::ResourceProvider::MODRINTH);
+                              };
+                          } else if (index == 3) {
+                              g_pendingAction = []() {
+                                  CloseChoiceDialog();
+                                  StartModrinthBrowse(ModPlatform::ResourceProvider::FLAME);
                               };
                           }
                       });
@@ -4989,6 +5511,22 @@ int main(int argc, char** argv)
                 // description list without needing gamepad input to
                 // navigate Y → "Modrinth" first.
                 StartModrinthBrowse();
+            } else if (name == "curseforge_browse") {
+                // Same, for CurseForge — verifies the provider-generalized
+                // browse path fails gracefully (shows lastError inline, no
+                // crash) when no FlameKeyOverride is configured, which is
+                // the expected state for this fork build.
+                StartModrinthBrowse(ModPlatform::ResourceProvider::FLAME);
+            } else if (name == "modrinth_detail") {
+                // Same, then immediately opens the first result's detail
+                // view (ShowModrinthPackDetail()) — StartModrinthBrowse()
+                // already blocks until the search completes, so
+                // g_modrinthBrowse.packs is populated by the time this
+                // runs, no extra delay needed. For screenshotting the
+                // description/gallery view without needing X-press input.
+                StartModrinthBrowse();
+                if (!g_modrinthBrowse.packs.isEmpty())
+                    ShowModrinthPackDetail(g_modrinthBrowse.packs.first());
             } else if (name == "instance_mods_browse") {
                 // Same idea, but for the "Download ..." resource-browse
                 // path (StartResourceBrowse()) instead of the whole-
@@ -5003,6 +5541,20 @@ int main(int argc, char** argv)
                     g_instanceSettingsTarget = inst;
                     StartResourceBrowse(inst, inst->loaderModList(), ModPlatform::ResourceType::Mod, TR("ModFolderPage", "Download Mods"));
                 }
+            } else if (name == "resource_provider_picker") {
+                // TEMPORARY: opens the exact same Modrinth/CurseForge
+                // choice dialog ShowResourceActionsMenu()'s case 2
+                // ("Download ...") opens, directly — for screenshotting
+                // that new sub-dialog's rendering without needing to
+                // navigate the outer Delete/Check for Updates/Download
+                // menu first (that outer menu is the same long-proven
+                // OpenChoiceDialog pattern already screenshotted
+                // elsewhere).
+                ChoiceDialogOptions providerOptions;
+                providerOptions.emplace_back(TR("ModrinthPage", "Modrinth").toStdString(), false);
+                providerOptions.emplace_back("CurseForge", false);
+                OpenChoiceDialog(TR("ModFolderPage", "Download Mods").toStdString(), false, std::move(providerOptions),
+                                  [](s32, const std::string&, bool) {});
             } else if (name == "add_instance_import") {
                 // Jumps straight to the zip-import file selector — this is
                 // exactly what caught the file selector's fixed-size-
@@ -5012,6 +5564,24 @@ int main(int argc, char** argv)
                 // reach this specific dialog for a screenshot.
                 SetScreen(Screen::Instances);
                 StartZipInstanceImport();
+            } else if (name == "check_updates") {
+                // TEMPORARY: runs the real CheckResourceUpdates() against
+                // the first real instance's real Mods folder, for
+                // screenshotting the "N update(s) available" confirm
+                // dialog. Deliberately never confirmed (the process is
+                // killed by the test harness's own timeout while still
+                // sitting in the blocking Confirm() call) — nothing
+                // downloads. Blocks this timer callback for a while (real
+                // network calls to check every candidate), which is fine —
+                // this callback isn't itself nested inside a frame.
+                MinecraftInstance* inst = APPLICATION->instances()->getInstanceById("automodpack");
+                if (!inst && APPLICATION->instances()->rowCount() > 0)
+                    inst = APPLICATION->instances()->at(0);
+                if (inst) {
+                    ResourceFolderModel* model = inst->loaderModList();
+                    model->update();
+                    CheckResourceUpdates(inst, model, ModPlatform::ResourceType::Mod, "Check for Updates");
+                }
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
         });

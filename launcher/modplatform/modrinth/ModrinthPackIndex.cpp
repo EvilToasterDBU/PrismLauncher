@@ -116,6 +116,17 @@ void Modrinth::loadExtraPackData(ModPlatform::IndexedPack& pack, QJsonObject& ob
 
     pack.extraData.body = obj["body"].toString().remove("<br>");
 
+    auto galleryArr = obj["gallery"].toArray();
+    for (auto g : galleryArr) {
+        auto gObj = Json::requireObject(g);
+
+        ModPlatform::GalleryImage image;
+        image.url = gObj["url"].toString();
+        image.title = gObj["title"].toString();
+        if (!image.url.isEmpty())
+            pack.extraData.gallery.append(image);
+    }
+
     pack.extraDataLoaded = true;
 }
 

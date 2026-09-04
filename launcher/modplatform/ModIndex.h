@@ -179,6 +179,11 @@ struct IndexedVersion {
     }
 };
 
+struct GalleryImage {
+    QString url;   // pre-scaled preview (e.g. Modrinth's own ~350px-wide thumbnail)
+    QString title;
+};
+
 struct ExtraPackData {
     QList<DonationData> donate;
 
@@ -190,6 +195,8 @@ struct ExtraPackData {
     QString status;
 
     QString body;
+
+    QList<GalleryImage> gallery;
 };
 
 struct IndexedPack {

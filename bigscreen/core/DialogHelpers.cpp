@@ -90,6 +90,38 @@ std::optional<int> Choose(const std::string& title, const std::vector<std::strin
     return result;
 }
 
+std::vector<bool> ChooseMultiple(const std::string& title, const std::vector<std::string>& options, std::vector<bool> initiallyChecked)
+{
+    if (initiallyChecked.size() != options.size())
+        initiallyChecked.assign(options.size(), true);
+
+    ChoiceDialogOptions choiceOptions;
+    choiceOptions.reserve(options.size());
+    for (size_t i = 0; i < options.size(); ++i)
+        choiceOptions.emplace_back(options[i], initiallyChecked[i]);
+
+    std::vector<bool> checked = std::move(initiallyChecked);
+    bool done = false;
+
+    // index < 0 is the checkable dialog's own "closed via B/Escape without
+    // picking a row" signal (DrawChoiceDialog()'s cancel branch) — here
+    // that's not a cancel, it's "done, use whatever's checked", so it just
+    // ends the wait loop rather than discarding `checked`. A real row
+    // toggle (index >= 0) updates that one entry and leaves the dialog
+    // open for more.
+    OpenChoiceDialog(title, true, std::move(choiceOptions), [&checked, &done](s32 index, const std::string&, bool state) {
+        if (index < 0) {
+            done = true;
+            return;
+        }
+        if (index >= 0 && static_cast<size_t>(index) < checked.size())
+            checked[static_cast<size_t>(index)] = state;
+    });
+
+    WaitForDialog(done, IsChoiceDialogOpen);
+    return checked;
+}
+
 void WaitForTask(Task* task)
 {
     BlockingGuard guard;

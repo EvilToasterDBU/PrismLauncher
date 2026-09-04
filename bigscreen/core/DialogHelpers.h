@@ -104,6 +104,24 @@ bool Confirm(const std::string& title,
 // Returns the selected option's index, or nullopt if cancelled/closed.
 std::optional<int> Choose(const std::string& title, const std::vector<std::string>& options);
 
+// Multi-select variant, built on ImGuiFullscreen's checkable choice dialog
+// (a vendored feature that sat unused until this) — each row shows a real
+// checkbox glyph and toggles on A without closing; there's no separate
+// "confirm" button in that dialog, so B does double duty here: it both
+// closes the dialog *and* commits whatever's currently checked (see
+// GetChoiceDialogHelpText()'s "Toggle / Confirm" footer hint, which makes
+// this explicit to the player, rather than the usual "Select / Cancel").
+// initiallyChecked (defaulting all-true if empty) seeds each row's starting
+// state — a "start with everything selected, uncheck what you don't want"
+// flow reads better for an update-all-by-default list than starting from
+// nothing checked. Returns one bool per option (true = checked) in the
+// same order as `options`; never nullopt (unlike Choose()/InputString()) —
+// "closed with nothing checked" is a fully valid, distinguishable answer
+// (an all-false vector) rather than a separate cancelled state, since nothing
+// this is used for has a meaningful difference between the two.
+std::vector<bool> ChooseMultiple(const std::string& title, const std::vector<std::string>& options,
+                                  std::vector<bool> initiallyChecked = {});
+
 // Blocks (via the same PumpFrame loop as the dialogs above, under the same
 // BlockingGuard) until `task` finishes running — for waiting on an
 // arbitrary Task, not just a dialog answer. Shared by

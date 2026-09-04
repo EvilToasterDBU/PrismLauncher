@@ -29,6 +29,16 @@ namespace ImGuiFullscreen {
 void GetChoiceDialogHelpText(SmallStringBase& dest)
 {
     const GamepadGlyphs glyphs = GetGamepadGlyphs();
+    // Checkable (multi-select) dialogs don't have a separate "confirm"
+    // button — B both closes AND commits whatever's checked (see
+    // BigScreenDialogs::ChooseMultiple()'s own comment for why), so the
+    // hint reads "Toggle / Confirm" here instead of "Select / Cancel".
+    if (IsChoiceDialogCheckable()) {
+        const std::pair<const char*, std::string_view> items[] = { { glyphs.confirm(false), "Toggle" },
+                                                                     { glyphs.cancel(false), "Confirm" } };
+        CreateFooterTextString(dest, items);
+        return;
+    }
     const std::pair<const char*, std::string_view> items[] = { { glyphs.confirm(false), "Select" }, { glyphs.cancel(false), "Cancel" } };
     CreateFooterTextString(dest, items);
 }

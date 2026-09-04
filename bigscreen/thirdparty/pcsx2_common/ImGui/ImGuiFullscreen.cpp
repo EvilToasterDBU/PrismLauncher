@@ -2477,6 +2477,11 @@ bool ImGuiFullscreen::IsChoiceDialogOpen()
 	return s_choice_dialog_open;
 }
 
+bool ImGuiFullscreen::IsChoiceDialogCheckable()
+{
+	return s_choice_dialog_checkable;
+}
+
 void ImGuiFullscreen::OpenChoiceDialog(std::string_view title, bool checkable, ChoiceDialogOptions options, ChoiceDialogCallback callback)
 {
 	if (s_choice_dialog_open)
@@ -2573,22 +2578,37 @@ void ImGuiFullscreen::DrawChoiceDialog()
 		}
 		else
 		{
-			for (s32 i = 0; i < static_cast<s32>(s_choice_dialog_options.size()); i++)
+			// BigScreen note: ImGuiListClipper — some real callers (e.g. picking a
+			// Modrinth pack version) can have hundreds of options, and this loop
+			// used to build every single row's widget every frame regardless of
+			// whether it was actually visible in the (height-capped, scrolling)
+			// popup — real, measurable cost on slower hardware. Safe here because
+			// every row uses the exact same fixed height (LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY
+			// + frame padding — the same formula GetMenuButtonFrameBounds() uses,
+			// and the same one this dialog's own height calc above already assumes).
+			ImGuiListClipper clipper;
+			clipper.Begin(static_cast<s32>(s_choice_dialog_options.size()),
+				LayoutScale(LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY) + ImGui::GetStyle().FramePadding.y * 2.0f);
+			while (clipper.Step())
 			{
-				auto& option = s_choice_dialog_options[i];
-				std::string title;
-				if (option.second)
-					title += ICON_FA_CHECK " ";
-				title += option.first;
-
-				if (ActiveButtonWithRightText(option.first.c_str(), option.second ? ICON_FA_CHECK : nullptr, option.second,
-						true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+				for (s32 i = clipper.DisplayStart; i < clipper.DisplayEnd; i++)
 				{
-					choice = i;
-					for (s32 j = 0; j < static_cast<s32>(s_choice_dialog_options.size()); j++)
-						s_choice_dialog_options[j].second = (j == i);
+					auto& option = s_choice_dialog_options[i];
+					std::string title;
+					if (option.second)
+						title += ICON_FA_CHECK " ";
+					title += option.first;
+
+					if (ActiveButtonWithRightText(option.first.c_str(), option.second ? ICON_FA_CHECK : nullptr, option.second,
+							true, LAYOUT_MENU_BUTTON_HEIGHT_NO_SUMMARY))
+					{
+						choice = i;
+						for (s32 j = 0; j < static_cast<s32>(s_choice_dialog_options.size()); j++)
+							s_choice_dialog_options[j].second = (j == i);
+					}
 				}
 			}
+			clipper.End();
 		}
 
 		EndMenuButtons();
@@ -2608,8 +2628,47 @@ void ImGuiFullscreen::DrawChoiceDialog()
 
 	if (choice >= 0)
 	{
-		const auto& option = s_choice_dialog_options[choice];
-		s_choice_dialog_callback(choice, option.first, option.second);
+		if (s_choice_dialog_checkable)
+		{
+			// Checkable (multi-select) dialogs stay open across each
+			// toggle — the caller closes them explicitly once done.
+			// (Not currently used by BigScreen — checkable is always
+			// false here — kept for parity with the checkbox branch
+			// above.)
+			const auto& option = s_choice_dialog_options[choice];
+			s_choice_dialog_callback(choice, option.first, option.second);
+		}
+		else
+		{
+			// BigScreen fix: unlike DrawMessageDialog()/DrawInputDialog()
+			// in this same file, this branch never closed the dialog on
+			// a real (non-checkable) selection — only OpenChoiceDialog()
+			// opening a *later* dialog implicitly cleaned up the stale
+			// state via its own "already open? close it" guard. Any
+			// caller chaining a second dialog right after a Choose() (a
+			// version picker followed by a name InputString(), for
+			// instance) rendered both simultaneously, since nothing had
+			// closed the first — which is exactly what showed up as
+			// "nothing happens after selecting, only Back works" on
+			// real hardware. Fixed the same way the sibling dialogs
+			// already do it: move the callback and the data it needs
+			// out to locals first, close the dialog (invalidates
+			// s_choice_dialog_options / s_choice_dialog_callback), THEN
+			// invoke the moved-out callback — matches
+			// DrawMessageDialog()'s own "have to move out in case they
+			// open another dialog in the callback" comment, and avoids
+			// calling CloseChoiceDialog() from inside its own
+			// currently-executing callback (a real use-after-free this
+			// project already got burned by once, fixed elsewhere via
+			// deferred g_pendingAction — that fix doesn't apply here
+			// since this file has no such mechanism, so this closes
+			// *before* invoking instead).
+			ChoiceDialogCallback cb(std::move(s_choice_dialog_callback));
+			const std::string optionText = s_choice_dialog_options[choice].first;
+			const bool optionState = s_choice_dialog_options[choice].second;
+			CloseChoiceDialog();
+			cb(choice, optionText, optionState);
+		}
 	}
 	else if (!is_open)
 	{

@@ -304,6 +304,12 @@ namespace ImGuiFullscreen
 	using ChoiceDialogCallback = std::function<void(s32 index, const std::string& title, bool checked)>;
 	using ChoiceDialogOptions = std::vector<std::pair<std::string, bool>>;
 	bool IsChoiceDialogOpen();
+	// BigScreen addition: exposes the checkable flag OpenChoiceDialog() was
+	// last called with, so GetChoiceDialogHelpText() (GuiManager.cpp) can
+	// show "Toggle / Confirm" instead of "Select / Cancel" for a multi-
+	// select dialog — that file has no other access to this file's static
+	// s_choice_dialog_checkable.
+	bool IsChoiceDialogCheckable();
 	void OpenChoiceDialog(std::string_view title, bool checkable, ChoiceDialogOptions options, ChoiceDialogCallback callback);
 	void CloseChoiceDialog();
 
