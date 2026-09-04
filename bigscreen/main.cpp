@@ -3231,6 +3231,119 @@ void LaunchInstance(MinecraftInstance* inst)
     }
 }
 
+// "Update Pack" — offered in ShowInstanceActionsMenu() only for
+// Modrinth-managed instances (inst->isManagedPack() &&
+// getManagedPackType() == "modrinth"; CurseForge managed packs aren't
+// supported — the online browsing/install machinery this reuses,
+// sections 27-29 in CLAUDE.md, is Modrinth-only, no API key wired up for
+// CurseForge). Real desktop equivalent:
+// ModrinthManagedPackPage::parseManagedPack()/ManagedPackPage::updatePack()
+// (launcher/ui/pages/instance/ManagedPackPage.cpp) — reuses the exact same
+// getProjectVersions()/InstanceImportTask machinery the earlier Modrinth
+// browsing rounds already built and proved, just seeded from the
+// ALREADY-installed pack's own ID (getManagedPackID()) instead of a fresh
+// search, and with "original_instance_id" in extraInfo (confirmed by
+// reading InstanceImportTask::processModrinth() — the exact same field
+// read there that this project's own online-install path leaves unset)
+// so the real ModrinthCreationTask replaces this instance in place rather
+// than creating a new sibling.
+void CheckAndUpdateManagedPack(MinecraftInstance* inst)
+{
+    const std::string dialogTitle = TR("ManagedPackPage", "Update Pack").toStdString();
+
+    ModPlatform::IndexedPack::Ptr pack = std::make_shared<ModPlatform::IndexedPack>();
+    pack->addonId = inst->getManagedPackID();
+
+    ResourceAPI::VersionSearchArgs versionArgs;
+    versionArgs.pack = pack;
+    versionArgs.resourceType = ModPlatform::ResourceType::Modpack;
+
+    QVector<ModPlatform::IndexedVersion> versions;
+    bool succeeded = false;
+    QString failReason;
+    Task::Ptr versionsTask = ModrinthAPI::get().getProjectVersions(
+        versionArgs, { [&versions, &succeeded](QVector<ModPlatform::IndexedVersion>& result) {
+                          versions = result;
+                          succeeded = true;
+                      },
+                       [&failReason](const QString& reason, int) { failReason = reason; }, [] {} });
+    if (!versionsTask) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to check for updates.", false, "OK", "OK");
+        return;
+    }
+    versionsTask->start();
+    BigScreenDialogs::WaitForTask(versionsTask.get());
+
+    if (!succeeded || versions.isEmpty()) {
+        BigScreenDialogs::Confirm(dialogTitle, "Failed to check for updates: " + failReason.toStdString(), false, "OK", "OK");
+        return;
+    }
+
+    // Real desktop labeling: ModrinthManagedPackPage::parseManagedPack()
+    // appends " (Current)" to whichever returned version's raw `version`
+    // field matches getManagedPackVersionName() — note this compares
+    // against `version`, not `versionNumber`/`fileId` (the desktop's own
+    // comment there explains why: a version's fileId in this API response
+    // isn't always the same id recorded in the modpack format spec).
+    const QString currentVersionName = inst->getManagedPackVersionName();
+    std::vector<std::string> labels;
+    for (const ModPlatform::IndexedVersion& v : versions) {
+        QString label = v.getVersionDisplayString();
+        if (v.version == currentVersionName)
+            label = TR("ModrinthManagedPackPage", "%1 (Current)").arg(label);
+        labels.push_back(label.toStdString());
+    }
+
+    const auto choice = BigScreenDialogs::Choose(dialogTitle, labels);
+    if (!choice || *choice < 0 || static_cast<size_t>(*choice) >= static_cast<size_t>(versions.size()))
+        return;
+    const ModPlatform::IndexedVersion& chosenVersion = versions[static_cast<int>(*choice)];
+
+    if (chosenVersion.version == currentVersionName) {
+        // No real desktop equivalent for this specific confirmation (the
+        // desktop just lets you click "Update Pack" on the already-
+        // selected "(Current)" entry with no extra prompt) — added here
+        // since re-running a full reinstall isn't free, worth a check
+        // before doing it by accident on a gamepad.
+        if (!BigScreenDialogs::Confirm(dialogTitle, "This is already the installed version. Reinstall it anyway?", false, "Reinstall",
+                                        "Cancel"))
+            return;
+    }
+
+    QMap<QString, QString> extraInfo{ { "pack_id", inst->getManagedPackID() },
+                                       { "pack_version_id", chosenVersion.fileId.toString() },
+                                       { "original_instance_id", inst->id() } };
+    auto* importTask = new InstanceImportTask(QUrl(chosenVersion.downloadUrl), true, nullptr, extraInfo);
+    // Keeps the instance's existing name as-is rather than replicating the
+    // desktop's name.replace(oldVersionName, newVersionName) heuristic
+    // (ManagedPackPage::updatePack()) — that string-replace can misfire on
+    // a name a user has already customized to not contain the raw version
+    // string, and BigScreen has no inline rename-preview UI to catch a bad
+    // result before it's applied.
+    importTask->setName(inst->name());
+    importTask->setGroup(APPLICATION->instances()->getInstanceGroup(inst->id()));
+    importTask->setIcon(inst->iconKey());
+    importTask->setConfirmUpdate(false);
+
+    unique_qobject_ptr<Task> task(APPLICATION->instances()->wrapInstanceTask(importTask));
+    task->start();
+    BigScreenDialogs::WaitForTask(task.get());
+
+    if (!task->wasSuccessful()) {
+        BigScreenDialogs::Confirm(
+            TR("ManagedPackPage", "Update Failed").toStdString(),
+            TR("ManagedPackPage", "The instance failed to update to pack version %1. Please check launcher logs for more information.")
+                .arg(chosenVersion.version)
+                .toStdString(),
+            false, "OK", "OK");
+        return;
+    }
+    BigScreenDialogs::Confirm(
+        TR("ManagedPackPage", "Update Successful").toStdString(),
+        TR("ManagedPackPage", "The instance updated to pack version %1 successfully.").arg(chosenVersion.version).toStdString(), false,
+        "OK", "OK");
+}
+
 // X on a focused instance card opens this — a curated subset of the
 // desktop's right-click context menu (MainWindow::showInstanceContextMenu),
 // picking the actions that make sense without a mouse/keyboard: launching,
@@ -3355,6 +3468,13 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
                              g_instanceSettingsTarget = inst;
                              SetScreen(Screen::InstanceSettings);
                          } });
+
+    // Only for Modrinth-managed instances — see CheckAndUpdateManagedPack()'s
+    // own comment for why CurseForge-managed packs aren't offered this.
+    if (inst->isManagedPack() && inst->getManagedPackType() == "modrinth") {
+        actions->push_back(
+            { TR("ManagedPackPage", "Update Pack").toStdString(), [inst]() { g_pendingAction = [inst]() { CheckAndUpdateManagedPack(inst); }; } });
+    }
 
     // Desktop's CopyInstanceDialog lets the user pick exactly what to
     // bring along (saves/mods/resource packs/screenshots/servers/...) and
@@ -4082,15 +4202,36 @@ void DrawModrinthBrowse()
             // Page indicator — no real total-page count available (see
             // ModrinthBrowseState's comment on hasMore), so this reads
             // "Page N" rather than "Page N of M", plus which direction(s)
-            // LB/RB currently do something.
+            // LB/RB currently do something. Uses ICON_FA_CHEVRON_LEFT/
+            // _RIGHT (already loaded into the font atlas and already used
+            // elsewhere in this file, e.g. the "< Back" buttons) rather
+            // than the raw Unicode "◀"/"▶" (U+25C0/U+25B6, Geometric
+            // Shapes block) an earlier version of this used — those were
+            // never in any loaded glyph range (only Basic Latin/Latin-1 +
+            // explicit Cyrillic + the FA/PromptFont icon ranges are — see
+            // GuiManager.cpp's LoadFonts()), so they rendered as missing-
+            // glyph boxes instead of real arrows. Built as a std::string
+            // rather than QString::arg() — the icon macros are plain
+            // const char* byte literals, awkward to interleave with
+            // QString's %N substitution.
             {
-                QString pageLabel = QObject::tr("Page %1").arg(currentPage);
-                if (canGoPrev || canGoNext)
-                    pageLabel += QString("  (%1%2%3)")
-                                     .arg(canGoPrev ? "\xE2\x97\x80 LB " : "")
-                                     .arg(canGoPrev && canGoNext ? " " : "")
-                                     .arg(canGoNext ? "RB \xE2\x96\xB6" : "");
-                ImGui::TextUnformatted(pageLabel.toUtf8().constData());
+                std::string label = QObject::tr("Page %1").arg(currentPage).toStdString();
+                if (canGoPrev && canGoNext) {
+                    label += "  (";
+                    label += ICON_FA_CHEVRON_LEFT;
+                    label += " LB   RB ";
+                    label += ICON_FA_CHEVRON_RIGHT;
+                    label += ")";
+                } else if (canGoPrev) {
+                    label += "  (";
+                    label += ICON_FA_CHEVRON_LEFT;
+                    label += " LB)";
+                } else if (canGoNext) {
+                    label += "  (RB ";
+                    label += ICON_FA_CHEVRON_RIGHT;
+                    label += ")";
+                }
+                ImGui::TextUnformatted(label.c_str());
             }
 
             if (g_modrinthBrowse.packs.isEmpty() && !g_modrinthBrowse.lastError.isEmpty())
