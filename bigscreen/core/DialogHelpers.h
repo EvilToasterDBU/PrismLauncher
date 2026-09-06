@@ -104,6 +104,13 @@ bool Confirm(const std::string& title,
 // Returns the selected option's index, or nullopt if cancelled/closed.
 std::optional<int> Choose(const std::string& title, const std::vector<std::string>& options);
 
+// Single-button informational popup (ImGuiFullscreen's OpenInfoMessageDialog)
+// — for a plain "OK to acknowledge" prompt with no real yes/no choice (e.g.
+// LaunchController's profiler-ready/profiler-error messages), rather than
+// misusing Confirm()'s two-button dialog with both buttons doing the same
+// thing.
+void Alert(const std::string& title, const std::string& message, const std::string& buttonText = "OK");
+
 // Multi-select variant, built on ImGuiFullscreen's checkable choice dialog
 // (a vendored feature that sat unused until this) — each row shows a real
 // checkbox glyph and toggles on A without closing; there's no separate

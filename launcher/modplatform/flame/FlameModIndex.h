@@ -10,7 +10,7 @@ namespace FlameMod {
 
 void loadIndexedPack(ModPlatform::IndexedPack& pack, QJsonObject& obj);
 void loadURLs(ModPlatform::IndexedPack& pack, QJsonObject& obj);
-void loadBody(ModPlatform::IndexedPack& pack);
+void loadBody(ModPlatform::IndexedPack& pack, QJsonObject& obj);
 void loadIndexedPackVersions(ModPlatform::IndexedPack& pack, QJsonArray& arr);
 ModPlatform::IndexedVersion loadIndexedPackVersion(QJsonObject& obj, bool loadChangelog = false);
 }  // namespace FlameMod

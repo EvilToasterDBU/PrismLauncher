@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Name=PrismLauncher BigScreen
+Comment=Gamepad-only fullscreen interface for PrismLauncher, for Steam Deck and other handhelds
+Type=Application
+Terminal=false
+Exec=prismlauncher_bigscreen
+StartupNotify=true
+Icon=org.prismlauncher.bigscreen
+Categories=Game;
+Keywords=game;minecraft;mc;gamepad;bigscreen;steamdeck;
+StartupWMClass=prismlauncher_bigscreen

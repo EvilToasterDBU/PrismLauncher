@@ -7,13 +7,13 @@
 #include "net/NetUtils.h"
 #include "settings/SettingsObject.h"
 #include "tasks/Task.h"
-#include "ui/dialogs/MSALoginDialog.h"
 
 #include <QCoreApplication>
 #include <QRegularExpression>
 
 std::function<void(MinecraftInstance*)> BigScreenLaunchController::onShowConsole;
 std::function<void()> BigScreenLaunchController::onOpenAccounts;
+std::function<MinecraftAccountPtr(const QString&)> BigScreenLaunchController::onReauthenticate;
 
 namespace {
 // This class's own tr() would use "BigScreenLaunchController" as the
@@ -26,6 +26,15 @@ namespace {
 QString LC(const char* sourceText)
 {
     return QCoreApplication::translate("LaunchController", sourceText);
+}
+
+// Same one-line helper as bigscreen/main.cpp's own StripMnemonic() (internal
+// linkage there too, so not shared directly) — the original "&Launch"
+// button text carries a Qt '&' mnemonic marker that has no meaning for a
+// gamepad-driven button label and would otherwise render as a literal '&'.
+QString StripMnemonic(QString text)
+{
+    return text.remove(QChar('&'));
 }
 }  // namespace
 
@@ -89,14 +98,19 @@ bool BigScreenLaunchController::reauthenticateAccount(const MinecraftAccountPtr&
     if (!wantsReauth || account->accountType() != AccountType::MSA)
         return false;
 
-    // BigScreen's own device-code + QR login (bigscreen/main.cpp,
-    // Screen::AccountLogin) isn't reusable from here without more plumbing
-    // to share it between the two files — this path is only hit on token
-    // failure, rare enough that falling back to the normal Qt login dialog
-    // for the actual re-login form is an acceptable v1 gap. TODO: share it.
+    if (!onReauthenticate)
+        return false;
+
     auto* accounts = APPLICATION->accounts();
     const bool isDefault = accounts->defaultAccount() == account;
-    MinecraftAccountPtr newAccount = MSALoginDialog::newAccount(nullptr);
+    // Runs BigScreen's own device-code + QR login (bigscreen/main.cpp's
+    // BlockingReauthenticate(), reusing the exact same Screen::AccountLogin
+    // flow the Accounts screen's own "+ Add Account" already drives) —
+    // blocks (via the same frame-pumping pattern every other override here
+    // uses) until the user completes it on another device, fails, or
+    // cancels with B. Replaces the earlier fallback to the native
+    // MSALoginDialog::newAccount(), which required mouse/keyboard.
+    MinecraftAccountPtr newAccount = onReauthenticate(reason);
     if (!newAccount)
         return false;
 
@@ -252,4 +266,29 @@ bool BigScreenLaunchController::checkJvmArgsValid(const QString& jvmargs)
         return false;
     }
     return true;
+}
+
+void BigScreenLaunchController::profilerCheckFailed(const QString& profilerName, const QString& error)
+{
+    BigScreenDialogs::Alert(LC("Error!").toStdString(), LC("Profiler check for %1 failed: %2").arg(profilerName, error).toStdString());
+}
+
+void BigScreenLaunchController::profilerReadyToLaunch(const QString& message)
+{
+    // Single-button Alert() rather than Confirm() — the original is an
+    // "acknowledge to continue" prompt, not a real yes/no choice (there's
+    // no way to *not* proceed here short of aborting the whole launch,
+    // which is what B/Confirm's own dialog-close path would do anyway).
+    BigScreenDialogs::Alert(LC("Waiting.").toStdString(),
+                             LC("The game launch is delayed until you press the "
+                                "button. This is the right time to setup the profiler, as the "
+                                "profiler server is running now.\n\n%1")
+                                 .arg(message)
+                                 .toStdString(),
+                             StripMnemonic(LC("&Launch")).toStdString());
+}
+
+void BigScreenLaunchController::profilerAbortedLaunch(const QString& message)
+{
+    BigScreenDialogs::Alert(LC("Error").toStdString(), LC("Couldn't start the profiler: %1").arg(message).toStdString());
 }

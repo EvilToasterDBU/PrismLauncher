@@ -64,11 +64,31 @@ void FlameMod::loadURLs(ModPlatform::IndexedPack& pack, QJsonObject& obj)
     }
 }
 
-void FlameMod::loadBody(ModPlatform::IndexedPack& pack)
+// https://docs.curseforge.com/rest-api/#get-mod — the mod's own "screenshots"
+// array (real field, confirmed via a live GET /mods/{id} request, not
+// guessed): {id, modId, title, description, thumbnailUrl, url}. thumbnailUrl
+// is the pre-scaled preview image, same role as Modrinth's gallery "url"
+// field (ModPlatform::GalleryImage's own doc comment) — falls back to the
+// full-size "url" only if a particular screenshot has no thumbnail.
+void FlameMod::loadBody(ModPlatform::IndexedPack& pack, QJsonObject& obj)
 {
     pack.extraData.body = FlameAPI::getModDescription(pack.addonId.toInt());
 
-    if (!pack.extraData.issuesUrl.isEmpty() || !pack.extraData.sourceUrl.isEmpty() || !pack.extraData.wikiUrl.isEmpty()) {
+    auto screenshotsArr = obj["screenshots"].toArray();
+    for (auto s : screenshotsArr) {
+        auto sObj = Json::requireObject(s);
+
+        ModPlatform::GalleryImage image;
+        image.url = sObj["thumbnailUrl"].toString();
+        if (image.url.isEmpty())
+            image.url = sObj["url"].toString();
+        image.title = sObj["title"].toString();
+        if (!image.url.isEmpty())
+            pack.extraData.gallery.append(image);
+    }
+
+    if (!pack.extraData.issuesUrl.isEmpty() || !pack.extraData.sourceUrl.isEmpty() || !pack.extraData.wikiUrl.isEmpty() ||
+        !pack.extraData.gallery.isEmpty()) {
         pack.extraDataLoaded = true;
     }
 }

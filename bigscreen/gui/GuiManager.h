@@ -24,6 +24,10 @@ bool LoadFonts(float scale);
 // GSTexture, for cases ImGuiFullscreen's own file-path-based texture cache
 // doesn't cover (instance/account icons that only exist as in-memory QIcons
 // or come from arbitrary absolute paths outside EmuFolders::Resources).
-std::shared_ptr<GSTexture> UploadQImage(const QImage& image);
+// nearest=true uses nearest-neighbor (not linear) min/mag filtering — for
+// small, deliberately blocky pixel art (Minecraft skin/cape textures) that
+// looks blurry/smeared when scaled up with the default linear filtering
+// every other texture here wants.
+std::shared_ptr<GSTexture> UploadQImage(const QImage& image, bool nearest = false);
 
 }  // namespace BigScreenGui

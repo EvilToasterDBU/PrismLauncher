@@ -41,3 +41,32 @@
 #define ICON_FA_BATTERY_QUARTER "\xef\x89\x83"         // U+F243
 #define ICON_FA_BATTERY_EMPTY "\xef\x89\x84"           // U+F244
 #define ICON_FA_BOLT "\xef\x83\xa7"                    // U+F0E7
+
+// Menu-card and top-bar category icons — replace the plain PNG textures
+// Landing/Quit/Settings/Instance-Settings used until now (BigScreen plan's
+// "Известные, осознанные пробелы" follow-up item). Verified the same way as
+// the set above: read out of fa-solid-900.ttf's own tables, then rendered
+// and eyeballed before use (see bigscreen/CLAUDE.md for the render check).
+#define ICON_FA_GAMEPAD "\xef\x84\x9b"         // U+F11B
+#define ICON_FA_USER "\xef\x80\x87"            // U+F007
+#define ICON_FA_GEAR "\xef\x80\x93"            // U+F013
+#define ICON_FA_POWER_OFF "\xef\x80\x91"       // U+F011
+#define ICON_FA_DESKTOP "\xef\x84\x88"         // U+F108
+#define ICON_FA_HOUSE "\xef\x80\x95"           // U+F015
+#define ICON_FA_PAINTBRUSH "\xef\x87\xbc"      // U+F1FC
+#define ICON_FA_CUBE "\xef\x86\xb2"            // U+F1B2
+#define ICON_FA_MUG_HOT "\xef\x9e\xb6"         // U+F7B6
+#define ICON_FA_GLOBE "\xef\x82\xac"           // U+F0AC
+#define ICON_FA_MICROCHIP "\xef\x8b\x9b"       // U+F2DB
+#define ICON_FA_LANGUAGE "\xef\x86\xab"        // U+F1AB
+#define ICON_FA_PLUG "\xef\x87\xa6"            // U+F1E6
+#define ICON_FA_WRENCH "\xef\x82\xad"          // U+F0AD
+#define ICON_FA_PUZZLE_PIECE "\xef\x84\xae"    // U+F12E
+#define ICON_FA_SWATCHBOOK "\xef\x97\x83"      // U+F5C3
+#define ICON_FA_LAYER_GROUP "\xef\x97\xbd"     // U+F5FD
+#define ICON_FA_DATABASE "\xef\x87\x80"        // U+F1C0
+#define ICON_FA_EARTH_AMERICAS "\xef\x95\xbd"  // U+F57D
+#define ICON_FA_FILE_LINES "\xef\x83\xb6"      // U+F0F6
+#define ICON_FA_CODE_BRANCH "\xef\x84\xa6"     // U+F126
+#define ICON_FA_SERVER "\xef\x88\xb3"          // U+F233
+#define ICON_FA_CAMERA "\xef\x80\xb0"          // U+F030

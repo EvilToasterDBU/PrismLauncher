@@ -25,6 +25,14 @@ class BigScreenLaunchController : public LaunchController {
     // Same bridge, for offerToOpenAccountManager() below — routes to
     // BigScreen's own Screen::Accounts.
     static std::function<void()> onOpenAccounts;
+    // Same bridge, for reauthenticateAccount() below — runs the same
+    // device-code+QR login flow BigScreen's own Accounts screen uses
+    // (Screen::AccountLogin, see bigscreen/main.cpp's StartLogin()), but
+    // blocking: returns the freshly-logged-in account on success, or
+    // nullptr on failure/cancel — matching MSALoginDialog::newAccount()'s
+    // contract, which this replaces. Reason is passed through only to seed
+    // the status text shown while waiting.
+    static std::function<MinecraftAccountPtr(const QString& reason)> onReauthenticate;
 
    protected:
     bool askPlayDemo() const override;
@@ -36,4 +44,7 @@ class BigScreenLaunchController : public LaunchController {
     bool offerToOpenAccountManager() override;
     MinecraftAccountPtr selectAccountToUse(bool* useAsDefault) override;
     bool checkJvmArgsValid(const QString& jvmargs) override;
+    void profilerCheckFailed(const QString& profilerName, const QString& error) override;
+    void profilerReadyToLaunch(const QString& message) override;
+    void profilerAbortedLaunch(const QString& message) override;
 };

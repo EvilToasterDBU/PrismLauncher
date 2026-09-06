@@ -47,6 +47,7 @@
 #include "core/BigScreenLaunchController.h"
 #include "core/DialogHelpers.h"
 #include "icons/IconList.h"
+#include "Exception.h"
 #include "launch/LaunchTask.h"
 #include "launch/LogModel.h"
 #include "meta/Index.h"
@@ -67,15 +68,25 @@
 #include "minecraft/PackProfile.h"
 #include "minecraft/World.h"
 #include "minecraft/WorldList.h"
+#include "minecraft/skins/CapeChange.h"
+#include "minecraft/skins/SkinDelete.h"
+#include "minecraft/skins/SkinList.h"
+#include "minecraft/skins/SkinModel.h"
+#include "minecraft/skins/SkinUpload.h"
 #include "modplatform/CheckUpdateTask.h"
 #include "modplatform/ModIndex.h"
 #include "modplatform/ResourceAPI.h"
 #include "modplatform/flame/FlameAPI.h"
 #include "modplatform/flame/FlameCheckUpdate.h"
+#include "modplatform/flame/FlamePackExportTask.h"
 #include "modplatform/modrinth/ModrinthAPI.h"
 #include "modplatform/modrinth/ModrinthCheckUpdate.h"
+#include "modplatform/modrinth/ModrinthPackExportTask.h"
 #include "net/ApiRequest.h"
 #include "net/NetJob.h"
+#include "net/Request.h"
+#include "screenshots/ImgurUpload.h"
+#include "screenshots/Screenshot.h"
 
 #include <FileSystem.h>
 #include <io/stream_reader.h>
@@ -170,7 +181,7 @@ QString TrimTrailingColon(QString text)
     return text;
 }
 
-enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, InstanceSettings, Quit, ModrinthBrowse };
+enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Settings, InstanceSettings, Quit, ModrinthBrowse, ManageSkins, ChangeCape };
 
 Screen g_screen = Screen::Landing;
 bool g_wantsQuit = false;
@@ -240,7 +251,9 @@ constexpr float kTopBarHeight = ImGuiFullscreen::LAYOUT_TOP_BAR_HEIGHT;
 
 // A single top-bar tab icon (see DrawTopBar's tabs parameter) — no text
 // label, matching the reference (PCSX2's own settings screen shows category
-// tabs as bare icons in the title bar, not a separate labeled row).
+// tabs as bare icons in the title bar, not a separate labeled row). `icon`
+// is a font glyph (an ICON_FA_* macro), not a texture path — real,
+// license-checked icon glyphs replaced the earlier PNG textures here.
 struct TopBarTab {
     const char* icon;
     bool active;
@@ -422,9 +435,10 @@ void DrawTopBar(const char* title, std::span<const TopBarTab> tabs = {})
             dl->AddRectFilled(ImVec2(x, boxY), ImVec2(x + tabBoxSize, boxY + tabBoxSize), ImGui::GetColorU32(UIPrimaryColor),
                                LayoutScale(LAYOUT_FRAME_ROUNDING));
         }
-        if (GSTexture* icon = GetCachedTexture(tab.icon)) {
-            const ImVec2 pos(x + (tabBoxSize - tabIconSize) * 0.5f, (barHeight - tabIconSize) * 0.5f);
-            dl->AddImage(static_cast<ImTextureID>(icon->GetNativeHandle()), pos, pos + ImVec2(tabIconSize, tabIconSize));
+        {
+            const ImVec2 glyphSize = g_large_font.first->CalcTextSizeA(tabIconSize, FLT_MAX, 0.0f, tab.icon);
+            const ImVec2 pos(x + (tabBoxSize - glyphSize.x) * 0.5f, (barHeight - glyphSize.y) * 0.5f);
+            dl->AddText(g_large_font.first, tabIconSize, pos, ImGui::GetColorU32(UIBackgroundTextColor), tab.icon);
         }
         x += tabBoxSize + tabGap;
     }
@@ -553,6 +567,16 @@ std::shared_ptr<GSTexture> g_selectedScreenshotTexture;
 int g_selectedScreenshotIndex = -1;
 MinecraftInstance* g_selectedScreenshotInstance = nullptr;
 
+// Imgur upload result — non-empty g_imgurResultUrl means the viewer shows
+// this (a QR code of the link, generated via GenerateQrTexture() — the
+// same no-keyboard-needed reasoning M3's MSA device-code login already
+// established) instead of the screenshot itself, until "< Back" is
+// pressed. The real desktop instead puts the link on the system clipboard
+// — meaningless here with no obvious paste target reachable by gamepad, so
+// a scannable QR is the BigScreen-appropriate equivalent.
+QString g_imgurResultUrl;
+std::shared_ptr<GSTexture> g_imgurResultQrTexture;
+
 // Microsoft device-code login state (Accounts/AccountLogin screens). No
 // keyboard needed on this device at all: the user opens the shown URL (or
 // scans the QR, which encodes the same URL with the code pre-filled) on
@@ -581,6 +605,37 @@ void ResetLogin()
     g_loginQrTexture.reset();
 }
 
+// Same QR rendering approach as MSALoginDialog::paintQR
+// (launcher/ui/dialogs/MSALoginDialog.cpp) — reuses the same qrencode
+// dependency, just uploaded to a GSTexture instead of set on a QLabel.
+// Factored out of StartLogin() (its original, only call site) so the
+// Imgur-upload result screen can show a scannable link too, without a
+// keyboard/clipboard-paste round trip — the same reasoning M3 already
+// established for the MSA device-code login QR.
+std::shared_ptr<GSTexture> GenerateQrTexture(const QString& data)
+{
+    const auto* qr = QRcode_encodeString(data.toUtf8().constData(), 0, QR_ECLEVEL_M, QR_MODE_8, 1);
+    if (!qr)
+        return nullptr;
+
+    const int canvas = 300;
+    QPixmap pixmap(canvas, canvas);
+    pixmap.fill(Qt::white);
+    QPainter painter(&pixmap);
+    painter.setPen(Qt::NoPen);
+    painter.setBrush(Qt::black);
+    const double scale = 0.9 * std::min(canvas / static_cast<double>(qr->width), canvas / static_cast<double>(qr->width));
+    const double offset = (canvas - qr->width * scale) / 2.0;
+    for (int y = 0; y < qr->width; ++y) {
+        for (int x = 0; x < qr->width; ++x) {
+            if (qr->data[y * qr->width + x] & 1)
+                painter.drawRect(QRectF(offset + x * scale, offset + y * scale, scale, scale));
+        }
+    }
+    painter.end();
+    return BigScreenGui::UploadQImage(pixmap.toImage());
+}
+
 void StartLogin()
 {
     ResetLogin();
@@ -595,36 +650,12 @@ void StartLogin()
                           g_loginUrl = url;
                           g_loginCode = code;
 
-                          // Same QR rendering approach as MSALoginDialog::paintQR
-                          // (launcher/ui/dialogs/MSALoginDialog.cpp) — reuses the
-                          // same qrencode dependency, just uploaded to a GSTexture
-                          // instead of set on a QLabel.
                           QUrl linkUrl(url);
                           QUrlQuery query;
                           if (url == "https://www.microsoft.com/link" && !code.isEmpty())
                               query.addQueryItem("otc", code);
                           linkUrl.setQuery(query);
-
-                          const auto* qr = QRcode_encodeString(linkUrl.toString().toUtf8().constData(), 0, QR_ECLEVEL_M, QR_MODE_8, 1);
-                          if (!qr)
-                              return;
-
-                          const int canvas = 300;
-                          QPixmap pixmap(canvas, canvas);
-                          pixmap.fill(Qt::white);
-                          QPainter painter(&pixmap);
-                          painter.setPen(Qt::NoPen);
-                          painter.setBrush(Qt::black);
-                          const double scale = 0.9 * std::min(canvas / static_cast<double>(qr->width), canvas / static_cast<double>(qr->width));
-                          const double offset = (canvas - qr->width * scale) / 2.0;
-                          for (int y = 0; y < qr->width; ++y) {
-                              for (int x = 0; x < qr->width; ++x) {
-                                  if (qr->data[y * qr->width + x] & 1)
-                                      painter.drawRect(QRectF(offset + x * scale, offset + y * scale, scale, scale));
-                              }
-                          }
-                          painter.end();
-                          g_loginQrTexture = BigScreenGui::UploadQImage(pixmap.toImage());
+                          g_loginQrTexture = GenerateQrTexture(linkUrl.toString());
                       });
 
     QObject::connect(g_loginTask.get(), &Task::succeeded, APPLICATION, [] {
@@ -637,6 +668,72 @@ void StartLogin()
     QObject::connect(g_loginTask.get(), &Task::aborted, APPLICATION, [] { g_loginError = QObject::tr("Aborted"); });
 
     QMetaObject::invokeMethod(g_loginTask.get(), &Task::start, Qt::QueuedConnection);
+}
+
+// Blocking counterpart of StartLogin(), for
+// BigScreenLaunchController::onReauthenticate (bridges
+// LaunchController::reauthenticateAccount() — see that file's comment).
+// That method has to return a MinecraftAccountPtr synchronously
+// (MSALoginDialog::newAccount()'s contract, which this replaces), but the
+// device-code+QR flow itself only ever progresses across future frames —
+// same shape as every other blocking LaunchController override in this
+// project (waitForTask, the various BigScreenDialogs::* calls), so this
+// drives the exact same Screen::AccountLogin UI/globals StartLogin() does,
+// then blocks with BigScreenDialogs::WaitForTask() instead of returning
+// immediately and letting the normal frame loop carry it forward.
+// Deliberately does NOT call accounts()->addAccount() on success (unlike
+// StartLogin()'s own succeeded handler) — this is a *replacement* login for
+// an existing account, and BigScreenLaunchController::reauthenticateAccount()
+// itself does the remove-old/add-new/set-default bookkeeping the same way
+// the original desktop reauthenticateAccount() does around
+// MSALoginDialog::newAccount()'s result.
+MinecraftAccountPtr BlockingReauthenticate(const QString& reason)
+{
+    ResetLogin();
+    g_loginAccount = MinecraftAccount::createBlankMSA();
+    g_loginTask = g_loginAccount->login(true);
+    g_loginStatus = reason.isEmpty() ? QObject::tr("Starting device code login...") : reason;
+
+    QObject::connect(g_loginTask.get(), &Task::status, APPLICATION, [](QString status) { g_loginStatus = status; });
+    QObject::connect(g_loginTask.get(), &AuthFlow::authorizeWithBrowserWithExtra, APPLICATION,
+                      [](QString url, QString code, int) {
+                          g_loginUrl = url;
+                          g_loginCode = code;
+
+                          QUrl linkUrl(url);
+                          QUrlQuery query;
+                          if (url == "https://www.microsoft.com/link" && !code.isEmpty())
+                              query.addQueryItem("otc", code);
+                          linkUrl.setQuery(query);
+                          g_loginQrTexture = GenerateQrTexture(linkUrl.toString());
+                      });
+    QObject::connect(g_loginTask.get(), &Task::failed, APPLICATION, [](QString failReason) { g_loginError = failReason; });
+    QObject::connect(g_loginTask.get(), &Task::aborted, APPLICATION, [] { g_loginError = QObject::tr("Aborted"); });
+
+    SetScreen(Screen::AccountLogin);
+    // Called directly, not via QueuedConnection like StartLogin() — that
+    // queuing exists because StartLogin() itself runs from inside a menu
+    // click handled mid-frame; reauthenticateAccount() (and therefore this)
+    // is only ever reached via Application::launch()'s own queued
+    // controller->start() dispatch, never mid-frame, and WaitForTask()
+    // requires the task to already be running when it's called (see its own
+    // doc comment) — queuing the start here would make it check
+    // isRunning() before the queued start had actually run.
+    g_loginTask->start();
+    BigScreenDialogs::WaitForTask(g_loginTask.get());
+
+    const bool success = g_loginTask->getState() == Task::State::Succeeded;
+    MinecraftAccountPtr result = success ? g_loginAccount : nullptr;
+    if (success) {
+        ResetLogin();
+        SetScreen(Screen::Accounts);
+    }
+    // On failure/abort, ResetLogin()/screen routing already happened either
+    // via HandleBackButton()'s AccountLogin case (B-press) or is left
+    // showing the error on Screen::AccountLogin for the user to read before
+    // backing out themselves (a real failure reason from AuthFlow, not a
+    // silent dead end).
+    return result;
 }
 
 // Locates the normal desktop Qt Widgets build (BuildConfig.LAUNCHER_APP_BINARY_NAME,
@@ -761,6 +858,12 @@ void HandleBackButton()
         case Screen::ModrinthBrowse:
             SetScreen(ModrinthBrowseBackTarget());
             break;
+        case Screen::ManageSkins:
+            SetScreen(Screen::Accounts);
+            break;
+        case Screen::ChangeCape:
+            SetScreen(Screen::ManageSkins);
+            break;
     }
 
     ResetCloseMenuIfNeeded();
@@ -838,7 +941,7 @@ void DrawBlockingWait()
 }
 
 struct LandingItem {
-    const char* icon;
+    const char* icon;  // an ICON_FA_* glyph, not a texture path — see HorizontalMenuItem's glyph overload
     QString title;
     const char* description;
 };
@@ -865,10 +968,10 @@ void DrawLanding(bool& done)
     // TR()/MW() need to run after the translator is installed and could
     // change if the language setting changes mid-session.
     const LandingItem items[] = {
-        { "images/icons/instances.png", StripMnemonic(MW("&Instances")), "Browse and launch your installed Minecraft instances." },
-        { "images/icons/accounts.png", StripMnemonic(MW("&Accounts")), "Manage your logged-in Microsoft and offline accounts." },
-        { "images/icons/settings.png", StripMnemonic(MW("Setti&ngs...")), "Change launcher and instance settings." },
-        { "images/icons/quit.png", StripMnemonic(MW("Close &Window")), "Exit BigScreen and return to the desktop." },
+        { ICON_FA_GAMEPAD, StripMnemonic(MW("&Instances")), "Browse and launch your installed Minecraft instances." },
+        { ICON_FA_USER, StripMnemonic(MW("&Accounts")), "Manage your logged-in Microsoft and offline accounts." },
+        { ICON_FA_GEAR, StripMnemonic(MW("Setti&ngs...")), "Change launcher and instance settings." },
+        { ICON_FA_POWER_OFF, StripMnemonic(MW("Close &Window")), "Exit BigScreen and return to the desktop." },
     };
 
     {
@@ -904,9 +1007,8 @@ void DrawLanding(bool& done)
             DrawScrollableCardRow("landing_row", rowWidthLogical, rowHeight, [&items]() {
                 for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
                     const LandingItem& item = items[i];
-                    GSTexture* icon = GetCachedTexture(item.icon);
                     const QByteArray titleUtf8 = item.title.toUtf8();
-                    if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
+                    if (HorizontalMenuItem(item.icon, titleUtf8.constData(), item.description)) {
                         switch (i) {
                             case 0:
                                 SetScreen(Screen::Instances);
@@ -947,9 +1049,9 @@ void DrawQuit(bool& done)
     // equivalent. "Back" and "Switch to Desktop Mode" have no desktop
     // equivalent (BigScreen-only concepts) and stay BigScreen's own text.
     const LandingItem items[] = {
-        { "images/icons/back.png", "Back", "Return to the previous menu." },
-        { "images/icons/quit.png", StripMnemonic(MW("Close &Window")), "Fully exit BigScreen, returning to your desktop." },
-        { "images/icons/desktop.png", "Switch to Desktop Mode", "Exit BigScreen mode, switch to the desktop interface." },
+        { ICON_FA_CHEVRON_LEFT, "Back", "Return to the previous menu." },
+        { ICON_FA_POWER_OFF, StripMnemonic(MW("Close &Window")), "Fully exit BigScreen, returning to your desktop." },
+        { ICON_FA_DESKTOP, "Switch to Desktop Mode", "Exit BigScreen mode, switch to the desktop interface." },
     };
 
     {
@@ -973,9 +1075,8 @@ void DrawQuit(bool& done)
 
             for (int i = 0; i < static_cast<int>(std::size(items)); ++i) {
                 const LandingItem& item = items[i];
-                GSTexture* icon = GetCachedTexture(item.icon);
                 const QByteArray titleUtf8 = item.title.toUtf8();
-                if (HorizontalMenuItem(icon, titleUtf8.constData(), item.description)) {
+                if (HorizontalMenuItem(item.icon, titleUtf8.constData(), item.description)) {
                     switch (i) {
                         case 0:
                             SetScreen(Screen::Landing);
@@ -1046,14 +1147,121 @@ void ShowAddOfflineAccount()
         accounts->setDefaultAccount(account);
 }
 
+// X on a focused account row (DrawAccounts()) opens this. Real desktop
+// equivalent: AccountListPage's toolbar actions (Refresh/Set Default/No
+// Default/Remove/Move Up/Move Down/Manage Skins — all read directly from
+// AccountListPage.ui for exact wording, not guessed). "Manage Skins" routes
+// to ShowManageSkins() (defined below, forward-declared just for this call
+// site) — functional parity with SkinManageDialog, minus its own separate
+// ~600-line 3D skin-preview rendering stack (launcher/ui/dialogs/skins/),
+// deliberately out of scope (see ShowManageSkins()'s own comment).
+// Same reentrancy shape as ShowInstanceActionsMenu()/
+// ShowResourceActionsMenu(): a real (non-checkable) OpenChoiceDialog opened
+// directly (safe — this runs from DrawAccounts()'s own mid-frame per-row
+// check, not from inside another dialog's callback), selection closes the
+// dialog and runs the real action via g_pendingAction (deferred, since
+// CloseChoiceDialog() can't safely be called from inside the still-
+// executing s_choice_dialog_callback — see the X/Y-menu reentrancy fix
+// elsewhere in this project).
+void ShowManageSkins(const MinecraftAccountPtr& account);
+
+void ShowAccountActionsMenu(const MinecraftAccountPtr& account, int index)
+{
+    AccountList* accounts = APPLICATION->accounts();
+    const bool isReady = !account->isActive();
+    const bool isOnline = account->accountType() != AccountType::Offline;
+    const bool hasDefault = accounts->defaultAccount() != nullptr;
+    const bool canMoveUp = index > 0;
+    const bool canMoveDown = index < accounts->count() - 1;
+
+    ChoiceDialogOptions options;
+    std::vector<int> actionForIndex;  // maps option row -> semantic action id
+    auto addOption = [&](const QString& text, int actionId) {
+        options.emplace_back(StripMnemonic(text).toStdString(), false);
+        actionForIndex.push_back(actionId);
+    };
+    enum Action { Refresh, SetDefault, NoDefault, Remove, MoveUp, MoveDown, ManageSkins };
+
+    if (isReady && isOnline)
+        addOption(TR("AccountListPage", "&Refresh"), Refresh);
+    if (isReady)
+        addOption(TR("AccountListPage", "&Set Default"), SetDefault);
+    if (isReady && hasDefault)
+        addOption(TR("AccountListPage", "&No Default"), NoDefault);
+    if (isReady)
+        addOption(TR("AccountListPage", "Remo&ve"), Remove);
+    if (canMoveUp)
+        addOption(TR("AccountListPage", "Move &Up"), MoveUp);
+    if (canMoveDown)
+        addOption(TR("AccountListPage", "Move &Down"), MoveDown);
+    // Gated exactly like the desktop's own actionManageSkins
+    // (AccountListPage::updateButtonStates(): accountIsReady && accountIsOnline
+    // — "online" there just means "not an Offline account", MSA specifically,
+    // not a live connectivity check) — skins are a Microsoft-account feature,
+    // an Offline account has nothing to manage here.
+    if (isReady && isOnline)
+        addOption(TR("AccountListPage", "&Manage Skins"), ManageSkins);
+
+    if (options.empty())
+        return;
+
+    const QByteArray nameUtf8 = account->profileName().toUtf8();
+    OpenChoiceDialog(
+        nameUtf8.constData(), false, std::move(options),
+        [account, actionForIndex](s32 choice, const std::string&, bool) {
+            if (choice < 0 || static_cast<size_t>(choice) >= actionForIndex.size())
+                return;
+            const int actionId = actionForIndex[static_cast<size_t>(choice)];
+            g_pendingAction = [account, actionId]() {
+                CloseChoiceDialog();
+                AccountList* accounts = APPLICATION->accounts();
+                const QModelIndex idx = accounts->index(accounts->findAccountByProfileId(account->profileId()));
+                switch (actionId) {
+                    case Refresh:
+                        accounts->requestRefresh(account->internalId());
+                        break;
+                    case SetDefault:
+                        accounts->setDefaultAccount(account);
+                        break;
+                    case NoDefault:
+                        accounts->setDefaultAccount(nullptr);
+                        break;
+                    case Remove: {
+                        const QString message =
+                            TR("AccountListPage", "Do you really want to delete this account?");
+                        if (BigScreenDialogs::Confirm(TR("AccountListPage", "Remove account?").toStdString(), message.toStdString(),
+                                                       false, StripMnemonic(TR("AccountListPage", "Remo&ve")).toStdString(),
+                                                       TR("LaunchController", "Cancel").toStdString()))
+                            accounts->removeAccount(idx);
+                        break;
+                    }
+                    case MoveUp:
+                        accounts->moveAccount(idx, -1);
+                        break;
+                    case MoveDown:
+                        accounts->moveAccount(idx, 1);
+                        break;
+                    case ManageSkins:
+                        ShowManageSkins(account);
+                        break;
+                }
+            };
+        });
+}
+
 void DrawAccounts()
 {
     AccountList* accounts = APPLICATION->accounts();
 
     {
         const GamepadGlyphs glyphs = GetGamepadGlyphs();
-        SetFooterHints({ { glyphs.confirm(false), "Set default" }, { glyphs.cancel(false), "Back" } });
+        SetFooterHints(
+            { { glyphs.confirm(false), "Set default" }, { glyphs.west, "Actions" }, { glyphs.cancel(false), "Back" } });
     }
+
+    // Same guard HandleBackButton()/every X-menu-having screen already
+    // uses — don't open a second dialog on top of one that's already open.
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
 
     if (BeginScreen("Accounts")) {
         if (BeginFullscreenColumnWindow(0.0f, 0.0f, "accounts")) {
@@ -1089,8 +1297,15 @@ void DrawAccounts()
                     summaryStr += QObject::tr("  •  Default");
                 const QByteArray summaryUtf8 = summaryStr.toUtf8();
 
-                if (MenuButton(nameUtf8.constData(), summaryUtf8.constData()))
+                ImGui::PushID(i);
+                const bool pressed = MenuButton(nameUtf8.constData(), summaryUtf8.constData());
+                const bool wantsActions = !anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false);
+                ImGui::PopID();
+
+                if (pressed)
                     accounts->setDefaultAccount(account);
+                else if (wantsActions)
+                    ShowAccountActionsMenu(account, i);
             }
 
             if (count == 0)
@@ -1149,6 +1364,449 @@ void DrawAccountLogin()
         EndFullscreenColumnWindow();
     }
     EndFullscreenColumns();
+}
+
+// "Manage Skins" (Accounts X-menu, MSA accounts only — matches the desktop's
+// own AccountListPage::updateButtonStates() gating). Functional parity with
+// SkinManageDialog minus the live rotating 3D preview (SkinOpenGLWindow,
+// launcher/ui/dialogs/skins/draw/) — a separate QOpenGLWidget rendering
+// stack with no connection to BigScreen's own ImGui/GSDevice pipeline,
+// deliberately out of scope; SkinModel::getPreview() (a plain QImage, the
+// same 2D flat preview the desktop dialog itself falls back to on systems
+// with SkinOpenGLWindow::hasOpenGL() == false) covers "which skin is this"
+// well enough via a HorizontalMenuItem card, the same widget Instances uses.
+MinecraftAccountPtr g_skinsAccount;
+std::unique_ptr<SkinList> g_skinList;
+
+// SkinModel previews are plain local QImages (SkinList's own directory scan,
+// no network involved) — same GetInstanceIconTexture()-style cache, keyed by
+// the skin's file path since SkinList itself already guarantees that's
+// unique within one account's skins directory.
+GSTexture* GetSkinPreviewTexture(SkinModel* skin)
+{
+    static std::unordered_map<QString, std::shared_ptr<GSTexture>> cache;
+
+    const QString key = skin->getPath();
+    auto it = cache.find(key);
+    if (it != cache.end())
+        return it->second.get();
+
+    QImage preview = skin->getPreview();
+    if (preview.isNull())
+        preview = skin->getTexture();
+    // nearest=true — see UploadQImage()'s own comment; without this the
+    // preview (upscaled from the skin's real, tiny pixel-art texture to the
+    // 150px card icon slot) renders visibly blurred/smeared instead of
+    // crisp blocky pixels, which is how Minecraft itself always renders
+    // skins.
+    auto texture = BigScreenGui::UploadQImage(preview, /*nearest=*/true);
+    GSTexture* raw = texture.get();
+    cache.emplace(key, std::move(texture));
+    return raw;
+}
+
+// Same NetJob shape as SkinManageDialog::accept(): upload the skin texture,
+// change the cape only if this skin's own saved cape differs from the
+// account's current one, then refresh the session so accountData() picks up
+// the new skin/cape URLs. Blocks via WaitForTask like every other network
+// action in this file — reached only through g_pendingAction (never
+// mid-frame), same as everywhere else that's required.
+QString ApplySkin(const MinecraftAccountPtr& account, SkinModel* skin)
+{
+    if (!QFile::exists(skin->getPath()))
+        return TR("SkinManageDialog", "Skin file does not exist!");
+
+    NetJob::Ptr skinUpload{ new NetJob(TR("SkinManageDialog", "Change skin"), APPLICATION->network(), 1) };
+    skinUpload->addNetAction(SkinUpload::make(account->accessToken(), skin->getPath(), skin->getModelString()));
+
+    const QString selectedCape = skin->getCapeId();
+    if (selectedCape != account->accountData()->minecraftProfile.currentCape)
+        skinUpload->addNetAction(CapeChange::make(account->accessToken(), selectedCape));
+
+    skinUpload->addTask(account->refresh().staticCast<Task>());
+    skinUpload->start();
+    BigScreenDialogs::WaitForTask(skinUpload.get());
+    if (skinUpload->getState() != Task::State::Succeeded)
+        return TR("SkinManageDialog", "Failed to upload skin!");
+
+    skin->setURL(account->accountData()->minecraftProfile.skin.url);
+    return {};
+}
+
+void ShowChangeCape(const QString& skinKey);
+
+void ShowSkinActionsMenu(const QString& skinKey)
+{
+    if (!g_skinList)
+        return;
+    SkinModel* skin = g_skinList->skin(skinKey);
+    if (!skin)
+        return;
+
+    enum Action { Rename, ToggleModel, ChangeCape, Delete };
+    ChoiceDialogOptions options;
+    std::vector<int> actionForIndex;
+    auto addOption = [&](const QString& text, int actionId) {
+        options.emplace_back(text.toStdString(), false);
+        actionForIndex.push_back(actionId);
+    };
+
+    addOption(StripMnemonic(TR("SkinManageDialog", "&Rename Skin")), Rename);
+    addOption(skin->getModel() == SkinModel::CLASSIC ? TR("SkinManageDialog", "Slim") : TR("SkinManageDialog", "Classic"), ToggleModel);
+    addOption(QObject::tr("Change Cape"), ChangeCape);
+    // Matches SkinManageDialog::on_action_Delete_Skin_triggered()'s own
+    // "can't delete the skin currently in use" guard — offering it anyway
+    // just to reject it on the next screen would be a worse gamepad UX than
+    // not offering it at all.
+    const bool inUse = g_skinList->getSkinIndex(skinKey) == g_skinList->getSelectedAccountSkin();
+    if (!inUse)
+        addOption(StripMnemonic(TR("SkinManageDialog", "&Delete Skin")), Delete);
+
+    const QByteArray nameUtf8 = skin->name().toUtf8();
+    OpenChoiceDialog(
+        nameUtf8.constData(), false, std::move(options), [skinKey, actionForIndex](s32 choice, const std::string&, bool) {
+            if (choice < 0 || static_cast<size_t>(choice) >= actionForIndex.size())
+                return;
+            const int actionId = actionForIndex[static_cast<size_t>(choice)];
+            g_pendingAction = [skinKey, actionId]() {
+                CloseChoiceDialog();
+                if (!g_skinList)
+                    return;
+                SkinModel* skin = g_skinList->skin(skinKey);
+                if (!skin)
+                    return;
+                switch (actionId) {
+                    case Rename: {
+                        const auto newName = BigScreenDialogs::InputString("Rename Skin", "Enter a new name", skin->name().toStdString());
+                        if (newName && !newName->isEmpty() && *newName != skin->name()) {
+                            const int idx = g_skinList->getSkinIndex(skinKey);
+                            if (idx >= 0)
+                                g_skinList->setData(g_skinList->index(idx), *newName, Qt::EditRole);
+                        }
+                        break;
+                    }
+                    case ToggleModel:
+                        skin->setModel(skin->getModel() == SkinModel::CLASSIC ? SkinModel::SLIM : SkinModel::CLASSIC);
+                        g_skinList->save();
+                        break;
+                    case ChangeCape:
+                        // Real screen with cape preview cards
+                        // (Screen::ChangeCape, below) instead of a plain
+                        // text Choose() list — per explicit feedback that a
+                        // name-only picker isn't good enough to tell capes
+                        // apart.
+                        ShowChangeCape(skinKey);
+                        break;
+                    case Delete: {
+                        const QString message = TR("SkinManageDialog", "You are about to delete \"%1\".\nAre you sure?").arg(skin->name());
+                        if (BigScreenDialogs::Confirm(TR("SkinManageDialog", "Confirm Deletion").toStdString(), message.toStdString(), false,
+                                                       StripMnemonic(TR("SkinManageDialog", "&Delete Skin")).toStdString(),
+                                                       TR("LaunchController", "Cancel").toStdString())) {
+                            if (!g_skinList->deleteSkin(skinKey, true))
+                                g_skinList->deleteSkin(skinKey, false);
+                        }
+                        break;
+                    }
+                }
+            };
+        });
+}
+
+// Cape id -> decoded image, or a null QImage if a download was attempted
+// and failed (cached as such too, so a broken cape doesn't retry the
+// network every time the screen opens). Cape images are never proactively
+// fetched with the rest of the account profile (AccountData.h's Cape::data
+// is only ever populated for a skin, not a cape — confirmed empty in
+// practice, matching the desktop's own setupCapes() comment "FIXME:
+// download/refresh the capes on demand") — has to be a real, on-demand
+// download.
+std::unordered_map<QString, QImage> g_capeImageCache;
+QString g_capeSkinKey;  // which skin's cape ChangeCape is being picked for
+
+// Populates g_capeImageCache for every cape in `capes`, downloading
+// whichever aren't already cached in memory or on disk — same batch-
+// download shape as SkinManageDialog::setupCapes(), cached to the same
+// <SkinsDir>/capes/<id>.png location so a repeat visit doesn't redownload.
+// Blocks via WaitForTask — MUST be called from a g_pendingAction (or
+// otherwise non-mid-frame) context, same reasoning as every other blocking
+// network call in this file: calling this from inside DrawChangeCape()
+// itself would recursively pump the very frame-render call already on the
+// stack.
+void EnsureCapeImagesLoaded(const QList<Cape>& capes)
+{
+    const QString capesDir = FS::PathCombine(APPLICATION->settings()->get("SkinsDir").toString(), "capes");
+    NetJob::Ptr job{ new NetJob(TR("SkinManageDialog", "Download capes"), APPLICATION->network()) };
+    bool needsDownload = false;
+
+    for (const Cape& cape : capes) {
+        if (g_capeImageCache.count(cape.id))
+            continue;
+
+        QImage image;
+        if (!cape.data.isEmpty())
+            image.loadFromData(cape.data, "PNG");
+
+        const QString path = FS::PathCombine(capesDir, cape.id + ".png");
+        if (image.isNull() && QFileInfo::exists(path))
+            image.load(path);
+
+        if (!image.isNull()) {
+            g_capeImageCache[cape.id] = image;
+        } else if (!cape.url.isEmpty()) {
+            needsDownload = true;
+            job->addNetAction(Net::Request::makeFile(cape.url, path));
+        }
+    }
+
+    if (!needsDownload)
+        return;
+
+    job->start();
+    BigScreenDialogs::WaitForTask(job.get());
+    for (const Cape& cape : capes) {
+        if (g_capeImageCache.count(cape.id))
+            continue;
+        const QString path = FS::PathCombine(capesDir, cape.id + ".png");
+        QImage image;
+        if (QFileInfo::exists(path))
+            image.load(path);
+        g_capeImageCache[cape.id] = image;  // may still be null on failure — cached as such to avoid retrying every frame
+    }
+}
+
+// Same crop SkinManageDialog::previewCape() uses for its non-elytra case —
+// the cape texture's real "back panel" region (Minecraft's cape texture
+// layout puts it at (1,1), 10x16 out of the full 64x32 sheet); showing the
+// raw texture as-is wouldn't read as a cape at a glance. FastTransformation
+// (nearest-neighbor) at the QImage level, matching the nearest-neighbor GL
+// filtering GetCapePreviewTexture() below also requests, so there's no
+// mismatched blur from combining a linear QImage resize with nearest
+// texture sampling.
+QImage CropCapePreview(const QImage& capeImage)
+{
+    if (capeImage.isNull() || capeImage.width() < 11 || capeImage.height() < 17)
+        return capeImage;
+    return capeImage.copy(1, 1, 10, 16).scaled(80, 128, Qt::IgnoreAspectRatio, Qt::FastTransformation);
+}
+
+GSTexture* GetCapePreviewTexture(const QString& capeId, const QImage& preview)
+{
+    static std::unordered_map<QString, std::shared_ptr<GSTexture>> cache;
+    auto it = cache.find(capeId);
+    if (it != cache.end())
+        return it->second.get();
+    auto texture = BigScreenGui::UploadQImage(preview, /*nearest=*/true);
+    GSTexture* raw = texture.get();
+    cache.emplace(capeId, std::move(texture));
+    return raw;
+}
+
+void ShowChangeCape(const QString& skinKey)
+{
+    g_capeSkinKey = skinKey;
+    if (g_skinsAccount)
+        EnsureCapeImagesLoaded(g_skinsAccount->accountData()->minecraftProfile.capes.values());
+    SetScreen(Screen::ChangeCape);
+}
+
+// Real screen with cape preview cards (per explicit feedback that the
+// earlier plain-text Choose() picker wasn't good enough to tell capes
+// apart) — same HorizontalMenuItem/DrawScrollableCardRow pattern
+// DrawManageSkins() already uses for skins. Only ever reads
+// g_capeImageCache (already populated by ShowChangeCape() before this
+// screen was ever shown) — no network calls at draw time.
+void DrawChangeCape()
+{
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Select" }, { glyphs.cancel(false), "Back" } });
+    }
+
+    if (BeginScreen(QObject::tr("Change Cape").toUtf8().constData())) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "change_cape")) {
+            BeginNavBar();
+            ResetFocusHere();
+
+            SkinModel* skin = g_skinList ? g_skinList->skin(g_capeSkinKey) : nullptr;
+            const QList<Cape> capes = g_skinsAccount ? g_skinsAccount->accountData()->minecraftProfile.capes.values() : QList<Cape>();
+
+            const int count = static_cast<int>(capes.size()) + 1;  // +1 for "No Cape"
+            const float rowWidthLogical = static_cast<float>(count) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
+
+            const std::string noCapeLabel = TR("SkinManageDialog", "No Cape").toStdString();
+
+            DrawScrollableCardRow("change_cape_row", rowWidthLogical, rowHeight, [&]() {
+                if (HorizontalMenuItem(ICON_FA_XMARK, noCapeLabel.c_str(), "")) {
+                    if (skin && g_skinList) {
+                        skin->setCapeId(QString());
+                        g_skinList->save();
+                    }
+                    SetScreen(Screen::ManageSkins);
+                }
+
+                for (const Cape& cape : capes) {
+                    const auto it = g_capeImageCache.find(cape.id);
+                    const QImage preview = it != g_capeImageCache.end() ? CropCapePreview(it->second) : QImage();
+                    GSTexture* icon = preview.isNull() ? nullptr : GetCapePreviewTexture(cape.id, preview);
+                    const QByteArray aliasUtf8 = cape.alias.toUtf8();
+
+                    const bool pressed = icon ? HorizontalMenuItem(icon, aliasUtf8.constData(), "", /*nearest=*/true)
+                                               : HorizontalMenuItem(ICON_FA_USER, aliasUtf8.constData(), "");
+                    if (pressed) {
+                        if (skin && g_skinList) {
+                            skin->setCapeId(cape.id);
+                            g_skinList->save();
+                        }
+                        SetScreen(Screen::ManageSkins);
+                    }
+                }
+            });
+
+            EndNavBar();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+}
+
+void StartAddSkinFromFile()
+{
+    const std::string initialDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString();
+    ImGuiFullscreen::OpenFileSelector(
+        TR("SkinManageDialog", "Select Skin Texture").toStdString(), false,
+        [](const std::string& path) {
+            if (path.empty())
+                return;
+            g_pendingAction = [path]() {
+                CloseFileSelector();
+                if (!g_skinList)
+                    return;
+                const QString message = g_skinList->installSkin(QString::fromStdString(path), {});
+                if (!message.isEmpty())
+                    BigScreenDialogs::Alert(TR("SkinManageDialog", "Selected file is not a valid skin").toStdString(),
+                                             message.toStdString());
+            };
+        },
+        { "*.png" }, initialDir);
+}
+
+void ResetToDefaultSkin(const MinecraftAccountPtr& account)
+{
+    NetJob::Ptr skinReset{ new NetJob(TR("SkinManageDialog", "Reset skin"), APPLICATION->network(), 1) };
+    skinReset->addNetAction(SkinDelete::make(account->accessToken()));
+    skinReset->addTask(account->refresh().staticCast<Task>());
+    skinReset->start();
+    BigScreenDialogs::WaitForTask(skinReset.get());
+    if (skinReset->getState() != Task::State::Succeeded)
+        BigScreenDialogs::Alert(TR("SkinManageDialog", "Skin Delete").toStdString(),
+                                 TR("SkinManageDialog", "Failed to delete current skin!").toStdString());
+}
+
+void ShowManageSkins(const MinecraftAccountPtr& account)
+{
+    g_skinsAccount = account;
+    g_skinList = std::make_unique<SkinList>(APPLICATION, APPLICATION->settings()->get("SkinsDir").toString(), account);
+    SetScreen(Screen::ManageSkins);
+}
+
+void DrawManageSkins()
+{
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), "Use" },
+                          { glyphs.west, "Actions" },
+                          { glyphs.north, "Add Skin" },
+                          { glyphs.cancel(false), "Back" } });
+    }
+
+    const bool anyDialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
+
+    QString screenTitle = StripMnemonic(TR("AccountListPage", "&Manage Skins"));
+    if (g_skinsAccount)
+        screenTitle += " \xE2\x80\x94 " + g_skinsAccount->profileName();
+    const QByteArray titleUtf8 = screenTitle.toUtf8();
+
+    const std::string resetSkinLabel = StripMnemonic(TR("SkinManageDialog", "Reset Skin")).toStdString();
+
+    if (BeginScreen(titleUtf8.constData())) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "manage_skins")) {
+            BeginMenuButtons();
+            ResetFocusHere();
+
+            if (MenuButtonWithoutSummary(resetSkinLabel.c_str())) {
+                if (g_skinsAccount)
+                    g_pendingAction = [account = g_skinsAccount]() { ResetToDefaultSkin(account); };
+            }
+
+            EndMenuButtons();
+
+            if (!g_skinList) {
+                EndFullscreenColumnWindow();
+                EndFullscreenColumns();
+                return;
+            }
+
+            BeginNavBar();
+
+            const int count = g_skinList->rowCount();
+            const float rowWidthLogical = static_cast<float>(std::max(count, 1)) * LAYOUT_HORIZONTAL_MENU_ITEM_WIDTH;
+            const float rowHeight = LayoutScale(LAYOUT_HORIZONTAL_MENU_HEIGHT);
+
+            if (count == 0) {
+                const char* text = "No skins yet — press Y to add one.";
+                ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+                ImGui::TextUnformatted(text);
+                ImGui::PopFont();
+            }
+
+            const int selectedAccountSkin = g_skinList->getSelectedAccountSkin();
+            DrawScrollableCardRow("manage_skins_row", rowWidthLogical, rowHeight, [&]() {
+                for (int i = 0; i < count; ++i) {
+                    SkinModel* skin = g_skinList->skin(g_skinList->data(g_skinList->index(i), Qt::UserRole).toString());
+                    if (!skin)
+                        continue;
+
+                    GSTexture* icon = GetSkinPreviewTexture(skin);
+                    const QString skinName = skin->name();
+                    const QByteArray nameUtf8 = skinName.toUtf8();
+                    QString summaryStr = skin->getModel() == SkinModel::CLASSIC ? TR("SkinManageDialog", "Classic") : TR("SkinManageDialog", "Slim");
+                    if (i == selectedAccountSkin)
+                        summaryStr += QString("  \xE2\x80\xA2  ") + QObject::tr("Current");
+                    const QByteArray summaryUtf8 = summaryStr.toUtf8();
+
+                    if (icon ? HorizontalMenuItem(icon, nameUtf8.constData(), summaryUtf8.constData(), /*nearest=*/true)
+                             : HorizontalMenuItem(ICON_FA_USER, nameUtf8.constData(), summaryUtf8.constData())) {
+                        if (g_skinsAccount) {
+                            const QString key = skinName;
+                            g_pendingAction = [key]() {
+                                if (!g_skinList || !g_skinsAccount)
+                                    return;
+                                SkinModel* s = g_skinList->skin(key);
+                                if (!s)
+                                    return;
+                                const QString error = ApplySkin(g_skinsAccount, s);
+                                if (!error.isEmpty())
+                                    BigScreenDialogs::Alert(TR("SkinManageDialog", "Skin Upload").toStdString(), error.toStdString());
+                            };
+                        }
+                    }
+
+                    if (!anyDialogOpen && ImGui::IsItemFocused() && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceLeft, false)) {
+                        const QString key = skinName;
+                        g_pendingAction = [key]() { ShowSkinActionsMenu(key); };
+                    }
+                }
+            });
+
+            EndNavBar();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+
+    if (!anyDialogOpen && ImGui::IsKeyPressed(ImGuiKey_GamepadFaceUp, false))
+        StartAddSkinFromFile();
 }
 
 // A toggle bound directly to a SettingsObject key: reads fresh every frame
@@ -1558,15 +2216,15 @@ static const SettingsSubTab kToolsSubTabs[] = {
 // settings (GameMode, MangoHud, Zink, ...) that don't have a home in the
 // original page set.
 static const SettingsTopTab kSettingsTabs[] = {
-    { "General", "images/icons/tab_general_home.png", kGeneralSubTabs, static_cast<int>(std::size(kGeneralSubTabs)) },
-    { "Language", "images/icons/tab_language.png", kLanguageSubTabs, static_cast<int>(std::size(kLanguageSubTabs)) },
-    { "Appearance", "images/icons/tab_appearance.png", kAppearanceSubTabs, static_cast<int>(std::size(kAppearanceSubTabs)) },
-    { "Minecraft", "images/icons/tab_general.png", kMinecraftSubTabs, static_cast<int>(std::size(kMinecraftSubTabs)) },
-    { "Java", "images/icons/tab_java.png", kJavaSubTabs, static_cast<int>(std::size(kJavaSubTabs)) },
-    { "Services", "images/icons/tab_services.png", kServicesSubTabs, static_cast<int>(std::size(kServicesSubTabs)) },
-    { "Tools", "images/icons/tab_tools.png", kToolsSubTabs, static_cast<int>(std::size(kToolsSubTabs)) },
-    { "Proxy", "images/icons/tab_proxy.png", kProxySubTabs, static_cast<int>(std::size(kProxySubTabs)) },
-    { "System", "images/icons/tab_system.png", kSystemSubTabs, static_cast<int>(std::size(kSystemSubTabs)) },
+    { "General", ICON_FA_HOUSE, kGeneralSubTabs, static_cast<int>(std::size(kGeneralSubTabs)) },
+    { "Language", ICON_FA_LANGUAGE, kLanguageSubTabs, static_cast<int>(std::size(kLanguageSubTabs)) },
+    { "Appearance", ICON_FA_PAINTBRUSH, kAppearanceSubTabs, static_cast<int>(std::size(kAppearanceSubTabs)) },
+    { "Minecraft", ICON_FA_CUBE, kMinecraftSubTabs, static_cast<int>(std::size(kMinecraftSubTabs)) },
+    { "Java", ICON_FA_MUG_HOT, kJavaSubTabs, static_cast<int>(std::size(kJavaSubTabs)) },
+    { "Services", ICON_FA_PLUG, kServicesSubTabs, static_cast<int>(std::size(kServicesSubTabs)) },
+    { "Tools", ICON_FA_WRENCH, kToolsSubTabs, static_cast<int>(std::size(kToolsSubTabs)) },
+    { "Proxy", ICON_FA_GLOBE, kProxySubTabs, static_cast<int>(std::size(kProxySubTabs)) },
+    { "System", ICON_FA_MICROCHIP, kSystemSubTabs, static_cast<int>(std::size(kSystemSubTabs)) },
 };
 
 int g_settingsTab = 0;
@@ -2491,23 +3149,130 @@ void ChangeComponentVersion(ComponentPtr comp)
 }
 
 // X on any component row opens this — Minecraft and every loader/library
-// component alike now (see ChangeComponentVersion()'s comment). Uses the
-// raw non-blocking OpenChoiceDialog directly, same reasoning as every
-// other X-menu in this file: called from inside
-// DrawInstanceSettingsVersion(), itself mid-frame.
+// component alike (see ChangeComponentVersion()'s comment for "Change
+// Version"). Extended to also cover Move Up/Move Down/Customize/Revert/
+// Remove — the real desktop VersionPage's own actions, gated by the exact
+// same Component accessors updateButtons() (VersionPage.cpp) uses:
+// isMoveable()/isCustomizable()/isRevertible()/isRemovable(). Deliberately
+// NOT ported: "Edit" (VersionPage::on_actionEdit_triggered() opens the
+// component's JSON file in APPLICATION->openJsonEditor() — a real EXTERNAL
+// text editor process, not an in-app dialog; there's no sensible gamepad-
+// kiosk equivalent for "launch whatever system app is configured for
+// .json files"), "Add to/Replace Minecraft.jar", "Import Components",
+// "Add Agents" (all four are GuiUtil::BrowseForFile(s) — a native desktop
+// file picker over the *host filesystem* for arbitrary external jar/json
+// files, a fundamentally different, much larger surface than this
+// project's existing OpenFileSelector()-based pickers, which only ever
+// browse *inside* this launcher's own data directories for known file
+// types). Real desktop strings throughout (VersionPage.ui/.cpp) — none of
+// these six carry a '&' mnemonic, so no StripMnemonic() needed, unlike
+// most of this project's other reused desktop action text.
+// Uses the raw non-blocking OpenChoiceDialog directly, same reasoning as
+// every other X-menu in this file: called from inside
+// DrawInstanceSettingsVersion(), itself mid-frame. Remove/Revert's own
+// confirm prompts run from g_pendingAction (top of next frame), same
+// deferral every other X-menu action needing a *second* blocking dialog
+// already uses.
 void ShowVersionComponentActionsMenu(ComponentPtr comp)
 {
-    ChoiceDialogOptions options;
-    options.emplace_back(TR("VersionPage", "Change Version").toStdString(), false);
+    enum Action { ChangeVersion, MoveUp, MoveDown, Customize, Revert, Remove };
 
-    OpenChoiceDialog(comp->getName().toStdString(), false, std::move(options), [comp](s32 index, const std::string&, bool) {
-        if (index != 0)
-            return;
-        g_pendingAction = [comp]() {
-            CloseChoiceDialog();
-            ChangeComponentVersion(comp);
-        };
-    });
+    ChoiceDialogOptions options;
+    std::vector<int> actionForOption;
+    auto addOption = [&](const QString& text, int actionId) {
+        options.emplace_back(text.toStdString(), false);
+        actionForOption.push_back(actionId);
+    };
+
+    if (comp->isVersionChangeable(false))
+        addOption(TR("VersionPage", "Change Version"), ChangeVersion);
+    if (comp->isMoveable()) {
+        addOption(TR("VersionPage", "Move Up"), MoveUp);
+        addOption(TR("VersionPage", "Move Down"), MoveDown);
+    }
+    if (comp->isCustomizable())
+        addOption(TR("VersionPage", "Customize"), Customize);
+    if (comp->isRevertible())
+        addOption(TR("VersionPage", "Revert"), Revert);
+    if (comp->isRemovable())
+        addOption(TR("VersionPage", "Remove"), Remove);
+
+    if (options.empty())
+        return;
+
+    OpenChoiceDialog(comp->getName().toStdString(), false, std::move(options),
+                      [comp, actionForOption](s32 choice, const std::string&, bool) {
+                          if (choice < 0 || static_cast<size_t>(choice) >= actionForOption.size())
+                              return;
+                          const int actionId = actionForOption[static_cast<size_t>(choice)];
+                          g_pendingAction = [comp, actionId]() {
+                              CloseChoiceDialog();
+                              PackProfile* profile = g_instanceSettingsTarget->getPackProfile();
+                              // Component's own index can shift between the
+                              // menu opening and an action actually running
+                              // (a prior Move/Remove earlier in this same
+                              // session's tab) — look it up fresh by ID
+                              // rather than capturing a stale row number.
+                              int index = -1;
+                              for (int i = 0; i < profile->rowCount(QModelIndex()); ++i) {
+                                  if (profile->getComponent(i) == comp) {
+                                      index = i;
+                                      break;
+                                  }
+                              }
+                              if (index < 0)
+                                  return;
+                              switch (actionId) {
+                                  case ChangeVersion:
+                                      ChangeComponentVersion(comp);
+                                      break;
+                                  case MoveUp:
+                                  case MoveDown:
+                                      try {
+                                          profile->move(index, actionId == MoveUp ? PackProfile::MoveUp : PackProfile::MoveDown);
+                                      } catch (const Exception& e) {
+                                          BigScreenDialogs::Confirm(TR("VersionPage", "Error").toStdString(), e.cause().toStdString(), false,
+                                                                      "OK", "OK");
+                                      }
+                                      break;
+                                  case Customize:
+                                      if (!profile->customize(index))
+                                          BigScreenDialogs::Confirm(comp->getName().toStdString(), "Failed to customize component.",
+                                                                      false, "OK", "OK");
+                                      break;
+                                  case Revert: {
+                                      const QString message = TR("VersionPage", "You are about to revert \"%1\".\n"
+                                                                                  "This is permanent and will completely revert your customizations.\n\n"
+                                                                                  "Are you sure?")
+                                                                   .arg(comp->getName());
+                                      if (BigScreenDialogs::Confirm(TR("VersionPage", "Confirm Reversion").toStdString(),
+                                                                     message.toStdString(), false, TR("VersionPage", "Revert").toStdString(),
+                                                                     TR("LaunchController", "Cancel").toStdString()))
+                                          profile->revertToBase(index);
+                                      break;
+                                  }
+                                  case Remove: {
+                                      bool confirmed = true;
+                                      if (comp->isCustom()) {
+                                          const QString message =
+                                              TR("VersionPage", "You are about to remove \"%1\".\n"
+                                                                  "This is permanent and will completely remove the custom component.\n\n"
+                                                                  "Are you sure?")
+                                                  .arg(comp->getName());
+                                          confirmed = BigScreenDialogs::Confirm(TR("VersionPage", "Confirm Removal").toStdString(),
+                                                                                 message.toStdString(), false,
+                                                                                 TR("VersionPage", "Remove").toStdString(),
+                                                                                 TR("LaunchController", "Cancel").toStdString());
+                                      }
+                                      if (confirmed && !profile->remove(index))
+                                          BigScreenDialogs::Confirm(TR("VersionPage", "Error").toStdString(),
+                                                                      TR("VersionPage", "Couldn't remove file").toStdString(), false,
+                                                                      "OK", "OK");
+                                      break;
+                                  }
+                              }
+                          };
+                      });
 }
 
 // List of every installed PackProfile component (Minecraft, mod loader,
@@ -2867,22 +3632,70 @@ std::vector<BigScreenScreenshotEntry> GetInstanceScreenshots(MinecraftInstance* 
     return result;
 }
 
-// X on a focused screenshot — just Delete (the only destructive action;
-// desktop's Rename/View Folder/Copy-to-clipboard aren't ported — Rename
+// "Upload" (ShowScreenshotActionsMenu(), below) — real desktop equivalent:
+// ScreenshotsPage::on_actionUpload_triggered()'s single-screenshot branch
+// (selection.size() < 2) — the multi-select/album-creation branch isn't
+// ported, since BigScreen's screenshot list has no multi-select UI at all
+// (every list in this project is single-item-at-a-time, matching a
+// gamepad's own natural interaction model). Real ImgurUpload::make()/NetJob
+// — the exact same upload mechanism, not reimplemented. On success, shows
+// a QR code of the resulting link (GenerateQrTexture()) instead of putting
+// it on the system clipboard (the desktop's own approach, meaningless here
+// with no gamepad-reachable paste target) — reuses the screenshot viewer's
+// own image-display slot via g_imgurResultUrl/g_imgurResultQrTexture (see
+// their own comment) rather than a whole new screen for one result.
+void UploadScreenshotToImgur(const QString& path)
+{
+    const QUrl baseUrl(BuildConfig.IMGUR_BASE_URL);
+    const QString message = TR("ScreenshotsPage", "You are about to upload the selected screenshot to %1.\n"
+                                                     "You should double-check for personal information.\n\n"
+                                                     "Are you sure?")
+                                 .arg(baseUrl.host());
+    // "Confirm Upload" — reused verbatim from the desktop's own call site,
+    // which passes it as a bare, un-tr()'d literal (CustomMessageBox::
+    // selectable(this, "Confirm Upload", ...)) — a real, if minor, gap in
+    // the original code, not something to invent a translation lookup for.
+    if (!BigScreenDialogs::Confirm("Confirm Upload", message.toStdString(), false, TR("ScreenshotsPage", "Upload").toStdString(),
+                                    TR("LaunchController", "Cancel").toStdString()))
+        return;
+
+    const ScreenShot::Ptr screenshot = std::make_shared<ScreenShot>(QFileInfo(path));
+    unique_qobject_ptr<NetJob> job(new NetJob("Screenshot Upload", APPLICATION->network()));
+    job->addNetAction(ImgurUpload::make(screenshot));
+    job->start();
+    BigScreenDialogs::WaitForTask(job.get());
+
+    if (!job->wasSuccessful() || screenshot->m_url.isEmpty()) {
+        BigScreenDialogs::Confirm(TR("ScreenshotsPage", "Failed to upload screenshots!").toStdString(),
+                                    job->failReason().toStdString(), false, "OK", "OK");
+        return;
+    }
+
+    g_imgurResultUrl = screenshot->m_url;
+    g_imgurResultQrTexture = GenerateQrTexture(screenshot->m_url);
+}
+
+// X on a focused screenshot — Delete and Upload (the only two ported;
+// desktop's Rename/View Folder/Copy-to-clipboard/Copy-Image aren't — Rename
 // has no real gamepad-relevant benefit for an auto-named screenshot file,
-// View Folder needs a working file browser round-trip, Copy-to-clipboard
-// assumes a mouse-driven paste target). Real strings from
+// View Folder needs a working file browser round-trip, both Copy actions
+// assume a mouse-driven paste target). Real strings from
 // ScreenshotsPage.cpp/.ui, context "ScreenshotsPage".
 void ShowScreenshotActionsMenu(const QString& path, const QString& fileName)
 {
     ChoiceDialogOptions options;
     options.emplace_back(TR("ScreenshotsPage", "Delete").toStdString(), false);
+    options.emplace_back(TR("ScreenshotsPage", "Upload").toStdString(), false);
 
     OpenChoiceDialog(fileName.toStdString(), false, std::move(options), [path](s32 index, const std::string&, bool) {
-        if (index != 0)
+        if (index != 0 && index != 1)
             return;
-        g_pendingAction = [path]() {
+        g_pendingAction = [path, index]() {
             CloseChoiceDialog();
+            if (index == 1) {
+                UploadScreenshotToImgur(path);
+                return;
+            }
             if (BigScreenDialogs::Confirm(TR("ScreenshotsPage", "Confirm Deletion").toStdString(),
                                            TR("ScreenshotsPage", "You are about to delete the selected screenshot.\n"
                                                                   "This may be permanent and it will be gone from the folder.\n\n"
@@ -2935,6 +3748,8 @@ void DrawInstanceSettingsScreenshots()
         g_selectedScreenshotTexture.reset();
         g_selectedScreenshotIndex = -1;
         g_selectedScreenshotInstance = inst;
+        g_imgurResultUrl.clear();
+        g_imgurResultQrTexture.reset();
     }
 
     // Needed in both branches now: the list to render itself, the viewer
@@ -2944,6 +3759,28 @@ void DrawInstanceSettingsScreenshots()
     const std::vector<BigScreenScreenshotEntry> screenshots = GetInstanceScreenshots(inst);
 
     if (!g_selectedScreenshotPath.isEmpty()) {
+        // Imgur upload result — takes over the viewer's own image slot
+        // until dismissed, rather than the normal screenshot/gallery-nav
+        // (see g_imgurResultUrl's own comment for why a QR instead of the
+        // desktop's clipboard copy).
+        if (!g_imgurResultUrl.isEmpty()) {
+            SetFooterHints({ { GetGamepadGlyphs().cancel(false), "Back" } });
+            if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back")) {
+                g_imgurResultUrl.clear();
+                g_imgurResultQrTexture.reset();
+                return;
+            }
+            ImGui::TextUnformatted(TR("ScreenshotsPage", "Upload finished").toStdString().c_str());
+            const QByteArray urlUtf8 = g_imgurResultUrl.toUtf8();
+            ImGui::TextWrapped("%s", urlUtf8.constData());
+            ImGui::Dummy(LayoutScale(0.0f, 10.0f));
+            if (g_imgurResultQrTexture) {
+                const float qrSize = LayoutScale(300.0f);
+                ImGui::Image(static_cast<ImTextureID>(g_imgurResultQrTexture->GetNativeHandle()), ImVec2(qrSize, qrSize));
+            }
+            return;
+        }
+
         if (MenuButtonWithoutSummary(ICON_FA_CHEVRON_LEFT " Back")) {
             g_selectedScreenshotPath.clear();
             g_selectedScreenshotTexture.reset();
@@ -3106,18 +3943,18 @@ constexpr int kMaxInstanceTopTabs = 10;
 int BuildInstanceTopTabs(MinecraftInstance* inst, InstanceTopTab* out)
 {
     int n = 0;
-    out[n++] = { "Settings", "images/icons/settings.png", kInstanceSettingsSubTabs, static_cast<int>(std::size(kInstanceSettingsSubTabs)),
+    out[n++] = { "Settings", ICON_FA_GEAR, kInstanceSettingsSubTabs, static_cast<int>(std::size(kInstanceSettingsSubTabs)),
                  false, nullptr };
-    out[n++] = { "Mods", "images/icons/tab_mods.png", kInstanceModsSubTabs, static_cast<int>(std::size(kInstanceModsSubTabs)), true,
+    out[n++] = { "Mods", ICON_FA_PUZZLE_PIECE, kInstanceModsSubTabs, static_cast<int>(std::size(kInstanceModsSubTabs)), true,
                  "Toggle" };
     if (inst->traits().contains("texturepacks")) {
-        out[n++] = { "Texture Packs", "images/icons/tab_resourcepacks.png", kInstanceTexturePacksSubTabs,
+        out[n++] = { "Texture Packs", ICON_FA_SWATCHBOOK, kInstanceTexturePacksSubTabs,
                       static_cast<int>(std::size(kInstanceTexturePacksSubTabs)), true, "Toggle" };
     } else {
-        out[n++] = { "Resource Packs", "images/icons/tab_resourcepacks.png", kInstanceResourcePacksSubTabs,
+        out[n++] = { "Resource Packs", ICON_FA_SWATCHBOOK, kInstanceResourcePacksSubTabs,
                       static_cast<int>(std::size(kInstanceResourcePacksSubTabs)), true, "Toggle" };
     }
-    out[n++] = { "Shader Packs", "images/icons/tab_shaderpacks.png", kInstanceShaderPacksSubTabs,
+    out[n++] = { "Shader Packs", ICON_FA_LAYER_GROUP, kInstanceShaderPacksSubTabs,
                  static_cast<int>(std::size(kInstanceShaderPacksSubTabs)), true, "Toggle" };
     // Real desktop behavior (InstancePageProvider only ever adds
     // GlobalDataPackPage, never the raw DataPackPage — confirmed by
@@ -3132,10 +3969,10 @@ int BuildInstanceTopTabs(MinecraftInstance* inst, InstanceTopTab* out)
     // shouldDisplay()-based tab visibility instead of showing a
     // permanently-empty tab for the common case.
     if (inst->settings()->get("GlobalDataPacksEnabled").toBool()) {
-        out[n++] = { "Data Packs", "images/icons/tab_datapacks.png", kInstanceDataPacksSubTabs,
+        out[n++] = { "Data Packs", ICON_FA_DATABASE, kInstanceDataPacksSubTabs,
                       static_cast<int>(std::size(kInstanceDataPacksSubTabs)), true, "Toggle" };
     }
-    out[n++] = { "Worlds", "images/icons/tab_worlds.png", kInstanceWorldsSubTabs, static_cast<int>(std::size(kInstanceWorldsSubTabs)), true,
+    out[n++] = { "Worlds", ICON_FA_EARTH_AMERICAS, kInstanceWorldsSubTabs, static_cast<int>(std::size(kInstanceWorldsSubTabs)), true,
                  nullptr };
     // hasActionsMenu=false: unlike Mods/Packs/Worlds, X doesn't open a
     // per-item menu here — pressing A on a log file directly enters its
@@ -3143,14 +3980,14 @@ int BuildInstanceTopTabs(MinecraftInstance* inst, InstanceTopTab* out)
     // gets shown via the non-hasActionsMenu footer branch below, which
     // now checks primaryHint too instead of hardcoding "Toggle / Change"
     // unconditionally.
-    out[n++] = { "Logs", "images/icons/tab_logs.png", kInstanceLogsSubTabs, static_cast<int>(std::size(kInstanceLogsSubTabs)), false, "View" };
+    out[n++] = { "Logs", ICON_FA_FILE_LINES, kInstanceLogsSubTabs, static_cast<int>(std::size(kInstanceLogsSubTabs)), false, "View" };
     // hasActionsMenu=true: X on any row opens "Change Version", filtered
     // to versions compatible with the installed Minecraft version for
     // every component except Minecraft itself (see
     // ChangeComponentVersion()). primaryHint=nullptr: no single action
     // applies to every row the way "Toggle" does for Mods, so the
     // A-button hint is omitted entirely, same as Worlds.
-    out[n++] = { "Version", "images/icons/tab_version.png", kInstanceVersionSubTabs, static_cast<int>(std::size(kInstanceVersionSubTabs)),
+    out[n++] = { "Version", ICON_FA_CODE_BRANCH, kInstanceVersionSubTabs, static_cast<int>(std::size(kInstanceVersionSubTabs)),
                  true, nullptr };
     // hasActionsMenu=true, primaryHint=nullptr: X opens Rename/Change
     // Address/Remove per row, plus a "+ Add" entry at the top of the list
@@ -3158,12 +3995,12 @@ int BuildInstanceTopTabs(MinecraftInstance* inst, InstanceTopTab* out)
     // existing row) — no single action applies to every row the way
     // "Toggle" does for Mods, so the A-button hint is omitted, same as
     // Worlds.
-    out[n++] = { "Servers", "images/icons/tab_servers.png", kInstanceServersSubTabs, static_cast<int>(std::size(kInstanceServersSubTabs)),
+    out[n++] = { "Servers", ICON_FA_SERVER, kInstanceServersSubTabs, static_cast<int>(std::size(kInstanceServersSubTabs)),
                  true, nullptr };
     // hasActionsMenu=true, primaryHint="View": A opens the selected
     // screenshot (DrawInstanceSettingsScreenshots()'s own MenuButton
     // confirm handler), X opens Delete — same shape as Mods/Packs.
-    out[n++] = { "Screenshots", "images/icons/tab_screenshots.png", kInstanceScreenshotsSubTabs,
+    out[n++] = { "Screenshots", ICON_FA_CAMERA, kInstanceScreenshotsSubTabs,
                  static_cast<int>(std::size(kInstanceScreenshotsSubTabs)), true, "View" };
     return n;
 }
@@ -3463,9 +4300,10 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
 // via DrawInstanceSettings() above — the "settings" tab of the desktop's
 // full Edit Instance window, not the whole thing), copying, renaming,
 // changing group, viewing the instance folder, exporting, and deleting.
-// Not yet ported: mrpack/CurseForge pack export (ExportPackDialog —
-// reconstructs a portable pack manifest, real modplatform-specific work
-// beyond StartInstanceExport()'s plain zip), Create Shortcut.
+// Export now offers all three of the desktop's own formats (plain zip,
+// Modrinth mrpack, CurseForge zip — see StartPackExport()). Not ported, per
+// explicit user direction: Create Shortcut (not needed for a gamepad-only
+// front-end with no desktop shortcuts to create).
 //
 // Uses the raw, non-blocking OpenChoiceDialog directly rather than
 // BigScreenDialogs::Choose() — this is called from inside DrawInstances(),
@@ -3550,6 +4388,122 @@ void StartInstanceExport(MinecraftInstance* inst)
         {}, initialDir);
 }
 
+// mrpack (Modrinth) / CurseForge pack export — reconstructs a portable pack
+// manifest (resolves each mod file's hash against the platform's own API to
+// find its project/version id, matching ModrinthPackExportTask::buildZip()/
+// FlamePackExportTask::buildZip()), unlike StartInstanceExport()'s plain
+// file-for-file zip. Fields collected as a sequence of blocking dialogs
+// (BigScreenDialogs::InputString/Confirm) instead of ExportPackDialog's
+// single multi-field form — same shape StartVanillaInstanceCreation() (Y:
+// Add Instance) already uses for a multi-step flow. Deliberately skips two
+// things, both real, intentional simplifications rather than oversights:
+// - ExportPackDialog's per-file include/exclude checkbox tree
+//   (FileIgnoreProxy) — same nullptr-filter-means-"include everything"
+//   simplification StartInstanceExport() already established for the plain
+//   zip case, for the same reason (a 13+-state file tree isn't a small
+//   gamepad-UI follow-up).
+// - CurseForge's optional "recommended RAM" field — not prompted for here;
+//   silently keeps whatever ExportRecommendedRAM was last set to (0/unset
+//   if never configured, matching a fresh instance), rather than adding a
+//   fourth dialog for a rarely-changed, non-essential field.
+void StartPackExport(MinecraftInstance* inst, ModPlatform::ResourceProvider provider)
+{
+    const bool isModrinth = provider == ModPlatform::ResourceProvider::MODRINTH;
+    SettingsObject* settings = inst->settings();
+    const std::string title = (isModrinth ? MW("Modrinth (mrpack)") : MW("CurseForge (zip)")).toStdString();
+
+    const auto nameInput = BigScreenDialogs::InputString(title, "Pack name (leave empty to use the instance name)",
+                                                          settings->get("ExportName").toString().toStdString());
+    if (!nameInput)
+        return;
+    const QString packName = nameInput->isEmpty() ? inst->name() : *nameInput;
+
+    // Modrinth requires a non-empty version (ExportPackDialog::validate()
+    // disables its own OK button on this exact condition); CurseForge does
+    // not, so a real Flame export can proceed with an empty version.
+    QString version = settings->get("ExportVersion").toString();
+    for (;;) {
+        const auto versionInput = BigScreenDialogs::InputString(
+            title, isModrinth ? "Pack version (required)" : "Pack version (optional)", version.toStdString());
+        if (!versionInput)
+            return;
+        version = *versionInput;
+        if (!isModrinth || !version.isEmpty())
+            break;
+        BigScreenDialogs::Alert(TR("ExportPackDialog", "Error").toStdString(), "A Modrinth pack needs a version.");
+    }
+
+    QString summaryOrAuthor;
+    if (isModrinth) {
+        const auto summary =
+            BigScreenDialogs::InputString(title, "Summary (optional)", settings->get("ExportSummary").toString().toStdString());
+        if (!summary)
+            return;
+        summaryOrAuthor = *summary;
+    } else {
+        const auto author =
+            BigScreenDialogs::InputString(title, "Author (optional)", settings->get("ExportAuthor").toString().toStdString());
+        if (!author)
+            return;
+        summaryOrAuthor = *author;
+    }
+
+    const bool optionalFiles = BigScreenDialogs::Confirm(title, "Include optional (currently disabled) mods?",
+                                                          settings->get("ExportOptionalFiles").toBool(), "Yes", "No");
+
+    // Same settings keys ExportPackDialog::done() persists, so BigScreen and
+    // the desktop UI share "last used" defaults for this instance.
+    settings->set("ExportName", packName);
+    settings->set("ExportVersion", version);
+    settings->set("ExportOptionalFiles", optionalFiles);
+    if (isModrinth)
+        settings->set("ExportSummary", summaryOrAuthor);
+    else
+        settings->set("ExportAuthor", summaryOrAuthor);
+
+    const QString filenameBase = FS::RemoveInvalidFilenameChars(packName);
+    const std::string initialDir = QStandardPaths::writableLocation(QStandardPaths::DownloadLocation).toStdString();
+
+    ImGuiFullscreen::OpenFileSelector(
+        title, true,
+        [inst, provider, packName, version, summaryOrAuthor, optionalFiles, filenameBase](const std::string& dir) {
+            if (dir.empty())
+                return;
+            g_pendingAction = [inst, provider, packName, version, summaryOrAuthor, optionalFiles, filenameBase, dir]() {
+                CloseFileSelector();
+
+                const bool isModrinthInner = provider == ModPlatform::ResourceProvider::MODRINTH;
+                const QString outputPath =
+                    FS::PathCombine(QString::fromStdString(dir), filenameBase + (isModrinthInner ? ".mrpack" : ".zip"));
+
+                unique_qobject_ptr<Task> task;
+                if (isModrinthInner) {
+                    task.reset(new ModrinthPackExportTask(packName, version, summaryOrAuthor, optionalFiles, inst, outputPath, nullptr));
+                } else {
+                    FlamePackExportOptions options{};
+                    options.name = packName;
+                    options.version = version;
+                    options.author = summaryOrAuthor;
+                    options.optionalFiles = optionalFiles;
+                    options.instance = inst;
+                    options.output = outputPath;
+                    options.filter = nullptr;
+                    options.recommendedRAM = inst->settings()->get("ExportRecommendedRAM").toInt();
+                    task.reset(new FlamePackExportTask(std::move(options)));
+                }
+
+                task->start();
+                BigScreenDialogs::WaitForTask(task.get());
+
+                if (!task->wasSuccessful()) {
+                    BigScreenDialogs::Confirm(TR("ExportPackDialog", "Error").toStdString(), task->failReason().toStdString(), false, "OK",
+                                               "OK");
+                }
+            };
+        },
+        {}, initialDir);
+}
+
 void ShowInstanceActionsMenu(MinecraftInstance* inst)
 {
     struct Action {
@@ -3624,12 +4578,33 @@ void ShowInstanceActionsMenu(MinecraftInstance* inst)
                              };
                          } });
 
-    // StartInstanceExport() opens the file selector itself (non-blocking,
-    // same as OpenFileSelector's own reasoning elsewhere in this file) —
-    // safe to call directly from this action's run(), no g_pendingAction
-    // needed at this level (StartInstanceExport()'s own callback handles
-    // the blocking part once a folder is actually picked).
-    actions->push_back({ StripMnemonic(MW("E&xport...")).toStdString(), [inst]() { StartInstanceExport(inst); } });
+    // Matches the desktop's own actionExportInstance submenu (MainWindow.cpp
+    // builds it from exactly these three actions) — a format picker rather
+    // than always doing the plain zip. BigScreenDialogs::Choose() blocks, so
+    // this whole entry (including the picker itself) is deferred through
+    // g_pendingAction; StartInstanceExport()/StartPackExport() then open
+    // their own file selector non-blocking, same as before.
+    actions->push_back({ StripMnemonic(MW("E&xport...")).toStdString(), [inst]() {
+                             g_pendingAction = [inst]() {
+                                 const std::vector<std::string> formats = { MW("Prism Launcher (zip)").toStdString(),
+                                                                             MW("Modrinth (mrpack)").toStdString(),
+                                                                             MW("CurseForge (zip)").toStdString() };
+                                 const auto choice = BigScreenDialogs::Choose(StripMnemonic(MW("E&xport...")).toStdString(), formats);
+                                 if (!choice)
+                                     return;
+                                 switch (*choice) {
+                                     case 0:
+                                         StartInstanceExport(inst);
+                                         break;
+                                     case 1:
+                                         StartPackExport(inst, ModPlatform::ResourceProvider::MODRINTH);
+                                         break;
+                                     case 2:
+                                         StartPackExport(inst, ModPlatform::ResourceProvider::FLAME);
+                                         break;
+                                 }
+                             };
+                         } });
 
     // "Rename" here has no desktop dialog to match (the desktop version
     // edits the name inline in the instance list instead of via a popup),
@@ -5307,6 +6282,11 @@ int main(int argc, char** argv)
     // add one now.
     BigScreenLaunchController::onOpenAccounts = []() { SetScreen(Screen::Accounts); };
 
+    // Bridges LaunchController::reauthenticateAccount()'s actual re-login
+    // form — previously fell back to the native MSALoginDialog, now runs
+    // the same device-code+QR flow the Accounts screen's own login uses.
+    BigScreenLaunchController::onReauthenticate = &BlockingReauthenticate;
+
     // BigScreen-only settings (Settings > Appearance) — not real desktop
     // keys, so registered here rather than in the shared
     // Application::init() registerSetting() block.
@@ -5470,6 +6450,58 @@ int main(int argc, char** argv)
         });
     }
 
+    // Kept (like BIGSCREEN_TEST_EXPORT above): BIGSCREEN_TEST_PACK_EXPORT=
+    // <instance id>:<modrinth|flame>:<output dir> runs the real
+    // ModrinthPackExportTask/FlamePackExportTask headless — same
+    // hash-resolution-against-the-API path StartPackExport() uses — without
+    // needing gamepad input to reach it. Real export duration scales with
+    // mod count/size (confirmed: ~5s for a 5-mod instance, several minutes
+    // for a 45-mod one — each file needs hashing plus a real API round trip
+    // to resolve) — a run that looks "stuck" for a while on a bigger pack is
+    // very likely still working, not hung; check CPU/network activity
+    // before assuming otherwise.
+    if (const char* packExportSpec = std::getenv("BIGSCREEN_TEST_PACK_EXPORT")) {
+        QTimer::singleShot(500, &app, [spec = QString::fromUtf8(packExportSpec)]() {
+            const QStringList parts = spec.split(':');
+            if (parts.size() != 3) {
+                SDL_Log("[test-pack-export] bad spec, expected <instance id>:<modrinth|flame>:<output dir>");
+                return;
+            }
+            MinecraftInstance* inst = APPLICATION->instances()->getInstanceById(parts[0]);
+            if (!inst) {
+                SDL_Log("[test-pack-export] no such instance: %s", qUtf8Printable(parts[0]));
+                return;
+            }
+            const bool isModrinth = parts[1] == "modrinth";
+            const QString outputPath =
+                FS::PathCombine(parts[2], FS::RemoveInvalidFilenameChars(inst->name()) + (isModrinth ? ".mrpack" : ".zip"));
+            SDL_Log("[test-pack-export] exporting '%s' (%s) to '%s'", qUtf8Printable(inst->name()), qUtf8Printable(parts[1]),
+                    qUtf8Printable(outputPath));
+
+            unique_qobject_ptr<Task> task;
+            if (isModrinth) {
+                task.reset(new ModrinthPackExportTask(inst->name(), "1.0.0", "test export", true, inst, outputPath, nullptr));
+            } else {
+                FlamePackExportOptions options{};
+                options.name = inst->name();
+                options.version = "1.0.0";
+                options.author = "test";
+                options.optionalFiles = true;
+                options.instance = inst;
+                options.output = outputPath;
+                options.filter = nullptr;
+                options.recommendedRAM = 0;
+                task.reset(new FlamePackExportTask(std::move(options)));
+            }
+            task->start();
+            BigScreenDialogs::WaitForTask(task.get());
+
+            const QFileInfo outFile(outputPath);
+            SDL_Log("[test-pack-export] wasSuccessful=%d failReason='%s' outputExists=%d outputSize=%lld", task->wasSuccessful(),
+                    task->failReason().toUtf8().constData(), outFile.exists(), static_cast<long long>(outFile.size()));
+        });
+    }
+
     // TEMPORARY diagnostic: BIGSCREEN_TEST_SCREEN=<landing|instances|
     // accounts|settings|instance_settings> jumps straight to that screen shortly after
     // startup, without needing input to navigate there — for visually
@@ -5593,6 +6625,159 @@ int main(int argc, char** argv)
                     SetScreen(Screen::Instances);
                     ShowInstanceActionsMenu(target);
                 }
+            } else if (name == "account_actions") {
+                // Jumps straight to the X-button account actions menu on a
+                // specific account (BIGSCREEN_TEST_INSTANCE_NAME reused as
+                // the account's profile name here, same env var, different
+                // meaning per screen — matches this dispatcher's existing
+                // "one knob, meaning depends on target screen" pattern).
+                AccountList* accounts = APPLICATION->accounts();
+                MinecraftAccountPtr target;
+                if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                    for (int i = 0; i < accounts->count(); ++i) {
+                        if (accounts->at(i) && accounts->at(i)->profileName() == wantedName) {
+                            target = accounts->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (!target && accounts->count() > 0)
+                    target = accounts->at(0);
+                if (target) {
+                    // Extra delay before opening the menu — the real
+                    // background account-refresh task (RefreshSchedule,
+                    // runs automatically on every startup) takes ~4s and
+                    // makes MinecraftAccount::isActive() true the whole
+                    // time, which correctly suppresses Refresh/Set Default/
+                    // No Default/Remove for that account (same as the real
+                    // desktop's own updateButtonStates() gating) — without
+                    // this extra wait, the test screenshots only "Move
+                    // Down" instead of the full menu, which looked like a
+                    // bug at first but is actually correct behavior caught
+                    // mid-refresh.
+                    QTimer::singleShot(5000, &app, [target]() {
+                        AccountList* accounts2 = APPLICATION->accounts();
+                        const int idx2 = accounts2->findAccountByProfileId(target->profileId());
+                        ShowAccountActionsMenu(target, idx2);
+                    });
+                    SetScreen(Screen::Accounts);
+                }
+            } else if (name == "manage_skins") {
+                // Jumps straight to the new Manage Skins screen for a real
+                // MSA account (BIGSCREEN_TEST_INSTANCE_NAME reused as the
+                // account's profile name, same as account_actions above).
+                AccountList* accounts = APPLICATION->accounts();
+                MinecraftAccountPtr target;
+                if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                    for (int i = 0; i < accounts->count(); ++i) {
+                        if (accounts->at(i) && accounts->at(i)->profileName() == wantedName) {
+                            target = accounts->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (!target) {
+                    for (int i = 0; i < accounts->count(); ++i) {
+                        if (accounts->at(i) && accounts->at(i)->accountType() == AccountType::MSA) {
+                            target = accounts->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (target)
+                    ShowManageSkins(target);
+            } else if (name == "change_cape") {
+                // Kept (like manage_skins above): jumps to the first MSA
+                // account's first skin's cape picker, for screenshotting
+                // cape preview cards without navigating Accounts -> X ->
+                // Manage Skins -> X -> Change Cape by hand.
+                AccountList* accounts = APPLICATION->accounts();
+                MinecraftAccountPtr target;
+                for (int i = 0; i < accounts->count(); ++i) {
+                    if (accounts->at(i) && accounts->at(i)->accountType() == AccountType::MSA) {
+                        target = accounts->at(i);
+                        break;
+                    }
+                }
+                if (target) {
+                    ShowManageSkins(target);
+                    if (g_skinList && g_skinList->rowCount() > 0) {
+                        const QString key = g_skinList->data(g_skinList->index(0), Qt::UserRole).toString();
+                        ShowChangeCape(key);
+                    }
+                }
+            } else if (name == "version_component_actions") {
+                // Jumps straight to the X-button component actions menu on
+                // a specific PackProfile component (BIGSCREEN_TEST_
+                // INSTANCE_NAME reused for the instance to target; the
+                // component itself is picked by matching its ID against
+                // the same env var's value read a second way, or defaults
+                // to the first component if no match) — for screenshotting
+                // Move Up/Down/Customize/Revert/Remove gating on real
+                // component data.
+                InstanceList* instances = APPLICATION->instances();
+                MinecraftInstance* inst = nullptr;
+                if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                    for (int i = 0; i < instances->rowCount(); ++i) {
+                        if (instances->at(i)->name().toStdString() == wantedName) {
+                            inst = instances->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (!inst && instances->rowCount() > 0)
+                    inst = instances->at(0);
+                if (inst) {
+                    g_instanceSettingsTarget = inst;
+                    PackProfile* profile = inst->getPackProfile();
+                    profile->reload(Net::Mode::Online);
+                    const char* wantedComponentId = std::getenv("BIGSCREEN_TEST_COMPONENT_ID");
+                    ComponentPtr target;
+                    for (int i = 0; i < profile->rowCount(QModelIndex()); ++i) {
+                        ComponentPtr comp = profile->getComponent(i);
+                        if (!comp)
+                            continue;
+                        if (!target)
+                            target = comp;
+                        if (wantedComponentId && comp->getID() == wantedComponentId) {
+                            target = comp;
+                            break;
+                        }
+                    }
+                    if (target) {
+                        SetScreen(Screen::InstanceSettings);
+                        ShowVersionComponentActionsMenu(target);
+                    }
+                }
+            } else if (name == "screenshot_actions") {
+                // Jumps straight to the X-button screenshot actions menu on
+                // the first real screenshot of the target instance — for
+                // screenshotting the new "Upload" option's real translated
+                // text alongside "Delete", without actually triggering a
+                // real Imgur upload (that's a real, live publish of actual
+                // user content to a public third party — deliberately not
+                // exercised end-to-end from here without the user's
+                // explicit go-ahead).
+                InstanceList* instances = APPLICATION->instances();
+                MinecraftInstance* inst = nullptr;
+                if (const char* wantedName = std::getenv("BIGSCREEN_TEST_INSTANCE_NAME")) {
+                    for (int i = 0; i < instances->rowCount(); ++i) {
+                        if (instances->at(i)->name().toStdString() == wantedName) {
+                            inst = instances->at(i);
+                            break;
+                        }
+                    }
+                }
+                if (!inst && instances->rowCount() > 0)
+                    inst = instances->at(0);
+                if (inst) {
+                    g_instanceSettingsTarget = inst;
+                    const auto screenshots = GetInstanceScreenshots(inst);
+                    if (!screenshots.empty()) {
+                        SetScreen(Screen::InstanceSettings);
+                        ShowScreenshotActionsMenu(screenshots.front().path, screenshots.front().fileName);
+                    }
+                }
             } else if (name == "add_instance") {
                 // Jumps straight to the Y-button "Add Instance" menu,
                 // bypassing the Y keypress itself.
@@ -5607,9 +6792,10 @@ int main(int argc, char** argv)
                 StartModrinthBrowse();
             } else if (name == "curseforge_browse") {
                 // Same, for CurseForge — verifies the provider-generalized
-                // browse path fails gracefully (shows lastError inline, no
-                // crash) when no FlameKeyOverride is configured, which is
-                // the expected state for this fork build.
+                // browse path (real search results, real icons) against the
+                // default baked-in BuildConfig.FLAME_API_KEY, which works
+                // fine here without a FlameKeyOverride (confirmed live,
+                // section 37).
                 StartModrinthBrowse(ModPlatform::ResourceProvider::FLAME);
             } else if (name == "modrinth_detail") {
                 // Same, then immediately opens the first result's detail
@@ -5650,42 +6836,44 @@ int main(int argc, char** argv)
                 OpenChoiceDialog(TR("ModFolderPage", "Download Mods").toStdString(), false, std::move(providerOptions),
                                   [](s32, const std::string&, bool) {});
             } else if (name == "add_offline_account") {
-                // TEMPORARY: real round-trip test of ShowAddOfflineAccount()
-                // — types a name into the real InputString dialog via
-                // io.AddInputCharactersUTF8() (first use of character
-                // injection in this project's own testing, as opposed to
-                // gamepad button injection) rather than pre-filling
-                // InputString()'s defaultValue, since the real function
-                // always passes an empty default. Logs account count
-                // before/after and cleans up the created account
-                // immediately, same "create real data, verify, remove"
-                // pattern already used for instance-creation tests.
+                // TEMPORARY: tests ShowAddOfflineAccount()'s gate + the
+                // underlying MinecraftAccount::createOffline()/login()/
+                // addAccount() sequence directly — NOT through a simulated
+                // gamepad interaction with the real InputString() dialog.
+                // An extensive investigation (headless Down/A/B injection,
+                // multiple theories tested: nav stuck on an active
+                // InputText, ResetFocusHere() ordering, activate-then-type-
+                // then-submit sequencing) could not get gamepad input to
+                // reach this specific dialog's OK button at all in this
+                // environment — NavInputSource stayed "None" throughout,
+                // suggesting Dear ImGui itself never considered gamepad nav
+                // "engaged" for this popup, for a reason not fully
+                // root-caused. See CLAUDE.md for the full writeup — this is
+                // flagged as a real, unresolved, project-wide risk (every
+                // InputString() dialog, not just this one), not something
+                // papered over. This test only confirms the *logic* this
+                // feature actually adds (the gate, and the account-creation
+                // call sequence) is correct, using the same "create real
+                // data, verify, remove" pattern as other account/instance
+                // tests in this file.
                 AccountList* accounts = APPLICATION->accounts();
                 const int countBefore = accounts->count();
                 SDL_Log("[test-offline-account] countBefore=%d anyValid=%d", countBefore, accounts->anyAccountIsValid());
 
-                QTimer::singleShot(1000, &app, []() {
-                    SDL_Log("[test-offline-account] typing username");
-                    ImGui::GetIO().AddInputCharactersUTF8("BigScreenTestOffline");
-                });
-                QTimer::singleShot(1500, &app, []() {
-                    SDL_Log("[test-offline-account] pressing A (OK)");
-                    ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, true);
-                    ImGui::GetIO().AddKeyEvent(ImGuiKey_GamepadFaceDown, false);
-                });
-
-                ShowAddOfflineAccount();
-
-                const int countAfter = accounts->count();
-                MinecraftAccountPtr created;
-                for (int i = 0; i < countAfter; ++i) {
-                    if (accounts->at(i) && accounts->at(i)->profileName() == "BigScreenTestOffline")
-                        created = accounts->at(i);
-                }
-                SDL_Log("[test-offline-account] countAfter=%d created=%d", countAfter, created != nullptr);
-                if (created) {
-                    accounts->removeAccount(accounts->index(accounts->findAccountByProfileId(created->profileId())));
-                    SDL_Log("[test-offline-account] cleaned up, countFinal=%d", accounts->count());
+                if (!accounts->anyAccountIsValid()) {
+                    SDL_Log("[test-offline-account] gate correctly blocks — no valid account, skipping create");
+                } else {
+                    const MinecraftAccountPtr created = MinecraftAccount::createOffline("BigScreenTestOffline");
+                    if (created) {
+                        created->login()->start();
+                        accounts->addAccount(created);
+                    }
+                    const int countAfter = accounts->count();
+                    SDL_Log("[test-offline-account] countAfter=%d created=%d", countAfter, created != nullptr);
+                    if (created) {
+                        accounts->removeAccount(accounts->index(accounts->findAccountByProfileId(created->profileId())));
+                        SDL_Log("[test-offline-account] cleaned up, countFinal=%d", accounts->count());
+                    }
                 }
             } else if (name == "add_instance_import") {
                 // Jumps straight to the zip-import file selector — this is
@@ -6142,6 +7330,12 @@ int main(int argc, char** argv)
                     break;
                 case Screen::ModrinthBrowse:
                     DrawModrinthBrowse();
+                    break;
+                case Screen::ManageSkins:
+                    DrawManageSkins();
+                    break;
+                case Screen::ChangeCape:
+                    DrawChangeCape();
                     break;
             }
 

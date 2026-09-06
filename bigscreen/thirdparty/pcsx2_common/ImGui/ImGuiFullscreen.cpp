@@ -2112,7 +2112,59 @@ void ImGuiFullscreen::EndHorizontalMenu()
 	EndFullscreenWindow();
 }
 
-bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0, const ImVec2& icon_uv1, const char* title, const char* description)
+// Nested inside ImGuiFullscreen (rather than a plain file-scope anonymous
+// namespace) specifically so this helper's body still gets unqualified
+// lookup of the namespace's own members (LayoutScale, g_large_font,
+// s_menu_button_index, ...) the same way the qualified-name function
+// definitions below it do — a plain `namespace { ... }` here compiled but
+// couldn't see any of those.
+namespace ImGuiFullscreen {
+namespace {
+// Shared by every HorizontalMenuItem overload below — only the icon slot's
+// contents differ between them (an uploaded texture vs. a font glyph), so
+// this takes that as a callback instead of duplicating the ~90 lines of
+// item-sizing/hover/frame/title/description layout three times.
+using HorizontalMenuIconDrawFn = std::function<void(ImDrawList*, const ImVec2& icon_pos, float icon_size)>;
+
+// Dear ImGui's OpenGL3 backend (imgui_impl_opengl3.cpp) binds its own
+// sampler object (GL_LINEAR) via glBindSampler() once per RenderDrawData()
+// call, on any GL 3.3+/GLES 3.0+ context — confirmed by reading it — and a
+// bound sampler object overrides whatever glTexParameteri() a texture was
+// created with (GSDeviceCompat::CreateTexture()'s own nearest/linear
+// filter argument, see its comment). That backend does expose exactly the
+// callback functions needed to switch samplers mid-draw-list
+// (ImGui_ImplOpenGL3_DrawCallback_SetSampler{Linear,Nearest}), but they're
+// file-local statics, not part of its public header — these are BigScreen's
+// own equivalent, using its own sampler objects instead of reaching into
+// that backend's private data.
+GLuint GetNearestSampler()
+{
+	static GLuint sampler = 0;
+	if (!sampler)
+	{
+		glGenSamplers(1, &sampler);
+		glSamplerParameteri(sampler, GL_TEXTURE_MIN_FILTER, GL_NEAREST);
+		glSamplerParameteri(sampler, GL_TEXTURE_MAG_FILTER, GL_NEAREST);
+	}
+	return sampler;
+}
+
+GLuint GetLinearSampler()
+{
+	static GLuint sampler = 0;
+	if (!sampler)
+	{
+		glGenSamplers(1, &sampler);
+		glSamplerParameteri(sampler, GL_TEXTURE_MIN_FILTER, GL_LINEAR);
+		glSamplerParameteri(sampler, GL_TEXTURE_MAG_FILTER, GL_LINEAR);
+	}
+	return sampler;
+}
+
+void SetNearestSamplerCallback(const ImDrawList*, const ImDrawCmd*) { glBindSampler(0, GetNearestSampler()); }
+void SetLinearSamplerCallback(const ImDrawList*, const ImDrawCmd*) { glBindSampler(0, GetLinearSampler()); }
+
+bool HorizontalMenuItemImpl(const char* title, const char* description, const HorizontalMenuIconDrawFn& drawIcon)
 {
 	ImGuiWindow* window = ImGui::GetCurrentWindow();
 	if (window->SkipItems)
@@ -2185,7 +2237,7 @@ bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0
 	const ImVec2 icon_pos = bb.Min + ImVec2((avail_width - icon_size) * 0.5f, 0.0f);
 
 	ImDrawList* dl = ImGui::GetWindowDrawList();
-	dl->AddImage(static_cast<ImTextureID>(icon->GetNativeHandle()), icon_pos, icon_pos + ImVec2(icon_size, icon_size), icon_uv0, icon_uv1);
+	drawIcon(dl, icon_pos, icon_size);
 
 	const std::pair<ImFont*, float> title_font = g_large_font;
 	const ImVec2 title_size = title_font.first->CalcTextSizeA(title_font.second, size.x, 0.0f, title);
@@ -2207,9 +2259,61 @@ bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0
 	return pressed;
 }
 
-bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const char* title, const char* description)
+}  // namespace
+}  // namespace ImGuiFullscreen
+
+bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0, const ImVec2& icon_uv1, const char* title, const char* description, bool nearest)
 {
-	return HorizontalMenuItem(icon, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), title, description);
+	return HorizontalMenuItemImpl(title, description, [icon, icon_uv0, icon_uv1, nearest](ImDrawList* dl, const ImVec2& icon_pos, float icon_size) {
+		// Fit the selected UV region's real aspect ratio within the square
+		// icon slot (centered, letterboxed) instead of stretching it to
+		// fill — every caller here had historically been pre-square (app/
+		// instance icons, generated at exactly the icon slot's resolution),
+		// so this was a no-op in practice until skin/cape previews
+		// (genuinely non-square — a cape crop's real ~5:8 portrait shape)
+		// started using this same overload and came out visibly squashed.
+		const float regionW = static_cast<float>(icon->GetWidth()) * std::abs(icon_uv1.x - icon_uv0.x);
+		const float regionH = static_cast<float>(icon->GetHeight()) * std::abs(icon_uv1.y - icon_uv0.y);
+		ImVec2 drawPos = icon_pos;
+		ImVec2 drawSize(icon_size, icon_size);
+		if (regionW > 0.0f && regionH > 0.0f)
+		{
+			const float scale = std::min(icon_size / regionW, icon_size / regionH);
+			drawSize = ImVec2(regionW * scale, regionH * scale);
+			drawPos = icon_pos + ImVec2((icon_size - drawSize.x) * 0.5f, (icon_size - drawSize.y) * 0.5f);
+		}
+
+		// See GetNearestSampler()'s comment — without this, per-texture
+		// nearest filtering (GSDeviceCompat::CreateTexture()'s own
+		// argument) is silently overridden by Dear ImGui's own bound
+		// sampler object for every draw, not just this one.
+		if (nearest)
+			dl->AddCallback(SetNearestSamplerCallback, nullptr);
+		dl->AddImage(static_cast<ImTextureID>(icon->GetNativeHandle()), drawPos, drawPos + drawSize, icon_uv0, icon_uv1);
+		if (nearest)
+			dl->AddCallback(SetLinearSamplerCallback, nullptr);
+	});
+}
+
+bool ImGuiFullscreen::HorizontalMenuItem(GSTexture* icon, const char* title, const char* description, bool nearest)
+{
+	return HorizontalMenuItem(icon, ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f), title, description, nearest);
+}
+
+bool ImGuiFullscreen::HorizontalMenuItem(const char* icon_glyph, const char* title, const char* description)
+{
+	return HorizontalMenuItemImpl(title, description, [icon_glyph](ImDrawList* dl, const ImVec2& icon_pos, float icon_size) {
+		// g_large_font's own configured size is sized for title text, much
+		// smaller than the 150x150 (LayoutScale'd) icon slot the
+		// texture-based cards fill entirely — request a much bigger size
+		// from the same font (it's merged with the icon fonts at load time,
+		// see BigScreenGui::LoadFonts) rather than introducing a fourth
+		// font pair just for this.
+		const float glyph_font_size = icon_size * 0.7f;
+		const ImVec2 glyph_size = g_large_font.first->CalcTextSizeA(glyph_font_size, FLT_MAX, 0.0f, icon_glyph);
+		const ImVec2 glyph_pos = icon_pos + ImVec2((icon_size - glyph_size.x) * 0.5f, (icon_size - glyph_size.y) * 0.5f);
+		dl->AddText(g_large_font.first, glyph_font_size, glyph_pos, ImGui::GetColorU32(ImGuiCol_Text), icon_glyph);
+	});
 }
 
 bool ImGuiFullscreen::HorizontalMenuSvgItem(const char* svg_path, const char* title, const char* description, SvgScaling mode)
@@ -2741,10 +2845,29 @@ void ImGuiFullscreen::DrawInputDialog()
 		if (!is_open)
 			ImGui::CloseCurrentPopup();
 
-		ResetFocusHere();
+		// BigScreen fix: ResetFocusHere() used to run *before*
+		// BeginMenuButtons() here — the only one of this file's three
+		// dialog-drawing functions ordered that way (DrawChoiceDialog()/
+		// DrawMessageDialog() both call BeginMenuButtons() first, then
+		// ResetFocusHere() — confirmed by reading both directly). Real,
+		// reproducible consequence, not just a style nit: ResetFocusHere()
+		// consumes s_focus_reset_queued (sets it back to None) as soon as
+		// it runs, so by the time the InputText's own `if
+		// (s_focus_reset_queued != FocusResetType::None)
+		// ImGui::SetKeyboardFocusHere();` check ran further down, the flag
+		// was already spent — that call never fired, gamepad nav never
+		// properly entered this dialog's button/field group at all, and
+		// D-pad Down/A could never leave the stale pre-dialog NavId to
+		// reach the field or the OK/Cancel buttons below it — confirmed via
+		// a headless test injecting Down/A/B repeatedly against a real,
+		// non-empty pre-filled field: NavId never moved, OK never fired,
+		// even a real B press left the dialog open with NavId unchanged.
+		// Moving this call after BeginMenuButtons(), matching both
+		// siblings, fixes the ordering that was starving it.
 		ImGui::TextWrapped("%s", s_input_dialog_message.c_str());
 
 		BeginMenuButtons();
+		ResetFocusHere();
 
 		ImGui::SetCursorPosY(ImGui::GetCursorPosY() + LayoutScale(10.0f));
 
@@ -2782,7 +2905,24 @@ void ImGuiFullscreen::DrawInputDialog()
 			return 0;
 		};
 
-		ImGuiInputTextFlags flags = ImGuiInputTextFlags_None;
+		// BigScreen fix: EnterReturnsTrue — confirmed by a headless test
+		// (repeated Down/A/B injection against a real, non-empty field)
+		// that gamepad Down never moves nav focus away from an *active*
+		// InputText to reach the OK button below it: this dialog is a
+		// BeginPopupModal(), and Dear ImGui's own NavUpdateCancelRequest()
+		// explicitly excludes modal windows from its built-in "Cancel
+		// releases the active widget back to nav" behavior (confirmed by
+		// reading imgui.cpp directly — the same modal exemption already
+		// documented for DrawChoiceDialog()'s X-button removal). With no
+		// built-in escape and no bespoke one added here, OK was never
+		// reachable by gamepad once typing began. Rather than build a
+		// custom "release the active widget without closing the whole
+		// dialog" mechanism, this makes A submit directly while typing:
+		// ImGuiKey_NavGamepadActivate (A) already acts as Enter for an
+		// *active* text widget in Dear ImGui's own gamepad-nav handling,
+		// so EnterReturnsTrue turns that into InputText() returning true,
+		// treated below exactly like the OK button firing.
+		ImGuiInputTextFlags flags = ImGuiInputTextFlags_EnterReturnsTrue;
 		if (s_input_dialog_filter_type == InputFilterType::Numeric || s_input_dialog_filter_type == InputFilterType::IPAddress)
 			flags |= ImGuiInputTextFlags_CallbackCharFilter;
 		else if (s_input_dialog_filter_type == InputFilterType::Password)
@@ -2802,7 +2942,8 @@ void ImGuiFullscreen::DrawInputDialog()
 
 		const bool needs_char_filter_callback =
 			(s_input_dialog_filter_type == InputFilterType::Numeric || s_input_dialog_filter_type == InputFilterType::IPAddress);
-		ImGui::InputText("##input", &s_input_dialog_text, flags, needs_char_filter_callback ? input_callback : nullptr,
+		const bool enter_pressed = ImGui::InputText("##input", &s_input_dialog_text, flags,
+			needs_char_filter_callback ? input_callback : nullptr,
 			needs_char_filter_callback ? static_cast<void*>(&s_input_dialog_filter_type) : nullptr);
 
 		ImGui::PopStyleColor(5);
@@ -2812,7 +2953,7 @@ void ImGuiFullscreen::DrawInputDialog()
 
 		const bool ok_enabled = !s_input_dialog_text.empty();
 
-		if (ActiveButton(s_input_dialog_ok_text.c_str(), false, ok_enabled) && ok_enabled)
+		if ((ActiveButton(s_input_dialog_ok_text.c_str(), false, ok_enabled) || (enter_pressed && ok_enabled)) && ok_enabled)
 		{
 			// have to move out in case they open another dialog in the callback
 			InputStringDialogCallback cb(std::move(s_input_dialog_callback));

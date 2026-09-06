@@ -120,6 +120,18 @@ class LaunchController : public Task {
     // JavaCommon::checkJVMArgs(jvmargs, m_parentWidget), which shows a
     // native warning QMessageBox and returns false if a problem was found.
     virtual bool checkJvmArgsValid(const QString& jvmargs);
+    // The three profiler-related prompts in readyForLaunch() (only reached
+    // when a launch profiler like JProfiler/JVisualVM is configured for the
+    // instance — an advanced, rare setup). Defaults are exactly the
+    // original inline QMessageBox calls; BigScreen overrides all three with
+    // its own single-button info dialog (see
+    // bigscreen/core/BigScreenLaunchController.*), since none of them had
+    // ever been touched by the earlier LaunchController virtual-method
+    // refactor and previously would have popped up a native, gamepad-
+    // unusable QWidget over BigScreen's fullscreen SDL window.
+    virtual void profilerCheckFailed(const QString& profilerName, const QString& error);
+    virtual void profilerReadyToLaunch(const QString& message);
+    virtual void profilerAbortedLaunch(const QString& message);
 
    private:
     void login();

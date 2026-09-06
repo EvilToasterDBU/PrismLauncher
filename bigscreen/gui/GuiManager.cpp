@@ -151,14 +151,14 @@ bool LoadFonts(float scale)
     return true;
 }
 
-std::shared_ptr<GSTexture> UploadQImage(const QImage& image)
+std::shared_ptr<GSTexture> UploadQImage(const QImage& image, bool nearest)
 {
     if (image.isNull())
         return nullptr;
 
     const QImage rgba = image.convertToFormat(QImage::Format_RGBA8888);
-    GSTexture* texture =
-        g_gs_device->CreateTexture(static_cast<u32>(rgba.width()), static_cast<u32>(rgba.height()), 1, GSTexture::Format::Color);
+    GSTexture* texture = g_gs_device->CreateTexture(static_cast<u32>(rgba.width()), static_cast<u32>(rgba.height()), 1,
+                                                     GSTexture::Format::Color, nearest);
     if (!texture)
         return nullptr;
 

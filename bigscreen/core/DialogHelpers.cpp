@@ -53,6 +53,14 @@ std::optional<QString> InputString(const std::string& title, const std::string& 
     return result;
 }
 
+void Alert(const std::string& title, const std::string& message, const std::string& buttonText)
+{
+    bool resolved = false;
+    OpenInfoMessageDialog(
+        title, message, [&resolved] { resolved = true; }, buttonText);
+    WaitForDialog(resolved, IsMessageBoxDialogOpen);
+}
+
 bool Confirm(const std::string& title, const std::string& message, bool defaultValue, const std::string& yesButtonText,
              const std::string& noButtonText)
 {

@@ -1,0 +1,23 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<component type="desktop-application">
+  <id>org.prismlauncher.bigscreen</id>
+  <name>PrismLauncher BigScreen</name>
+  <summary>Gamepad-only fullscreen interface for PrismLauncher</summary>
+  <developer id="org.prismlauncher">
+    <name>Prism Launcher Contributors</name>
+  </developer>
+  <metadata_license>CC0-1.0</metadata_license>
+  <project_license>GPL-3.0-only</project_license>
+  <description>
+    <p>
+      A fullscreen, gamepad-navigable front-end for PrismLauncher, built on the same
+      ImGui "big picture" UI toolkit used by DuckStation/PCSX2, for Steam Deck and
+      other handheld or console-style setups.
+    </p>
+  </description>
+  <url type="homepage">https://prismlauncher.org/</url>
+  <url type="bugtracker">https://github.com/PrismLauncher/PrismLauncher/issues</url>
+  <url type="vcs-browser">https://github.com/PrismLauncher/PrismLauncher</url>
+  <launchable type="desktop-id">org.prismlauncher.bigscreen.desktop</launchable>
+  <content_rating type="oars-1.1" />
+</component>

@@ -290,8 +290,25 @@ namespace ImGuiFullscreen
 
 	bool BeginHorizontalMenu(const char* name, const ImVec2& position, const ImVec2& size, u32 num_items);
 	void EndHorizontalMenu();
-	bool HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0, const ImVec2& icon_uv1, const char* title, const char* description);
-	bool HorizontalMenuItem(GSTexture* icon, const char* title, const char* description);
+	// nearest=true switches to nearest-neighbor texture filtering for this
+	// one draw (see GetNearestSampler()'s comment in the .cpp for why that
+	// needs more than just creating the texture with nearest filtering) —
+	// for small, deliberately blocky pixel art (Minecraft skin/cape
+	// previews) that looks blurred/smeared with the default linear
+	// filtering every other icon here wants. The icon's own real aspect
+	// ratio (from its pixel dimensions and the given UV region) is always
+	// fit within the square icon slot, centered, rather than stretched —
+	// harmless for the square icons every other caller already uses, and
+	// required for anything genuinely non-square (a cape preview's ~5:8
+	// portrait crop) to not look squashed.
+	bool HorizontalMenuItem(GSTexture* icon, const ImVec2& icon_uv0, const ImVec2& icon_uv1, const char* title, const char* description,
+		bool nearest = false);
+	bool HorizontalMenuItem(GSTexture* icon, const char* title, const char* description, bool nearest = false);
+	// Same card, but the icon slot is a font glyph (e.g. ICON_FA_GAMEPAD)
+	// drawn centered instead of an uploaded texture — for menu icons that
+	// only need a simple flat glyph, this skips needing a matching PNG
+	// asset and the GetCachedTexture() upload/cache path entirely.
+	bool HorizontalMenuItem(const char* icon_glyph, const char* title, const char* description);
 	bool HorizontalMenuSvgItem(const char* svg_path, const char* title, const char* description, SvgScaling mode = SvgScaling::Stretch);
 
 	using FileSelectorCallback = std::function<void(const std::string& path)>;

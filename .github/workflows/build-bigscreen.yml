@@ -342,3 +342,41 @@ jobs:
           name: PrismLauncherBigScreen-${{ matrix.artifact-name }}-Qt6
           path: PrismLauncherBigScreen-${{ matrix.artifact-name }}.tar.gz
           if-no-files-found: error
+
+      # A real, double-clickable .AppImage (menu integration via .desktop/
+      # icon/AppStream metadata), on top of the exact same staged AppDir the
+      # portable tarball above was already tar'd from — the tarball is
+      # created first, so decorating/mutating $STAGE afterward (adding the
+      # desktop-integration files below, renaming the sharun loader to
+      # AppRun) can't affect it. Requested explicitly instead of relying on
+      # the plain portable tarball alone (a prior round deliberately chose
+      # the tarball-only route for this kiosk-style app; revisited per
+      # explicit ask for real .desktop-menu integration).
+      #
+      # sharun's own lib4bin (already run above, into $STAGE) always leaves
+      # its loader binary at the AppDir root under the name "sharun" — that
+      # exact file, renamed to "AppRun", is what mkappimage uses as the
+      # image's entry point (same convention .github/actions/package/linux
+      # already uses for the desktop build's own AppImage).
+      - name: Package AppImage
+        run: |
+          set -euo pipefail
+          mkdir -p "$STAGE/share/applications" "$STAGE/share/icons/hicolor/256x256/apps" "$STAGE/share/metainfo"
+          cp bigscreen/packaging/org.prismlauncher.bigscreen.desktop "$STAGE/share/applications/"
+          cp bigscreen/packaging/org.prismlauncher.bigscreen.metainfo.xml "$STAGE/share/metainfo/"
+          cp bigscreen/resources/images/icons/app.png "$STAGE/share/icons/hicolor/256x256/apps/org.prismlauncher.bigscreen.png"
+
+          ln -s share/applications/org.prismlauncher.bigscreen.desktop "$STAGE/org.prismlauncher.bigscreen.desktop"
+          ln -s share/icons/hicolor/256x256/apps/org.prismlauncher.bigscreen.png "$STAGE/org.prismlauncher.bigscreen.png"
+          mv "$STAGE"/{sharun,AppRun}
+
+          appimage_dest="PrismLauncherBigScreen-${{ matrix.artifact-name }}-${{ matrix.glibc-arch }}.AppImage"
+          mkappimage "$STAGE" "$appimage_dest"
+          echo "APPIMAGE_DEST=$appimage_dest" >> "$GITHUB_ENV"
+
+      - name: Upload AppImage
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrismLauncherBigScreen-${{ matrix.artifact-name }}-AppImage
+          path: ${{ env.APPIMAGE_DEST }}
+          if-no-files-found: error

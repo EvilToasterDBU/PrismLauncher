@@ -8,7 +8,13 @@
 
 #include "common/Pcsx2Defs.h"
 
-#include <GL/gl.h>
+// GLES3 (not desktop GL 1.1's <GL/gl.h>) — this project runs GLES3
+// exclusively (see main.cpp's GLES3 context setup, added for the ARM/EGL
+// crash fix), and GLES3/GL 3.3+ sampler objects (glGenSamplers/
+// glBindSampler/glSamplerParameteri, used by the nearest-neighbor texture
+// filtering override in ImGuiFullscreen.cpp) aren't declared by the old
+// desktop header at all.
+#include <GLES3/gl3.h>
 
 struct GSVector4i {
     int x, y, z, w;
