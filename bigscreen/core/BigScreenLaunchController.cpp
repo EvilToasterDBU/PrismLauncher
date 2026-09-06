@@ -242,7 +242,7 @@ bool BigScreenLaunchController::checkJvmArgsValid(const QString& jvmargs)
 
     if (jvmargs.contains("-XX:PermSize=") || jvmargs.contains(memRegex) || jvmargs.contains("-XX-MaxHeapSize") ||
         jvmargs.contains("-XX:InitialHeapSize")) {
-        BigScreenDialogs::Confirm(
+        BigScreenDialogs::Alert(
             QCoreApplication::translate("QObject", "JVM arguments warning").toStdString(),
             QCoreApplication::translate("QObject", "You tried to manually set a JVM memory option (using \"-XX:PermSize\", "
                                                     "\"-XX-MaxHeapSize\", \"-XX:InitialHeapSize\", \"-Xmx\" "
@@ -250,19 +250,17 @@ bool BigScreenLaunchController::checkJvmArgsValid(const QString& jvmargs)
                                                     "There are dedicated boxes for these in the settings (Java tab, in the Memory group at "
                                                     "the top).\n"
                                                     "This message will be displayed until you remove them from the JVM arguments.")
-                .toStdString(),
-            false, "OK", "OK");
+                .toStdString());
         return false;
     }
     if (jvmargs.contains(versionRegex)) {
-        BigScreenDialogs::Confirm(
+        BigScreenDialogs::Alert(
             QCoreApplication::translate("QObject", "JVM arguments warning").toStdString(),
             QCoreApplication::translate("QObject", "You tried to pass required Java version argument to the JVM (using "
                                                     "\"-version:xxx\"). This is not safe and will not be "
                                                     "allowed.\n"
                                                     "This message will be displayed until you remove this from the JVM arguments.")
-                .toStdString(),
-            false, "OK", "OK");
+                .toStdString());
         return false;
     }
     return true;

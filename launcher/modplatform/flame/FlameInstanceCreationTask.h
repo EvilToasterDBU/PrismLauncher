@@ -35,6 +35,7 @@
 
 #pragma once
 
+#include <functional>
 #include <memory>
 #include <optional>
 
@@ -47,7 +48,7 @@
 
 #include "ui/dialogs/BlockedModsDialog.h"
 
-class FlameCreationTask final : public InstanceTask {
+class FlameCreationTask : public InstanceTask {
     Q_OBJECT
 
    public:
@@ -70,6 +71,29 @@ class FlameCreationTask final : public InstanceTask {
 
     void createInstance();
     void executeTask() override;
+
+    // Set once, globally, by a front-end without QWidgets (e.g. BigScreen —
+    // see bigscreen/main.cpp's BigScreen{OptionalMod,BlockedMods}Dialog) to
+    // replace the two native dialogs below with something else. Unset by
+    // default, in which case idResolverSucceeded() runs its original
+    // OptionalModDialog/BlockedModsDialog QDialog::exec() calls unchanged —
+    // this class was `final` and had no such extension point before; adding
+    // these two hooks is the smallest change that avoids every call site
+    // needing to know which concrete class to construct (the way e.g.
+    // LaunchController's controllerFactory does), since FlameCreationTask is
+    // constructed directly in several places (InstanceImportTask's format
+    // dispatch among them), not through one factory function.
+    //
+    // overrideOptionalModDialog: given the optional files' relative paths,
+    // returns the subset to actually install, or std::nullopt to abort the
+    // whole task (matching OptionalModDialog::exec() == QDialog::Rejected).
+    static std::function<std::optional<QStringList>(const QStringList& optionalFiles)> overrideOptionalModDialog;
+    // overrideBlockedModsDialog: given the blocked mods list (to be mutated
+    // in place exactly like BlockedModsDialog does — matched/localPath/move
+    // — copyBlockedMods() reads those same fields afterward regardless of
+    // which UI populated them), returns whether to proceed (true) or abort
+    // the whole task (false, matching BlockedModsDialog::exec() == 0).
+    static std::function<bool(const QString& title, const QString& text, QList<BlockedMod>& mods)> overrideBlockedModsDialog;
 
    private slots:
     void idResolverSucceeded();

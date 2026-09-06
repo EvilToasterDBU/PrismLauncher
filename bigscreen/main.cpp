@@ -38,6 +38,14 @@
 #include "Input/InputManager.h"
 #include "gui/GuiManager.h"
 
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+// ISteamUtils::ShowFloatingGamepadTextInput() — see bigscreen/CMakeLists.txt
+// (BIGSCREEN_HAVE_STEAMWORKS is only defined when the vendored SDK under
+// thirdparty/steamworks/ is present) and the ImGuiFullscreen::
+// OnTextInputActivated registration further down for the actual usage.
+#include <steam/steam_api.h>
+#endif
+
 #include "Application.h"
 #include "BuildConfig.h"
 #include "DesktopServices.h"
@@ -66,6 +74,7 @@
 #include "minecraft/auth/MinecraftAccount.h"
 #include "minecraft/Component.h"
 #include "minecraft/PackProfile.h"
+#include "minecraft/launch/EnsureAvailableMemory.h"
 #include "minecraft/World.h"
 #include "minecraft/WorldList.h"
 #include "minecraft/skins/CapeChange.h"
@@ -78,7 +87,9 @@
 #include "modplatform/ResourceAPI.h"
 #include "modplatform/flame/FlameAPI.h"
 #include "modplatform/flame/FlameCheckUpdate.h"
+#include "modplatform/flame/FlameInstanceCreationTask.h"
 #include "modplatform/flame/FlamePackExportTask.h"
+#include "modplatform/helpers/HashUtils.h"
 #include "modplatform/modrinth/ModrinthAPI.h"
 #include "modplatform/modrinth/ModrinthCheckUpdate.h"
 #include "modplatform/modrinth/ModrinthPackExportTask.h"
@@ -109,6 +120,7 @@
 #include <QCoreApplication>
 #include <QCryptographicHash>
 #include <QDir>
+#include <QDirIterator>
 #include <QFile>
 #include <QFileInfo>
 #include <QLocale>
@@ -185,6 +197,10 @@ enum class Screen { Landing, Instances, Console, Accounts, AccountLogin, Setting
 
 Screen g_screen = Screen::Landing;
 bool g_wantsQuit = false;
+
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+bool g_steamInitialized = false;
+#endif
 
 // A single deferred action, run once at the very top of the next frame (see
 // RunPendingAction(), called from the frame lambda before SDL_PollEvent —
@@ -774,16 +790,37 @@ QString FindDesktopLauncherBinary()
 // the brief window both are alive.
 void SwitchToDesktopMode()
 {
+    // Both failure paths used to only SDL_Log() — invisible on a real
+    // device that isn't launched from a terminal (an AppImage double-
+    // clicked, or a Steam shortcut), which is exactly why this looked like
+    // "nothing happens" when reported: the function *was* failing, just
+    // silently. Real user-visible feedback either way now, via
+    // BigScreenDialogs::Alert() — safe here since every call site defers
+    // through g_pendingAction (see DrawQuit()'s own comment).
     const QString desktopBinary = FindDesktopLauncherBinary();
     if (desktopBinary.isEmpty()) {
         SDL_Log("[switch-to-desktop] could not find '%s' next to this binary or on PATH",
                 qUtf8Printable(BuildConfig.LAUNCHER_APP_BINARY_NAME));
+        BigScreenDialogs::Alert(
+            "Switch to Desktop Mode",
+            QString("Couldn't find a desktop install of %1 next to this program or on your system's PATH — it may not be installed "
+                    "separately from this BigScreen build.")
+                .arg(BuildConfig.LAUNCHER_APP_BINARY_NAME)
+                .toStdString());
         return;
     }
     if (!QProcess::startDetached(desktopBinary, {})) {
         SDL_Log("[switch-to-desktop] failed to start '%s'", qUtf8Printable(desktopBinary));
+        BigScreenDialogs::Alert("Switch to Desktop Mode",
+                                 QString("Found %1 but the system refused to start it.").arg(desktopBinary).toStdString());
         return;
     }
+    // Even a successfully *started* process isn't a guarantee it becomes
+    // visible/focused — a gamescope (or similar) session's own window
+    // management is outside this program's control, and reportedly doesn't
+    // always show it. Nothing further to check from here (startDetached()
+    // only reports whether the OS could fork+exec it at all), but at least
+    // this confirms to the user that BigScreen's own side of it worked.
     g_wantsQuit = true;
 }
 
@@ -940,6 +977,252 @@ void DrawBlockingWait()
     EndFullscreenColumns();
 }
 
+// CurseForge blocks some mod authors' files from third-party-launcher
+// download entirely — FlameCreationTask discovers these (empty
+// version.downloadUrl) while resolving a pack's mod list, whether that's a
+// fresh CurseForge instance creation or (the only path actually reachable
+// in BigScreen today) CheckAndUpdateManagedPack()'s InstanceImportTask when
+// updating a Flame-managed instance. The desktop's own BlockedModsDialog is
+// a real QWidget (drag-and-drop area, folder browser, live directory
+// watcher) with no gamepad equivalent — this is BigScreen's replacement,
+// registered via FlameCreationTask::overrideBlockedModsDialog (see that
+// class's own comment for why a callback rather than subclassing: the
+// class isn't constructed through one factory function BigScreen could
+// swap, so every call site would need updating otherwise).
+//
+// "Semi-automatic with player confirmation" (explicit request): rather than
+// a live directory watcher, the player explicitly presses "Open Download
+// Pages" (opens each missing mod's CurseForge page via DesktopServices::
+// openUrl — a real browser tab, same as the desktop dialog's own
+// QDesktopServices::openUrl) and, once they've actually downloaded the
+// files (on whatever device that browser is on, or back on this one),
+// presses "Re-check" to scan the Downloads + global mods folders for a
+// hash match. No continuous background polling — matches how every other
+// blocking BigScreen flow in this file already works (explicit action,
+// not a live watch), and avoids needing QFileSystemWatcher wired into a
+// screen that isn't normally part of the render loop's own screen stack.
+struct BlockedModsUIState {
+    QString title;
+    QString text;
+    QList<BlockedMod>* mods = nullptr;
+    bool done = false;
+    bool proceed = false;
+};
+BlockedModsUIState g_blockedModsUI;
+// Checked by the render loop (see renderFrame(), highest priority — above
+// even BigScreenDialogs::BlockingDepth's own override) so this draws while
+// ShowBlockedModsDialogBigScreen() pumps frames from deep inside a Task
+// callback, the same way DrawBlockingWait() already overrides the normal
+// per-screen switch for a bare Task wait.
+bool g_blockedModsDialogActive = false;
+
+// On-demand hash scan of the Downloads dir + the global mods dir (the same
+// two locations BlockedModsDialog::setupWatch() watches) — matches
+// BlockedModsDialog::checkMatchHash()'s own hash-only comparison exactly
+// (BlockedModsDialog is always constructed with the default hash_type
+// "sha1", and FlameCreationTask's own blockedMod.hash always comes from a
+// CurseForge file's sha1, confirmed by reading idResolverSucceeded()), but
+// skips its filename-based fuzzy-match fallback — a hash match is
+// unambiguous and covers the common case (the player downloaded the exact
+// file CurseForge's page linked to); a renamed-but-hash-matching file is
+// still found correctly, only a renamed *and* re-encoded one wouldn't be,
+// same edge case the desktop's own hash path already has.
+void RescanBlockedMods(QList<BlockedMod>& mods)
+{
+    const QString downloadsDir = APPLICATION->settings()->get("DownloadsDir").toString();
+    const QString modsDir = APPLICATION->settings()->get("CentralModsDir").toString();
+    const bool moveFiles = APPLICATION->settings()->get("MoveModsFromDownloadsDir").toBool();
+    const QString downloadsAbs = QFileInfo(downloadsDir).absoluteFilePath();
+
+    for (const QString& dir : { downloadsDir, modsDir }) {
+        if (dir.isEmpty() || !QFileInfo::exists(dir))
+            continue;
+        QDirIterator it(dir, QDir::Files, QDirIterator::Subdirectories);
+        while (it.hasNext()) {
+            const QString path = it.next();
+            const QString sha1 = Hashing::hash(path, Hashing::Algorithm::Sha1);
+            for (BlockedMod& mod : mods) {
+                if (mod.matched || mod.hash.isEmpty())
+                    continue;
+                if (mod.hash.compare(sha1, Qt::CaseInsensitive) == 0) {
+                    mod.matched = true;
+                    mod.localPath = path;
+                    if (moveFiles)
+                        mod.move = QFileInfo(path).absoluteFilePath().startsWith(downloadsAbs);
+                }
+            }
+        }
+    }
+}
+
+void DrawBlockedModsDialog()
+{
+    QList<BlockedMod>& mods = *g_blockedModsUI.mods;
+    const bool allMatched = std::all_of(mods.begin(), mods.end(), [](const BlockedMod& m) { return m.matched; });
+    const int missingCount = static_cast<int>(std::count_if(mods.begin(), mods.end(), [](const BlockedMod& m) { return !m.matched; }));
+
+    {
+        const GamepadGlyphs glyphs = GetGamepadGlyphs();
+        SetFooterHints({ { glyphs.confirm(false), allMatched ? "Continue" : "Skip Missing" },
+                          { glyphs.west, "Open Download Pages" },
+                          { glyphs.north, "Re-check" },
+                          { glyphs.cancel(false), "Cancel" } });
+    }
+
+    const QByteArray titleUtf8 = g_blockedModsUI.title.toUtf8();
+    if (BeginScreen(titleUtf8.constData())) {
+        if (BeginFullscreenColumnWindow(0.0f, 0.0f, "blocked_mods")) {
+            BeginMenuButtons();
+            ResetFocusHere();
+
+            const QByteArray textUtf8 = g_blockedModsUI.text.toUtf8();
+            ImGui::PushFont(g_medium_font.first, g_medium_font.second);
+            ImGui::TextWrapped("%s", textUtf8.constData());
+            ImGui::PopFont();
+            ImGui::Dummy(LayoutScale(0.0f, 15.0f));
+
+            for (const BlockedMod& mod : mods) {
+                const QString titleStr = QString(mod.matched ? ICON_FA_CHECK : ICON_FA_XMARK) + " " + mod.name;
+                const QByteArray titleUtf8 = titleStr.toUtf8();
+                const QString summaryStr =
+                    mod.matched ? QObject::tr("Found at %1").arg(mod.localPath) : QObject::tr("Not found — needs manual download");
+                const QByteArray summaryUtf8 = summaryStr.toUtf8();
+                MenuButton(titleUtf8.constData(), summaryUtf8.constData());
+            }
+
+            ImGui::Dummy(LayoutScale(0.0f, 15.0f));
+
+            const QString openLabelStr =
+                missingCount > 0 ? QString("Open Download Pages (%1)").arg(missingCount) : QString("Open Download Pages");
+            const QByteArray openLabelUtf8 = openLabelStr.toUtf8();
+            if (MenuButtonWithoutSummary(openLabelUtf8.constData())) {
+                QList<BlockedMod>* modsPtr = &mods;
+                g_pendingAction = [modsPtr]() {
+                    const int missing =
+                        static_cast<int>(std::count_if(modsPtr->begin(), modsPtr->end(), [](const BlockedMod& m) { return !m.matched; }));
+                    if (missing == 0)
+                        return;
+                    if (BigScreenDialogs::Confirm("Open Download Pages",
+                                                   QString("Open %1 download page(s) in your browser?").arg(missing).toStdString(), true,
+                                                   "Open", "Cancel")) {
+                        for (const BlockedMod& mod : *modsPtr) {
+                            if (!mod.matched)
+                                DesktopServices::openUrl(QUrl(mod.websiteUrl));
+                        }
+                    }
+                };
+            }
+
+            if (MenuButtonWithoutSummary("Re-check Downloads")) {
+                QList<BlockedMod>* modsPtr = &mods;
+                g_pendingAction = [modsPtr]() { RescanBlockedMods(*modsPtr); };
+            }
+
+            if (MenuButtonWithoutSummary(allMatched ? "Continue" : "Skip Missing and Continue")) {
+                g_blockedModsUI.done = true;
+                g_blockedModsUI.proceed = true;
+            }
+
+            EndMenuButtons();
+        }
+        EndFullscreenColumnWindow();
+    }
+    EndFullscreenColumns();
+
+    // Same guarded WantsToCloseMenu()/ResetCloseMenuIfNeeded() pattern
+    // HandleBackButton() itself uses — this function stands in for it
+    // entirely while g_blockedModsDialogActive is set (see renderFrame()),
+    // since the normal screen stack isn't what's on screen right now.
+    if (IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen())
+        return;
+    if (WantsToCloseMenu()) {
+        g_blockedModsUI.done = true;
+        g_blockedModsUI.proceed = false;
+        ResetCloseMenuIfNeeded();
+    }
+}
+
+// Blocking (same PumpFrame-loop shape as every other BigScreenDialogs::*
+// helper) — registered as FlameCreationTask::overrideBlockedModsDialog.
+// Reached only from within FlameCreationTask::idResolverSucceeded(), itself
+// only ever invoked via a queued Task callback chain (never mid-frame — see
+// CheckAndUpdateManagedPack()'s own InstanceImportTask/WaitForTask call),
+// so blocking here is safe for the same reason every other override in
+// this file is.
+bool ShowBlockedModsDialogBigScreen(const QString& title, const QString& text, QList<BlockedMod>& mods)
+{
+    g_blockedModsUI.title = title;
+    // FlameCreationTask's real text is rich-text (QTextBrowser on the
+    // desktop side) and uses "<br/>" — ImGui::TextWrapped() has no HTML
+    // support at all, so without this it showed the literal tag on screen.
+    // Same replace-then-replace pattern ShowAddOfflineAccount() already
+    // established for "<br><br>"/"<br>" — extended here for the self-
+    // closing "<br/>" variant this particular string actually uses.
+    g_blockedModsUI.text = QString(text).replace("<br/><br/>", "\n\n").replace("<br/>", "\n").replace("<br><br>", "\n\n").replace("<br>", "\n");
+    g_blockedModsUI.mods = &mods;
+    g_blockedModsUI.done = false;
+    g_blockedModsUI.proceed = false;
+    g_blockedModsDialogActive = true;
+
+    {
+        // Same BlockingGuard + processEvents()/PumpFrame() pump shape every
+        // other BigScreenDialogs::* helper uses (see DialogHelpers.h) —
+        // polls g_blockedModsUI.done (set by DrawBlockedModsDialog() itself)
+        // instead of a Task's isRunning(), since there's no single Task
+        // this dialog is waiting on.
+        BigScreenDialogs::BlockingGuard guard;
+        while (!g_blockedModsUI.done) {
+            QCoreApplication::processEvents();
+            if (BigScreenDialogs::PumpFrame)
+                BigScreenDialogs::PumpFrame();
+        }
+    }
+
+    g_blockedModsDialogActive = false;
+    g_blockedModsUI.mods = nullptr;
+    return g_blockedModsUI.proceed;
+}
+
+// FlameCreationTask::overrideOptionalModDialog — the desktop's
+// OptionalModDialog is a plain checkbox list (QListWidget, all unchecked by
+// default per its own initial-state code), a direct fit for the existing
+// BigScreenDialogs::ChooseMultiple() picker (built for Check for Updates,
+// section 38) rather than a new custom screen the way the blocked-mods
+// dialog needed. `optionalFiles` are relative paths (targetFolder/fileName)
+// — shown as-is; there's no separate short display name available at this
+// point in FlameCreationTask, same as what the desktop's own QListWidget
+// items show.
+std::optional<QStringList> ShowOptionalModDialogBigScreen(const QStringList& optionalFiles)
+{
+    std::vector<std::string> options;
+    options.reserve(static_cast<size_t>(optionalFiles.size()));
+    for (const QString& file : optionalFiles)
+        options.push_back(file.toStdString());
+
+    // All-unchecked by default, matching OptionalModDialog's own initial
+    // state — ChooseMultiple() itself defaults to all-checked when given an
+    // empty vector (right for the update-all picker it was built for, wrong
+    // here), so this passes an explicit all-false vector instead.
+    const std::vector<bool> checked =
+        BigScreenDialogs::ChooseMultiple("Optional Mods", options, std::vector<bool>(options.size(), false));
+
+    QStringList result;
+    for (size_t i = 0; i < checked.size(); ++i) {
+        if (checked[i])
+            result << optionalFiles[static_cast<int>(i)];
+    }
+    // ChooseMultiple() never reports a real "cancel" distinct from "nothing
+    // checked" (see its own doc comment) — unlike the desktop dialog, B
+    // here always proceeds with whatever's checked (possibly none) rather
+    // than aborting the whole instance creation/update. A deliberate,
+    // documented simplification, not an oversight: "install zero optional
+    // mods" is already a fully valid choice on the desktop too (uncheck
+    // everything, click OK), so this just makes B do that instead of a full
+    // abort — the same tradeoff BigScreen's Check for Updates picker
+    // already made for the identical reason.
+    return result;
+}
+
 struct LandingItem {
     const char* icon;  // an ICON_FA_* glyph, not a texture path — see HorizontalMenuItem's glyph overload
     QString title;
@@ -1085,7 +1368,13 @@ void DrawQuit(bool& done)
                             done = true;
                             break;
                         case 2:
-                            SwitchToDesktopMode();
+                            // Deferred — SwitchToDesktopMode() now shows a
+                            // real Alert() on failure (see its own comment),
+                            // and any BigScreenDialogs::* call has to run
+                            // from outside the current frame, same reason
+                            // as every other g_pendingAction use in this
+                            // file.
+                            g_pendingAction = []() { SwitchToDesktopMode(); };
                             break;
                     }
                 }
@@ -1337,28 +1626,82 @@ void DrawAccountLogin()
             }
             EndMenuButtons();
 
-            ImGui::Dummy(LayoutScale(0.0f, 20.0f));
+            // Centered content block (both axes), sized up front so it's
+            // positioned to fit the real available area instead of just
+            // stacking top-down from under the Cancel button and hoping it
+            // fits — the previous version could run past the bottom of the
+            // screen at higher Settings > Appearance > Scale values.
+            const float availWidth = ImGui::GetContentRegionAvail().x;
+            const float availHeight = ImGui::GetContentRegionAvail().y;
 
             if (!g_loginError.isEmpty()) {
+                // Wrapped, not just centered — a real SSL handshake failure
+                // (network error strings can run 100+ characters) would
+                // otherwise run straight off the right edge of the screen
+                // instead of wrapping, since CalcTextSize()/TextColored()
+                // without a wrap width both assume a single unbroken line.
                 const QByteArray errUtf8 = g_loginError.toUtf8();
+                const float wrapWidth = availWidth * 0.8f;
+                const ImVec2 textSize = ImGui::CalcTextSize(errUtf8.constData(), nullptr, false, wrapWidth);
+                const float x = std::max(0.0f, (availWidth - wrapWidth) * 0.5f);
+                const float y = std::max(0.0f, (availHeight - textSize.y) * 0.5f);
+                ImGui::SetCursorPos(ImVec2(x, y));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + wrapWidth);
                 ImGui::TextColored(ImVec4(0.9f, 0.3f, 0.3f, 1.0f), "%s", errUtf8.constData());
+                ImGui::PopTextWrapPos();
             } else if (!g_loginQrTexture) {
                 const QByteArray statusUtf8 = g_loginStatus.toUtf8();
+                const float wrapWidth = availWidth * 0.8f;
+                const ImVec2 textSize = ImGui::CalcTextSize(statusUtf8.constData(), nullptr, false, wrapWidth);
+                const float x = std::max(0.0f, (availWidth - wrapWidth) * 0.5f);
+                const float y = std::max(0.0f, (availHeight - textSize.y) * 0.5f);
+                ImGui::SetCursorPos(ImVec2(x, y));
+                ImGui::PushTextWrapPos(ImGui::GetCursorPos().x + wrapWidth);
                 ImGui::TextUnformatted(statusUtf8.constData());
+                ImGui::PopTextWrapPos();
             } else {
-                const QByteArray codeUtf8 = g_loginCode.toUtf8();
-                const QByteArray urlUtf8 = g_loginUrl.toUtf8();
+                const char* line1 = "Scan this QR code with your phone,";
+                const char* line2 = "or open the URL below and enter the code:";
+                const QByteArray urlLineUtf8 = QString("URL:  %1").arg(g_loginUrl).toUtf8();
+                const QByteArray codeLineUtf8 = QString("Code: %1").arg(g_loginCode).toUtf8();
 
-                ImGui::TextUnformatted("Scan this QR code with your phone,");
-                ImGui::TextUnformatted("or open the URL below and enter the code:");
-                ImGui::Dummy(LayoutScale(0.0f, 10.0f));
+                const ImVec2 line1Size = ImGui::CalcTextSize(line1);
+                const ImVec2 line2Size = ImGui::CalcTextSize(line2);
+                const ImVec2 urlLineSize = ImGui::CalcTextSize(urlLineUtf8.constData());
+                const ImVec2 codeLineSize = ImGui::CalcTextSize(codeLineUtf8.constData());
+                const float gap = LayoutScale(12.0f);
+                // Shrinks below the usual 300px at low available height
+                // (a high Settings > Appearance > Scale, or a short window)
+                // instead of overflowing past the bottom of the screen.
+                const float qrSize = std::min(LayoutScale(300.0f), availHeight * 0.45f);
 
-                const float qrSize = LayoutScale(300.0f);
-                ImGui::Image(static_cast<ImTextureID>(g_loginQrTexture->GetNativeHandle()), ImVec2(qrSize, qrSize));
+                const float blockHeight = line1Size.y + line2Size.y + gap + qrSize + gap + urlLineSize.y + codeLineSize.y;
+                float y = std::max(0.0f, (availHeight - blockHeight) * 0.5f);
 
-                ImGui::Dummy(LayoutScale(0.0f, 10.0f));
-                ImGui::Text("URL:  %s", urlUtf8.constData());
-                ImGui::Text("Code: %s", codeUtf8.constData());
+                auto centeredText = [&](const char* text, const ImVec2& size) {
+                    ImGui::SetCursorPos(ImVec2(std::max(0.0f, (availWidth - size.x) * 0.5f), y));
+                    ImGui::TextUnformatted(text);
+                    y += size.y;
+                };
+
+                centeredText(line1, line1Size);
+                centeredText(line2, line2Size);
+                y += gap;
+
+                ImGui::SetCursorPos(ImVec2(std::max(0.0f, (availWidth - qrSize) * 0.5f), y));
+                const ImVec2 qrScreenPos = ImGui::GetCursorScreenPos();
+                // AddImageRounded instead of ImGui::Image() — a plain
+                // square QR code looked visually out of place against
+                // every other rounded-corner surface in this UI (menu
+                // buttons, cards, dialogs all use LAYOUT_FRAME_ROUNDING).
+                ImGui::GetWindowDrawList()->AddImageRounded(static_cast<ImTextureID>(g_loginQrTexture->GetNativeHandle()), qrScreenPos,
+                                                             qrScreenPos + ImVec2(qrSize, qrSize), ImVec2(0.0f, 0.0f), ImVec2(1.0f, 1.0f),
+                                                             IM_COL32_WHITE, LayoutScale(LAYOUT_FRAME_ROUNDING));
+                ImGui::Dummy(ImVec2(qrSize, qrSize));
+                y += qrSize + gap;
+
+                centeredText(urlLineUtf8.constData(), urlLineSize);
+                centeredText(codeLineUtf8.constData(), codeLineSize);
             }
         }
         EndFullscreenColumnWindow();
@@ -3074,7 +3417,7 @@ void ChangeComponentVersion(ComponentPtr comp)
 
     Meta::VersionList::Ptr versionList = isMinecraft ? APPLICATION->metadataIndex()->get("net.minecraft") : comp->getVersionList();
     if (!versionList) {
-        BigScreenDialogs::Confirm(dialogTitle, "No version list is available for this component.", false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "No version list is available for this component.");
         return;
     }
     if (!versionList->isLoaded()) {
@@ -3082,7 +3425,7 @@ void ChangeComponentVersion(ComponentPtr comp)
         loadTask->start();
         BigScreenDialogs::WaitForTask(loadTask.get());
         if (!versionList->isLoaded()) {
-            BigScreenDialogs::Confirm(dialogTitle, "Failed to load the version list. Check your internet connection.", false, "OK", "OK");
+            BigScreenDialogs::Alert(dialogTitle, "Failed to load the version list. Check your internet connection.");
             return;
         }
     }
@@ -3113,11 +3456,9 @@ void ChangeComponentVersion(ComponentPtr comp)
     for (const Meta::Version::Ptr& version : candidates)
         labels.push_back(version->descriptor().toStdString());
     if (labels.empty()) {
-        BigScreenDialogs::Confirm(dialogTitle,
-                                   isMinecraft ? "No release versions available."
-                                               : ("No versions compatible with Minecraft " + currentMcVersion.toStdString() +
-                                                  " are available for this component."),
-                                   false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, isMinecraft ? "No release versions available."
+                                                          : ("No versions compatible with Minecraft " + currentMcVersion.toStdString() +
+                                                             " are available for this component."));
         return;
     }
 
@@ -3231,14 +3572,12 @@ void ShowVersionComponentActionsMenu(ComponentPtr comp)
                                       try {
                                           profile->move(index, actionId == MoveUp ? PackProfile::MoveUp : PackProfile::MoveDown);
                                       } catch (const Exception& e) {
-                                          BigScreenDialogs::Confirm(TR("VersionPage", "Error").toStdString(), e.cause().toStdString(), false,
-                                                                      "OK", "OK");
+                                          BigScreenDialogs::Alert(TR("VersionPage", "Error").toStdString(), e.cause().toStdString());
                                       }
                                       break;
                                   case Customize:
                                       if (!profile->customize(index))
-                                          BigScreenDialogs::Confirm(comp->getName().toStdString(), "Failed to customize component.",
-                                                                      false, "OK", "OK");
+                                          BigScreenDialogs::Alert(comp->getName().toStdString(), "Failed to customize component.");
                                       break;
                                   case Revert: {
                                       const QString message = TR("VersionPage", "You are about to revert \"%1\".\n"
@@ -3265,9 +3604,8 @@ void ShowVersionComponentActionsMenu(ComponentPtr comp)
                                                                                  TR("LaunchController", "Cancel").toStdString());
                                       }
                                       if (confirmed && !profile->remove(index))
-                                          BigScreenDialogs::Confirm(TR("VersionPage", "Error").toStdString(),
-                                                                      TR("VersionPage", "Couldn't remove file").toStdString(), false,
-                                                                      "OK", "OK");
+                                          BigScreenDialogs::Alert(TR("VersionPage", "Error").toStdString(),
+                                                                   TR("VersionPage", "Couldn't remove file").toStdString());
                                       break;
                                   }
                               }
@@ -3666,8 +4004,7 @@ void UploadScreenshotToImgur(const QString& path)
     BigScreenDialogs::WaitForTask(job.get());
 
     if (!job->wasSuccessful() || screenshot->m_url.isEmpty()) {
-        BigScreenDialogs::Confirm(TR("ScreenshotsPage", "Failed to upload screenshots!").toStdString(),
-                                    job->failReason().toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Alert(TR("ScreenshotsPage", "Failed to upload screenshots!").toStdString(), job->failReason().toStdString());
         return;
     }
 
@@ -4207,14 +4544,14 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
                       },
                        [&failReason](const QString& reason, int) { failReason = reason; }, [] {} });
     if (!versionsTask) {
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to check for updates.", false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to check for updates.");
         return;
     }
     versionsTask->start();
     BigScreenDialogs::WaitForTask(versionsTask.get());
 
     if (!succeeded || versions.isEmpty()) {
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to check for updates: " + failReason.toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to check for updates: " + failReason.toStdString());
         return;
     }
 
@@ -4279,18 +4616,16 @@ void CheckAndUpdateManagedPack(MinecraftInstance* inst)
     BigScreenDialogs::WaitForTask(task.get());
 
     if (!task->wasSuccessful()) {
-        BigScreenDialogs::Confirm(
+        BigScreenDialogs::Alert(
             TR("ManagedPackPage", "Update Failed").toStdString(),
             TR("ManagedPackPage", "The instance failed to update to pack version %1. Please check launcher logs for more information.")
                 .arg(chosenVersion.version)
-                .toStdString(),
-            false, "OK", "OK");
+                .toStdString());
         return;
     }
-    BigScreenDialogs::Confirm(
+    BigScreenDialogs::Alert(
         TR("ManagedPackPage", "Update Successful").toStdString(),
-        TR("ManagedPackPage", "The instance updated to pack version %1 successfully.").arg(chosenVersion.version).toStdString(), false,
-        "OK", "OK");
+        TR("ManagedPackPage", "The instance updated to pack version %1 successfully.").arg(chosenVersion.version).toStdString());
 }
 
 // X on a focused instance card opens this — a curated subset of the
@@ -4370,8 +4705,8 @@ void StartInstanceExport(MinecraftInstance* inst)
 
                 QFileInfoList files;
                 if (!MMCZip::collectFileListRecursively(inst->instanceRoot(), nullptr, &files, nullptr)) {
-                    BigScreenDialogs::Confirm(TR("ExportInstanceDialog", "Error").toStdString(),
-                                               TR("ExportInstanceDialog", "Unable to export instance").toStdString(), false, "OK", "OK");
+                    BigScreenDialogs::Alert(TR("ExportInstanceDialog", "Error").toStdString(),
+                                             TR("ExportInstanceDialog", "Unable to export instance").toStdString());
                     return;
                 }
 
@@ -4380,8 +4715,7 @@ void StartInstanceExport(MinecraftInstance* inst)
                 BigScreenDialogs::WaitForTask(task.get());
 
                 if (!task->wasSuccessful()) {
-                    BigScreenDialogs::Confirm(TR("ExportInstanceDialog", "Error").toStdString(), task->failReason().toStdString(), false,
-                                               "OK", "OK");
+                    BigScreenDialogs::Alert(TR("ExportInstanceDialog", "Error").toStdString(), task->failReason().toStdString());
                 }
             };
         },
@@ -4717,8 +5051,7 @@ void StartVanillaInstanceCreation()
         loadTask->start();
         BigScreenDialogs::WaitForTask(loadTask.get());
         if (!versionList->isLoaded()) {
-            BigScreenDialogs::Confirm(dialogTitle, "Failed to load the Minecraft version list. Check your internet connection.", false,
-                                       "OK", "OK");
+            BigScreenDialogs::Alert(dialogTitle, "Failed to load the Minecraft version list. Check your internet connection.");
             return;
         }
     }
@@ -4755,8 +5088,7 @@ void StartVanillaInstanceCreation()
         versionLoadTask->start();
         BigScreenDialogs::WaitForTask(versionLoadTask.get());
         if (!chosenVersion->isLoaded()) {
-            BigScreenDialogs::Confirm(dialogTitle, "Failed to load version " + chosenVersion->descriptor().toStdString() + ".", false,
-                                       "OK", "OK");
+            BigScreenDialogs::Alert(dialogTitle, "Failed to load version " + chosenVersion->descriptor().toStdString() + ".");
             return;
         }
     }
@@ -4774,7 +5106,7 @@ void StartVanillaInstanceCreation()
     BigScreenDialogs::WaitForTask(task.get());
 
     if (!task->wasSuccessful())
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to create instance: " + task->failReason().toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to create instance: " + task->failReason().toStdString());
 }
 
 // Reuses the exact same InstanceImportTask the desktop's ImportPage builds
@@ -4835,8 +5167,8 @@ void StartZipInstanceImport()
                 BigScreenDialogs::WaitForTask(task.get());
 
                 if (!task->wasSuccessful()) {
-                    BigScreenDialogs::Confirm(StripMnemonic(MW("Add Instanc&e...")).toStdString(),
-                                               "Failed to import instance: " + task->failReason().toStdString(), false, "OK", "OK");
+                    BigScreenDialogs::Alert(StripMnemonic(MW("Add Instanc&e...")).toStdString(),
+                                             "Failed to import instance: " + task->failReason().toStdString());
                 }
             };
         },
@@ -5251,7 +5583,7 @@ void InstallModrinthPack(const ModPlatform::IndexedPack::Ptr& pack)
                       },
                        [&versionsFailReason](const QString& reason, int) { versionsFailReason = reason; }, [] {} });
     if (!versionsTask) {
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to load versions for this pack.", false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to load versions for this pack.");
         return;
     }
     versionsTask->start();
@@ -5292,7 +5624,7 @@ void InstallModrinthPack(const ModPlatform::IndexedPack::Ptr& pack)
     BigScreenDialogs::WaitForTask(task.get());
 
     if (!task->wasSuccessful())
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to install modpack: " + task->failReason().toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to install modpack: " + task->failReason().toStdString());
 }
 
 // Mirrors ModFilterWidget::prepareBasicFilter()'s two defaults (the only
@@ -5391,7 +5723,7 @@ void InstallModrinthResource(const ModPlatform::IndexedPack::Ptr& pack)
                       },
                        [&versionsFailReason](const QString& reason, int) { versionsFailReason = reason; }, [] {} });
     if (!versionsTask) {
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to load versions for this pack.", false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to load versions for this pack.");
         return;
     }
     versionsTask->start();
@@ -5418,7 +5750,7 @@ void InstallModrinthResource(const ModPlatform::IndexedPack::Ptr& pack)
     BigScreenDialogs::WaitForTask(task.get());
 
     if (!task->wasSuccessful()) {
-        BigScreenDialogs::Confirm(dialogTitle, "Failed to download: " + task->failReason().toStdString(), false, "OK", "OK");
+        BigScreenDialogs::Alert(dialogTitle, "Failed to download: " + task->failReason().toStdString());
         return;
     }
     model->update();
@@ -6104,6 +6436,20 @@ int main(int argc, char** argv)
     Q_INIT_RESOURCE(flat_white);
     Q_INIT_RESOURCE(shaders);
 
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+    // Entirely best-effort: BigScreen also targets plain ARM handhelds with
+    // no Steam installed at all, so SteamAPI_Init() failing (no Steam
+    // client running, or no steam_appid.txt when not launched by Steam
+    // itself) is a normal, silent outcome, not an error — everything below
+    // that touches Steam checks g_steamInitialized first and simply does
+    // nothing when it's false. See ImGuiFullscreen::OnTextInputActivated/
+    // OnTextInputDeactivated registration further down for the actual
+    // payoff (Steam's own on-screen keyboard for InputText fields under
+    // Steam Input/Big Picture).
+    g_steamInitialized = SteamAPI_Init();
+    SDL_Log(g_steamInitialized ? "[steam] SteamAPI_Init() succeeded" : "[steam] SteamAPI_Init() failed — running without Steam integration");
+#endif
+
     // Must be set before SDL_Init() — both are read once when the joystick
     // subsystem starts up.
     //
@@ -6286,6 +6632,73 @@ int main(int argc, char** argv)
     // form — previously fell back to the native MSALoginDialog, now runs
     // the same device-code+QR flow the Accounts screen's own login uses.
     BigScreenLaunchController::onReauthenticate = &BlockingReauthenticate;
+
+    // Replaces FlameCreationTask's two native QDialogs (OptionalModDialog,
+    // BlockedModsDialog) — reached via CheckAndUpdateManagedPack()'s
+    // InstanceImportTask when updating a CurseForge-managed instance whose
+    // new version has optional and/or CurseForge-blocked mods.
+    FlameCreationTask::overrideOptionalModDialog = &ShowOptionalModDialogBigScreen;
+    FlameCreationTask::overrideBlockedModsDialog = &ShowBlockedModsDialogBigScreen;
+
+    // Replaces EnsureAvailableMemory's native "low RAM" warning
+    // (CustomMessageBox::selectable(...)->exec(), nullptr parent) — a real
+    // LaunchStep every single launch goes through
+    // (MinecraftInstance::createLaunchTask()), not something reachable only
+    // from a specific menu, so this one was silently hanging every launch
+    // on any device whose free RAM sits below ~70% of the configured max
+    // allocation (a real, common situation on a memory-constrained handheld
+    // with generous memory settings carried over from a desktop PC).
+    EnsureAvailableMemory::overrideLowMemoryDialog = [](const QString& title, const QString& text) {
+        return BigScreenDialogs::Confirm(title.toStdString(), text.toStdString(), false, "Launch Anyway", "Cancel");
+    };
+
+    // Replaces NetJob's native NetworkJobFailedDialog (Retry/Abort +
+    // per-URL error table, shown via dialog->open() — not even a blocking
+    // .exec(), so it popped up as a genuinely separate top-level native
+    // window with no visible connection to whatever BigScreen screen was
+    // up). Every NetJob in the app funnels through this one function
+    // (NetJob::emitFailed()), so this single hook covers every download
+    // this project makes — library/asset downloads during a launch, mod
+    // downloads, pack exports, skin/cape uploads — not just one call site.
+    NetJob::overrideNetworkJobFailedDialog = [](const QString& jobName, int attempt, const QList<NetJob::FailedRequest>& failed) {
+        QString text = QString("%1 request(s) failed after %2 attempt(s):\n\n").arg(failed.size()).arg(attempt);
+        for (const NetJob::FailedRequest& f : failed)
+            text += QString("%1\n  %2\n\n").arg(f.url.toString(), f.error);
+        return BigScreenDialogs::Confirm(jobName.toStdString(), text.toStdString(), true, "Retry", "Abort");
+    };
+
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+    // Steam's own on-screen keyboard for every ImGui::InputText field this
+    // toolkit's own DrawInputDialog() shows (rename, search, instance name,
+    // proxy fields, ...) — the user's own ask: BigScreen already confirmed
+    // gamepad confirm/nav on real hardware works, but under Steam Input/
+    // Big Picture there's no physical keyboard and no guarantee Steam's own
+    // overlay heuristics detect an arbitrary SDL2 app's SDL_StartTextInput()
+    // call (that's the M6-era mechanism this still falls back to when Steam
+    // isn't present/initialized at all — see LoadFonts()/imgui_impl_sdl2).
+    // ShowFloatingGamepadTextInput(), not the full-screen ShowGamepadTextInput():
+    // the floating one sends real OS keyboard key events straight to the
+    // already-focused ImGui::InputText (confirmed by reading isteamutils.h's
+    // own doc comment — "sends OS keyboard keys directly to the game") —
+    // meaning zero changes needed to how BigScreen's dialogs already read
+    // text, unlike the full-screen variant's separate "wait for dismiss,
+    // then call GetEnteredGamepadTextInput()" callback protocol.
+    // Gated on IsSteamInBigPictureMode() specifically, per the user's own
+    // framing of the ask ("when opened through Steam Big Picture with Steam
+    // Input") — a physical keyboard is already available in every other
+    // Steam context (desktop mode, a non-Big-Picture non-Steam-game
+    // shortcut), where popping this up unasked would be actively wrong.
+    ImGuiFullscreen::OnTextInputActivated = [](ImVec2 pos, ImVec2 size) {
+        if (g_steamInitialized && SteamUtils() && SteamUtils()->IsSteamInBigPictureMode()) {
+            SteamUtils()->ShowFloatingGamepadTextInput(k_EFloatingGamepadTextInputModeModeSingleLine, static_cast<int>(pos.x),
+                                                        static_cast<int>(pos.y), static_cast<int>(size.x), static_cast<int>(size.y));
+        }
+    };
+    ImGuiFullscreen::OnTextInputDeactivated = [] {
+        if (g_steamInitialized && SteamUtils())
+            SteamUtils()->DismissFloatingGamepadTextInput();
+    };
+#endif
 
     // BigScreen-only settings (Settings > Appearance) — not real desktop
     // keys, so registered here rather than in the shared
@@ -6499,6 +6912,90 @@ int main(int argc, char** argv)
             const QFileInfo outFile(outputPath);
             SDL_Log("[test-pack-export] wasSuccessful=%d failReason='%s' outputExists=%d outputSize=%lld", task->wasSuccessful(),
                     task->failReason().toUtf8().constData(), outFile.exists(), static_cast<long long>(outFile.size()));
+        });
+    }
+
+    // Kept (like manage_skins/change_cape/BIGSCREEN_TEST_PACK_EXPORT):
+    // BIGSCREEN_TEST_BLOCKED_MODS=1 calls ShowBlockedModsDialogBigScreen()
+    // directly with synthetic data — real CurseForge blocked-mod packs
+    // aren't reliably reproducible on demand (depends on which specific
+    // mods a given pack happens to include), so this is the only practical
+    // way to re-verify this screen later. Auto-confirms itself after 4s so
+    // a run with no one watching doesn't hang forever waiting for a real
+    // button press.
+    if (std::getenv("BIGSCREEN_TEST_BLOCKED_MODS")) {
+        QTimer::singleShot(500, &app, [&app] {
+            static QList<BlockedMod> mods;
+            mods.clear();
+            BlockedMod a;
+            a.name = "examplemod-1.0.jar";
+            a.websiteUrl = "https://www.curseforge.com/minecraft/mc-mods/examplemod/download/123";
+            a.hash = "deadbeef";
+            a.matched = false;
+            a.targetFolder = "mods";
+            BlockedMod b;
+            b.name = "othermod-2.0.jar";
+            b.websiteUrl = "https://www.curseforge.com/minecraft/mc-mods/othermod/download/456";
+            b.hash = "cafebabe";
+            b.matched = true;
+            b.localPath = "/home/user/Downloads/othermod-2.0.jar";
+            b.targetFolder = "mods";
+            mods << a << b;
+
+            QTimer::singleShot(4000, &app, [] {
+                SDL_Log("[test-blocked-mods] auto-confirming");
+                g_blockedModsUI.done = true;
+                g_blockedModsUI.proceed = true;
+            });
+
+            SDL_Log("[test-blocked-mods] calling ShowBlockedModsDialogBigScreen()");
+            const bool proceed = ShowBlockedModsDialogBigScreen(
+                "Blocked mods found",
+                "The following files are not available for download in third party launchers. You will need to manually download "
+                "them and add them to the instance.",
+                mods);
+            SDL_Log("[test-blocked-mods] result: proceed=%d", proceed);
+        });
+    }
+
+    // Kept: BIGSCREEN_TEST_LOW_MEMORY=1 calls
+    // EnsureAvailableMemory::overrideLowMemoryDialog directly with synthetic
+    // text — a real low-RAM warning depends on the device's actual free RAM
+    // vs. the instance's configured max allocation, not reliably
+    // reproducible on demand. Auto-confirms after 4s so an unattended run
+    // doesn't hang forever.
+    if (std::getenv("BIGSCREEN_TEST_LOW_MEMORY")) {
+        QTimer::singleShot(500, &app, [&app] {
+            QTimer::singleShot(4000, &app, [] {
+                SDL_Log("[test-low-memory] auto-confirming");
+                ImGuiFullscreen::CloseMessageDialog();
+            });
+            SDL_Log("[test-low-memory] calling overrideLowMemoryDialog()");
+            const bool result = EnsureAvailableMemory::overrideLowMemoryDialog(
+                "Low free memory",
+                "There might not be enough free RAM to launch this instance with the current memory settings.\n\n"
+                "Maximum allocated: 10240 MiB\nFree: 3072 MiB (out of 8192 MiB total)\n\n"
+                "Launch anyway? This may cause slowdowns in the game and your system.");
+            SDL_Log("[test-low-memory] result=%d", result);
+        });
+    }
+
+    // Kept: BIGSCREEN_TEST_NETJOB_FAILED=1 calls
+    // NetJob::overrideNetworkJobFailedDialog directly with synthetic failed
+    // requests — a real network failure isn't reliably reproducible on
+    // demand from this sandbox. Auto-confirms after 4s.
+    if (std::getenv("BIGSCREEN_TEST_NETJOB_FAILED")) {
+        QTimer::singleShot(500, &app, [&app] {
+            QTimer::singleShot(4000, &app, [] {
+                SDL_Log("[test-netjob-failed] auto-confirming");
+                ImGuiFullscreen::CloseMessageDialog();
+            });
+            QList<NetJob::FailedRequest> failed;
+            failed.append({ QUrl("https://resources.download.minecraft.net/ab/cdef1234567890"), "SSL handshake failed" });
+            failed.append({ QUrl("https://libraries.minecraft.net/some/library-1.0.jar"), "Connection timed out" });
+            SDL_Log("[test-netjob-failed] calling overrideNetworkJobFailedDialog()");
+            const bool result = NetJob::overrideNetworkJobFailedDialog("Download Assets", 1, failed);
+            SDL_Log("[test-netjob-failed] result=%d", result);
         });
     }
 
@@ -6928,6 +7425,25 @@ int main(int argc, char** argv)
                 } else {
                     SDL_Log("[test-managed-pack] instance not found");
                 }
+            } else if (name == "account_login") {
+                // TEMPORARY: starts a real device-code login flow (real
+                // network call to Microsoft, nothing created/committed
+                // until the player finishes on their phone) purely to
+                // screenshot the redesigned DrawAccountLogin() layout
+                // (centering, rounded QR, overflow-safe sizing).
+                StartLogin();
+                SetScreen(Screen::AccountLogin);
+            } else if (name == "account_login_qr") {
+                // TEMPORARY: bypasses the real network call (this sandbox
+                // has no route to login.microsoftonline.com) and feeds
+                // synthetic data through the exact same code path
+                // StartLogin()'s authorizeWithBrowserWithExtra handler
+                // uses, to screenshot the QR-code branch specifically.
+                ResetLogin();
+                g_loginUrl = "https://www.microsoft.com/link";
+                g_loginCode = "ABCD1234";
+                g_loginQrTexture = GenerateQrTexture(QString("%1?otc=%2").arg(g_loginUrl, g_loginCode));
+                SetScreen(Screen::AccountLogin);
             }
             SDL_Log("[test-screen] jumped to %s", name.c_str());
         });
@@ -6954,6 +7470,17 @@ int main(int argc, char** argv)
     // answer or a background task, and this is the one function that knows
     // how to render a frame.
     std::function<void()> renderFrame = [&]() {
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+        // Steam's own docs require this once per frame whenever the API is
+        // initialized — pumps its callback queue (e.g. FloatingGamepadTextInputDismissed_t,
+        // not currently handled since ShowFloatingGamepadTextInput's own
+        // dismissal doesn't need a response from us — see its registration
+        // above). Safe to call unconditionally when uninitialized too, but
+        // gated anyway to make the "Steam isn't present" case a true no-op.
+        if (g_steamInitialized)
+            SteamAPI_RunCallbacks();
+#endif
+
         // Run before anything ImGui-frame-related: a pending action may
         // itself call PumpFrame() (== this function) in a loop while it
         // blocks on a dialog, so it needs to start from a point with no
@@ -7291,7 +7818,14 @@ int main(int argc, char** argv)
         // it) but confusing to look at.
         const bool dialogOpen = IsChoiceDialogOpen() || IsInputDialogOpen() || IsMessageBoxDialogOpen() || IsFileSelectorOpen();
 
-        if (BigScreenDialogs::BlockingDepth > 0 && !dialogOpen && g_screen != Screen::Console) {
+        if (g_blockedModsDialogActive) {
+            // Highest priority — see DrawBlockedModsDialog()'s own comment.
+            // Overrides even BlockingDepth's own DrawBlockingWait() below,
+            // since this screen has real interactive content of its own
+            // (Open Download Pages / Re-check / Continue / Cancel), unlike
+            // the bare "please wait" placeholder that check exists for.
+            DrawBlockedModsDialog();
+        } else if (BigScreenDialogs::BlockingDepth > 0 && !dialogOpen && g_screen != Screen::Console) {
             // See DrawBlockingWait()'s comment — skip the normal screen (and
             // HandleBackButton(), so B can't do anything unexpected either)
             // while a bare Task-wait pump loop further down the call stack
@@ -7400,6 +7934,11 @@ int main(int argc, char** argv)
     if (pad)
         SDL_GameControllerClose(pad);
     SDL_Quit();
+
+#ifdef BIGSCREEN_HAVE_STEAMWORKS
+    if (g_steamInitialized)
+        SteamAPI_Shutdown();
+#endif
 
     return exitCode;
 }

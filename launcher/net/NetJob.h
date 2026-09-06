@@ -38,6 +38,8 @@
 
 #include <QtNetwork>
 
+#include <functional>
+
 #include <QObject>
 #include "net/Request.h"
 #include "tasks/ConcurrentTask.h"
@@ -63,6 +65,22 @@ class NetJob : public ConcurrentTask {
     auto getFailedActions() -> QList<Net::Request*>;
     auto getFailedFiles() -> QList<QString>;
     void setAskRetry(bool askRetry);
+
+    struct FailedRequest {
+        QUrl url;
+        QString error;
+    };
+    // Set once, globally, by a front-end without QWidgets (e.g. BigScreen)
+    // to replace the native NetworkJobFailedDialog emitFailed() shows
+    // below. Given the job's object name, the current attempt number, and
+    // the (url, error) pairs that failed, returns true to retry or false to
+    // give up — matching the real dialog's Accepted/Rejected outcome.
+    // Unset by default, in which case emitFailed() runs its original
+    // dialog unchanged. Every NetJob in the whole app goes through this one
+    // function, so this one hook covers every download this project makes
+    // (library/asset downloads, mod downloads, skin/cape uploads, ...), not
+    // just a single call site.
+    static std::function<bool(const QString& jobName, int attempt, const QList<FailedRequest>& failed)> overrideNetworkJobFailedDialog;
 
    public slots:
     // Qt can't handle auto at the start for some reason?

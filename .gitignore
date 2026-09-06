@@ -63,3 +63,7 @@ flatbuild
 # Snap
 *.snap
 bigscreen/CLAUDE.md
+
+# Local Steamworks dev/test artifact — a real AppID (or the test AppID 480)
+# picked per-machine/per-testing-session, not project config.
+steam_appid.txt

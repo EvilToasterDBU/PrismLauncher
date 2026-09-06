@@ -349,6 +349,21 @@ namespace ImGuiFullscreen
 		std::string default_value = std::string(), InputFilterType filter_type = InputFilterType::None);
 	void CloseInputDialog();
 
+	// Set once, globally, by a front-end without its own text-input concept
+	// of "focus" (e.g. BigScreen) to learn when DrawInputDialog()'s
+	// InputText field gains/loses focus — BigScreen uses this to ask Steam
+	// to show its own on-screen keyboard (ISteamUtils::
+	// ShowFloatingGamepadTextInput()) when running under Steam Input/Big
+	// Picture, where there's no physical keyboard and no guarantee Steam's
+	// own input-focus heuristics fire for an arbitrary SDL2 app. Unset by
+	// default (both std::function are empty), in which case DrawInputDialog()
+	// behaves exactly as before — this toolkit has no Steam dependency of
+	// its own. OnTextInputActivated receives the field's on-screen rect
+	// (top-left position, size) in screen-space pixels, matching what
+	// ShowFloatingGamepadTextInput() itself expects.
+	extern std::function<void(ImVec2 pos, ImVec2 size)> OnTextInputActivated;
+	extern std::function<void()> OnTextInputDeactivated;
+
 	using ConfirmMessageDialogCallback = std::function<void(bool)>;
 	using InfoMessageDialogCallback = std::function<void()>;
 	using MessageDialogCallback = std::function<void(s32)>;

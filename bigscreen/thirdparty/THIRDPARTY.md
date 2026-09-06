@@ -44,6 +44,27 @@ Provides the controller-button/d-pad glyphs in
 header was cross-checked against PromptFont's own official `glyphs.json`
 manifest (fetched from its Codeberg repo), not guessed.
 
+## Steamworks SDK (`thirdparty/steamworks/`)
+Copyright Valve Corporation. Proprietary — governed by Valve's Steamworks
+SDK Access Agreement (accepted by the user via their own Steamworks partner
+account; not itself redistributed here). Only two subsets are vendored, not
+the rest of the SDK download: the public C++ headers
+(`thirdparty/steamworks/include/steam/*.h`, from `sdk/public/steam/` — the
+whole folder, since these headers are interdependent) and the Linux
+redistributable shared libraries Valve itself names for exactly this
+purpose (`thirdparty/steamworks/lib/{linux64,linuxarm64}/libsteam_api.so`,
+from `sdk/redistributable_bin/`) — the same two pieces any Steam game
+compiles against and ships. SDK version 1.65. Used for one call:
+`ISteamUtils::ShowFloatingGamepadTextInput()`, so Steam can show its own
+on-screen keyboard over an `ImGui::InputText` field when BigScreen is
+running under Steam Input/Big Picture with no physical keyboard available
+— see `bigscreen/CMakeLists.txt`'s `BIGSCREEN_HAVE_STEAMWORKS` block and
+`main.cpp`'s `#ifdef BIGSCREEN_HAVE_STEAMWORKS` sections. Entirely optional
+at build time (skipped cleanly if this directory isn't present) and at
+runtime (`SteamAPI_Init()` failing — no Steam client running, no
+`steam_appid.txt` — is treated as a normal, silent outcome, not an error;
+BigScreen also targets plain ARM handhelds with no Steam at all).
+
 ## stb_image (`thirdparty/stb/stb_image.h`)
 Single header from https://github.com/nothings/stb, public domain / MIT
 (dual-licensed, see the header's own license block).

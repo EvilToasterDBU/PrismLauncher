@@ -167,6 +167,17 @@ jobs:
           mkdir -p "$stage/bin"
           cp "build/$BUILD_TYPE/prismlauncher_bigscreen" "$stage/bin/"
 
+          # Only present once the vendored Steamworks SDK is actually
+          # committed (bigscreen/CMakeLists.txt's BIGSCREEN_HAVE_STEAMWORKS
+          # block is entirely optional — see THIRDPARTY.md) — copied next to
+          # the binary *before* sharun runs below so its own ldd-based
+          # dependency resolution finds and bundles it via the BUILD_RPATH
+          # CMake set at link time, same as any other linked .so.
+          steamworks_lib="bigscreen/thirdparty/steamworks/lib/$( [ "${{ matrix.glibc-arch }}" = "aarch64" ] && echo linuxarm64 || echo linux64 )/libsteam_api.so"
+          if [ -f "$steamworks_lib" ]; then
+            cp "$steamworks_lib" "$stage/bin/"
+          fi
+
           sharun lib4bin \
             --hard-links \
             --with-hooks \

@@ -21,6 +21,8 @@
 #include "HardwareInfo.h"
 #include "ui/dialogs/CustomMessageBox.h"
 
+std::function<bool(const QString&, const QString&)> EnsureAvailableMemory::overrideLowMemoryDialog;
+
 EnsureAvailableMemory::EnsureAvailableMemory(LaunchTask* parent, MinecraftInstance* instance) : LaunchStep(parent), m_instance(instance) {}
 
 void EnsureAvailableMemory::executeTask()
@@ -50,12 +52,16 @@ void EnsureAvailableMemory::executeTask()
     bool shouldAbort = false;
 
     if (m_instance->settings()->get("LowMemWarning").toBool()) {
-        auto* dialog = CustomMessageBox::selectable(nullptr, tr("High memory pressure"), text, QMessageBox::Icon::Warning,
-                                                    QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No,
-                                                    QMessageBox::StandardButton::No);
+        if (overrideLowMemoryDialog) {
+            shouldAbort = !overrideLowMemoryDialog(tr("High memory pressure"), text);
+        } else {
+            auto* dialog = CustomMessageBox::selectable(nullptr, tr("High memory pressure"), text, QMessageBox::Icon::Warning,
+                                                        QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No,
+                                                        QMessageBox::StandardButton::No);
 
-        shouldAbort = dialog->exec() == QMessageBox::No;
-        dialog->deleteLater();
+            shouldAbort = dialog->exec() == QMessageBox::No;
+            dialog->deleteLater();
+        }
     }
 
     const auto message = tr("The system is under high memory pressure");
@@ -83,19 +89,23 @@ void EnsureAvailableMemory::executeTask()
         bool shouldAbort = false;
 
         if (m_instance->settings()->get("LowMemWarning").toBool()) {
-            auto* dialog = CustomMessageBox::selectable(
-                nullptr, tr("Low free memory"),
-                tr("There might not be enough free RAM to launch this instance with the current memory settings.\n\n"
-                   "Maximum allocated: %1 MiB\nFree: %2 MiB (out of %3 MiB total)\n\n"
-                   "Launch anyway? This may cause slowdowns in the game and your system.")
-                    .arg(max)
-                    .arg(available)
-                    .arg(HardwareInfo::totalRamMiB()),
-                QMessageBox::Icon::Warning, QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No,
-                QMessageBox::StandardButton::No);
+            const QString text = tr("There might not be enough free RAM to launch this instance with the current memory settings.\n\n"
+                                     "Maximum allocated: %1 MiB\nFree: %2 MiB (out of %3 MiB total)\n\n"
+                                     "Launch anyway? This may cause slowdowns in the game and your system.")
+                                     .arg(max)
+                                     .arg(available)
+                                     .arg(HardwareInfo::totalRamMiB());
+            if (overrideLowMemoryDialog) {
+                shouldAbort = !overrideLowMemoryDialog(tr("Low free memory"), text);
+            } else {
+                auto* dialog =
+                    CustomMessageBox::selectable(nullptr, tr("Low free memory"), text, QMessageBox::Icon::Warning,
+                                                 QMessageBox::StandardButton::Yes | QMessageBox::StandardButton::No,
+                                                 QMessageBox::StandardButton::No);
 
-            shouldAbort = dialog->exec() == QMessageBox::No;
-            dialog->deleteLater();
+                shouldAbort = dialog->exec() == QMessageBox::No;
+                dialog->deleteLater();
+            }
         }
 
         const auto message = tr("Not enough RAM available to launch this instance");

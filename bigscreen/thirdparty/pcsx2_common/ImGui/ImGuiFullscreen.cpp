@@ -2787,6 +2787,9 @@ void ImGuiFullscreen::DrawChoiceDialog()
 }
 
 
+std::function<void(ImVec2, ImVec2)> ImGuiFullscreen::OnTextInputActivated;
+std::function<void()> ImGuiFullscreen::OnTextInputDeactivated;
+
 bool ImGuiFullscreen::IsInputDialogOpen()
 {
 	return s_input_dialog_open;
@@ -2946,6 +2949,16 @@ void ImGuiFullscreen::DrawInputDialog()
 			needs_char_filter_callback ? input_callback : nullptr,
 			needs_char_filter_callback ? static_cast<void*>(&s_input_dialog_filter_type) : nullptr);
 
+		// IsItemActivated() is only true the exact frame the field gains
+		// focus — checked right here, before anything else (even the Pop*
+		// calls right below, which don't touch "last item" state but this
+		// keeps the invariant obvious) could be mistaken for touching the
+		// InputText's own item state. Paired with OnTextInputDeactivated in
+		// CloseInputDialog() above, not a matching IsItemDeactivated() check
+		// here — see that function's comment for why.
+		if (ImGui::IsItemActivated() && OnTextInputActivated)
+			OnTextInputActivated(ImGui::GetItemRectMin(), ImGui::GetItemRectSize());
+
 		ImGui::PopStyleColor(5);
 		ImGui::PopStyleVar(3);
 
@@ -2988,6 +3001,18 @@ void ImGuiFullscreen::CloseInputDialog()
 {
 	if (!s_input_dialog_open)
 		return;
+
+	// Fired exactly once per dialog here (not scattered across every call
+	// site above — CloseInputDialog() is itself the single funnel all of
+	// them go through, and the s_input_dialog_open guard above already
+	// makes a second call a no-op) rather than relying only on
+	// DrawInputDialog()'s own IsItemDeactivated() check below: a dialog
+	// dismissed without the InputText widget ever rendering again on that
+	// same frame (e.g. B/Cancel closing the whole popup) could otherwise
+	// leave a front-end's "text input is active" state (e.g. BigScreen's
+	// Steam on-screen-keyboard hook) stuck on.
+	if (OnTextInputDeactivated)
+		OnTextInputDeactivated();
 
 	s_input_dialog_open = false;
 	s_input_dialog_title = {};

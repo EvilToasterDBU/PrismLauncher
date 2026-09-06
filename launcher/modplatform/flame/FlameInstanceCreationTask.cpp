@@ -70,6 +70,9 @@
 #include "ui/dialogs/UntrustedModsDialog.h"
 #include "ui/pages/modplatform/OptionalModDialog.h"
 
+std::function<std::optional<QStringList>(const QStringList&)> FlameCreationTask::overrideOptionalModDialog;
+std::function<bool(const QString&, const QString&, QList<BlockedMod>&)> FlameCreationTask::overrideBlockedModsDialog;
+
 bool FlameCreationTask::abort()
 {
     if (!canAbort()) {
@@ -543,13 +546,22 @@ void FlameCreationTask::idResolverSucceeded()
     }
 
     if (!optionalFiles.empty()) {
-        OptionalModDialog optionalModDialog(m_parent, optionalFiles);
-        if (optionalModDialog.exec() == QDialog::Rejected) {
-            emitAborted();
-            return;
-        }
+        if (overrideOptionalModDialog) {
+            auto result = overrideOptionalModDialog(optionalFiles);
+            if (!result) {
+                emitAborted();
+                return;
+            }
+            m_selectedOptionalMods = *result;
+        } else {
+            OptionalModDialog optionalModDialog(m_parent, optionalFiles);
+            if (optionalModDialog.exec() == QDialog::Rejected) {
+                emitAborted();
+                return;
+            }
 
-        m_selectedOptionalMods = optionalModDialog.getResult();
+            m_selectedOptionalMods = optionalModDialog.getResult();
+        }
     }
 
     // first check for blocked mods
@@ -582,14 +594,20 @@ void FlameCreationTask::idResolverSucceeded()
     if (anyBlocked) {
         qWarning() << "Blocked mods found, displaying mod list";
 
-        BlockedModsDialog messageDialog(m_parent, tr("Blocked mods found"),
-                                        tr("The following files are not available for download in third party launchers.<br/>"
-                                           "You will need to manually download them and add them to the instance."),
-                                        blockedMods);
+        const QString title = tr("Blocked mods found");
+        const QString text = tr("The following files are not available for download in third party launchers.<br/>"
+                                 "You will need to manually download them and add them to the instance.");
 
-        messageDialog.setModal(true);
+        bool proceed;
+        if (overrideBlockedModsDialog) {
+            proceed = overrideBlockedModsDialog(title, text, blockedMods);
+        } else {
+            BlockedModsDialog messageDialog(m_parent, title, text, blockedMods);
+            messageDialog.setModal(true);
+            proceed = messageDialog.exec() != 0;
+        }
 
-        if (messageDialog.exec() != 0) {
+        if (proceed) {
             qDebug() << "Post dialog blocked mods list:" << blockedMods;
             copyBlockedMods(blockedMods);
             setupDownloadJob();

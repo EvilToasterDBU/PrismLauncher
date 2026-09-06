@@ -80,6 +80,43 @@ add_executable(prismlauncher_bigscreen
 set_target_properties(prismlauncher_bigscreen PROPERTIES AUTOMOC ON)
 target_link_libraries(prismlauncher_bigscreen PRIVATE bigscreen_imgui bigscreen_fullscreen_toolkit Launcher_logic)
 
+# --- Optional Steamworks integration (ISteamUtils::ShowFloatingGamepadTextInput
+# specifically) — lets Steam show its own on-screen keyboard for our
+# ImGui::InputText fields when running under Steam Input / Big Picture,
+# where there's no physical keyboard. Vendored under thirdparty/steamworks/
+# (public headers + the redistributable_bin shared libraries only — not the
+# rest of the SDK) rather than a system package: there is no distro package
+# for this, Valve only ships it via partner.steamgames.com. Entirely
+# optional: if the vendored SDK isn't present (a fresh checkout without it
+# committed, or before it's added at all), this whole block is skipped and
+# prismlauncher_bigscreen builds exactly as before — see the
+# BIGSCREEN_HAVE_STEAMWORKS guards in main.cpp.
+set(STEAMWORKS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/thirdparty/steamworks)
+if(CMAKE_SYSTEM_PROCESSOR MATCHES "aarch64|arm64")
+    set(STEAMWORKS_LIB_ARCH linuxarm64)
+else()
+    set(STEAMWORKS_LIB_ARCH linux64)
+endif()
+set(STEAMWORKS_LIB ${STEAMWORKS_DIR}/lib/${STEAMWORKS_LIB_ARCH}/libsteam_api.so)
+if(EXISTS ${STEAMWORKS_LIB} AND EXISTS ${STEAMWORKS_DIR}/include/steam/steam_api.h)
+    target_include_directories(prismlauncher_bigscreen PRIVATE ${STEAMWORKS_DIR}/include)
+    target_link_libraries(prismlauncher_bigscreen PRIVATE ${STEAMWORKS_LIB})
+    target_compile_definitions(prismlauncher_bigscreen PRIVATE BIGSCREEN_HAVE_STEAMWORKS)
+    # BUILD_RPATH (not just INSTALL_RPATH): so a plain local
+    # `cmake --build` (no install/packaging step) can already find
+    # libsteam_api.so at its real vendored path — the same "absolute
+    # compile-time path for local dev, relative lookup once actually
+    # packaged" duality BIGSCREEN_RESOURCES_DIR already uses for
+    # resources/. $ORIGIN covers the packaged case, once sharun (CI) or a
+    # manual copy places libsteam_api.so next to the binary itself.
+    set_target_properties(prismlauncher_bigscreen PROPERTIES
+        BUILD_RPATH "${STEAMWORKS_DIR}/lib/${STEAMWORKS_LIB_ARCH}"
+        INSTALL_RPATH "$ORIGIN"
+    )
+else()
+    message(STATUS "BigScreen: Steamworks SDK not found under ${STEAMWORKS_DIR} — building without Steam on-screen-keyboard integration.")
+endif()
+
 # JavaCheck.jar and NewLaunch(Legacy).jar aren't link dependencies (they're
 # found at runtime via Application::getJarPath() — JavaChecker runs
 # JavaCheck.jar as an external `java -jar` subprocess to verify a JRE,
