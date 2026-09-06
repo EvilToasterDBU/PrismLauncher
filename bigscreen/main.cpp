@@ -6688,15 +6688,30 @@ int main(int argc, char** argv)
     // Input") — a physical keyboard is already available in every other
     // Steam context (desktop mode, a non-Big-Picture non-Steam-game
     // shortcut), where popping this up unasked would be actively wrong.
+    // Kept logging (not temporary) on every activation/deactivation — this
+    // path reported not working on three separate real devices (own PC in
+    // Big Picture, a pocknix-based ARM handheld, a friend's real Steam
+    // Deck) with no way to reproduce or attach a debugger here, so a single
+    // real run's log needs to be enough to tell apart every distinct
+    // failure point (Steam not initialized at all / not detected as Big
+    // Picture / the call itself rejected) without another back-and-forth.
     ImGuiFullscreen::OnTextInputActivated = [](ImVec2 pos, ImVec2 size) {
-        if (g_steamInitialized && SteamUtils() && SteamUtils()->IsSteamInBigPictureMode()) {
-            SteamUtils()->ShowFloatingGamepadTextInput(k_EFloatingGamepadTextInputModeModeSingleLine, static_cast<int>(pos.x),
-                                                        static_cast<int>(pos.y), static_cast<int>(size.x), static_cast<int>(size.y));
+        const bool bigPicture = g_steamInitialized && SteamUtils() && SteamUtils()->IsSteamInBigPictureMode();
+        SDL_Log("[steam] text input activated at (%.0f,%.0f) %.0fx%.0f — steamInit=%d SteamUtils=%p bigPicture=%d",
+                static_cast<double>(pos.x), static_cast<double>(pos.y), static_cast<double>(size.x), static_cast<double>(size.y),
+                g_steamInitialized, static_cast<void*>(SteamUtils()), bigPicture);
+        if (bigPicture) {
+            const bool shown = SteamUtils()->ShowFloatingGamepadTextInput(k_EFloatingGamepadTextInputModeModeSingleLine,
+                                                                           static_cast<int>(pos.x), static_cast<int>(pos.y),
+                                                                           static_cast<int>(size.x), static_cast<int>(size.y));
+            SDL_Log("[steam] ShowFloatingGamepadTextInput result=%d", shown);
         }
     };
     ImGuiFullscreen::OnTextInputDeactivated = [] {
-        if (g_steamInitialized && SteamUtils())
-            SteamUtils()->DismissFloatingGamepadTextInput();
+        if (g_steamInitialized && SteamUtils()) {
+            const bool dismissed = SteamUtils()->DismissFloatingGamepadTextInput();
+            SDL_Log("[steam] text input deactivated, DismissFloatingGamepadTextInput result=%d", dismissed);
+        }
     };
 #endif
 

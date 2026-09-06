@@ -102,16 +102,27 @@ if(EXISTS ${STEAMWORKS_LIB} AND EXISTS ${STEAMWORKS_DIR}/include/steam/steam_api
     target_include_directories(prismlauncher_bigscreen PRIVATE ${STEAMWORKS_DIR}/include)
     target_link_libraries(prismlauncher_bigscreen PRIVATE ${STEAMWORKS_LIB})
     target_compile_definitions(prismlauncher_bigscreen PRIVATE BIGSCREEN_HAVE_STEAMWORKS)
-    # BUILD_RPATH (not just INSTALL_RPATH): so a plain local
-    # `cmake --build` (no install/packaging step) can already find
-    # libsteam_api.so at its real vendored path — the same "absolute
+    # Both entries go into BUILD_RPATH, not just the absolute one — INSTALL_RPATH
+    # is a dead property here: BigScreen has no cmake --install step (CI
+    # packages straight out of the build tree — see build-bigscreen.yml's
+    # own "No cmake --install step first" comment), so it's never actually
+    # applied to the shipped binary. Without $ORIGIN also in BUILD_RPATH,
+    # the binary CI packages would carry only the CI runner's own absolute
+    # checkout path baked in (real on the runner at build/package time, so
+    # sharun's own ldd-based bundling step would still succeed there — but
+    # meaningless, and never valid, on the end user's actual machine once
+    # downloaded) — a real, confirmed bug (`readelf -d` on a local build
+    # showed exactly this: RUNPATH pointing at .../PrismLauncher-bigscreen/...,
+    # nothing resolvable once shipped), found while investigating a report
+    # that Steam's on-screen keyboard didn't appear on any of three real
+    # devices. $ORIGIN covers the packaged case (CI copies libsteam_api.so
+    # next to the binary in the same directory before running sharun, so
+    # $ORIGIN resolves there); the absolute path covers a plain local
+    # `cmake --build` with no packaging step at all — same "absolute
     # compile-time path for local dev, relative lookup once actually
-    # packaged" duality BIGSCREEN_RESOURCES_DIR already uses for
-    # resources/. $ORIGIN covers the packaged case, once sharun (CI) or a
-    # manual copy places libsteam_api.so next to the binary itself.
+    # packaged" duality BIGSCREEN_RESOURCES_DIR already uses for resources/.
     set_target_properties(prismlauncher_bigscreen PROPERTIES
-        BUILD_RPATH "${STEAMWORKS_DIR}/lib/${STEAMWORKS_LIB_ARCH}"
-        INSTALL_RPATH "$ORIGIN"
+        BUILD_RPATH "$ORIGIN;${STEAMWORKS_DIR}/lib/${STEAMWORKS_LIB_ARCH}"
     )
 else()
     message(STATUS "BigScreen: Steamworks SDK not found under ${STEAMWORKS_DIR} — building without Steam on-screen-keyboard integration.")
