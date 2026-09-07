@@ -64,6 +64,11 @@ flatbuild
 *.snap
 bigscreen/CLAUDE.md
 
-# Local Steamworks dev/test artifact — a real AppID (or the test AppID 480)
-# picked per-machine/per-testing-session, not project config.
+# Local Steamworks dev/test artifact for a build dir/anywhere else a dev
+# might drop one — a real AppID picked per-machine/per-testing-session, not
+# project config. NOT the tracked bigscreen/packaging/steam_appid.txt below
+# (that one ships in the actual package — a real device turned out to need
+# it even when launched through Steam as a non-Steam game shortcut, not
+# just for a bare local dev run — see bigscreen/CLAUDE.md).
 steam_appid.txt
+!bigscreen/packaging/steam_appid.txt

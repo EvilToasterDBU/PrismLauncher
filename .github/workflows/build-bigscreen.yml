@@ -345,6 +345,22 @@ jobs:
           cp -r bigscreen/resources "$STAGE/bin/"
           cp -r build/jars "$STAGE/bin/"
 
+          # Confirmed necessary on a real device even when launched through
+          # Steam as a non-Steam game shortcut (Big Picture, Steam Input) —
+          # a real log showed SteamAPI_Init() failing with Steam's own
+          # "No appID found. Either launch the game from Steam, or put the
+          # file steam_appid.txt..." even though it *was* launched through
+          # Steam, meaning Steam isn't reliably setting the SteamAppId/
+          # SteamGameId env vars this flat SteamAPI_Init() would otherwise
+          # read for a non-Steam-game entry. 480 is Valve's own official
+          # SDK-development/testing AppID (Spacewar) — the standard,
+          # widely-used choice for a project with no AppID of its own; if
+          # this project ever gets a real registered Steamworks AppID,
+          # replace this file's contents with that instead.
+          if [ -f bigscreen/packaging/steam_appid.txt ]; then
+            cp bigscreen/packaging/steam_appid.txt "$STAGE/bin/"
+          fi
+
           tar -czf "$STAGE.tar.gz" "$STAGE"
 
       - name: Upload artifact

@@ -6446,8 +6446,14 @@ int main(int argc, char** argv)
     // OnTextInputDeactivated registration further down for the actual
     // payoff (Steam's own on-screen keyboard for InputText fields under
     // Steam Input/Big Picture).
-    g_steamInitialized = SteamAPI_Init();
-    SDL_Log(g_steamInitialized ? "[steam] SteamAPI_Init() succeeded" : "[steam] SteamAPI_Init() failed — running without Steam integration");
+    // SteamAPI_InitEx(), not the plain SteamAPI_Init() — a real device log
+    // showed init failing with no further detail (plain Init() collapses
+    // every failure reason to a bare bool); InitEx() gives back Steam's own
+    // real error string (bad AppID, no running client, version mismatch,
+    // ...) so a single log line says exactly which one it is.
+    SteamErrMsg steamErrMsg = {};
+    g_steamInitialized = SteamAPI_InitEx(&steamErrMsg) == k_ESteamAPIInitResult_OK;
+    SDL_Log(g_steamInitialized ? "[steam] SteamAPI_Init() succeeded" : "[steam] SteamAPI_Init() failed: %s", steamErrMsg);
 #endif
 
     // Must be set before SDL_Init() — both are read once when the joystick
