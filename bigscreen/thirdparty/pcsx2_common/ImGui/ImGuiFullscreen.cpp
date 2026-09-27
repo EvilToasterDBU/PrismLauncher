@@ -2357,6 +2357,14 @@ void ImGuiFullscreen::PopulateFileSelectorItems()
 			// Special case for going to root list on Linux.
 			if (parent_path.empty() && s_file_selector_current_directory.size() > 1)
 				parent_path = "/";
+#else
+			// BigScreen note: cutting at the last '\' of "C:\Users" leaves
+			// "C:", which Windows reads as "the current directory on drive
+			// C", not the drive root. Turn it into "C:\" instead — or, when
+			// already *at* a drive root ("C:\"), into "" so the parent entry
+			// leads back to the drive list (GetRootDirectoryList()).
+			if (parent_path.size() == 2 && parent_path[1] == ':')
+				parent_path = (s_file_selector_current_directory.size() <= 3) ? std::string() : parent_path + '\\';
 #endif
 		}
 

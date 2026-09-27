@@ -53,7 +53,8 @@ the rest of the SDK download: the public C++ headers
 whole folder, since these headers are interdependent) and the Linux
 redistributable shared libraries Valve itself names for exactly this
 purpose (`thirdparty/steamworks/lib/{linux64,linuxarm64}/libsteam_api.so`,
-from `sdk/redistributable_bin/`) — the same two pieces any Steam game
+plus `thirdparty/steamworks/lib/win64/steam_api64.{dll,lib}` for the Windows
+build, from `sdk/redistributable_bin/`) — the same two pieces any Steam game
 compiles against and ships. SDK version 1.65. Used for one call:
 `ISteamUtils::ShowFloatingGamepadTextInput()`, so Steam can show its own
 on-screen keyboard over an `ImGui::InputText` field when BigScreen is

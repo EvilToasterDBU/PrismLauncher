@@ -1,7 +1,15 @@
 // SPDX-License-Identifier: GPL-3.0-only
 // Minimal compatibility shim for PCSX2's common/FileSystem.h, covering only
 // the subset the vendored ImGuiFullscreen toolkit calls (file selector
-// widget + binary asset loading). Linux-only, implemented on std::filesystem.
+// widget + binary asset loading), implemented on std::filesystem.
+//
+// Windows note: every path here is a UTF-8 std::string, fed to
+// std::filesystem/std::ifstream as narrow strings — which MSVC interprets in
+// the process's ANSI code page, not UTF-8. That's only correct because
+// prismlauncher_bigscreen's manifest sets <activeCodePage>UTF-8 (see
+// bigscreen/packaging/prismlauncher_bigscreen.manifest); without it, any
+// non-ASCII path (e.g. a Cyrillic Windows user name in the resources path)
+// would silently fail to open.
 #pragma once
 
 #include "Pcsx2Defs.h"
@@ -15,8 +23,15 @@
 #include <string>
 #include <vector>
 
-// Linux-only, so always '/' (PCSX2's real header picks '\\' on Windows).
+// Must match what std::filesystem::path::string() produces (Path::Combine
+// builds paths through it), since the file selector finds the parent
+// directory by rfind()-ing this character — same choice PCSX2's real header
+// makes.
+#ifdef _WIN32
+constexpr char FS_OSPATH_SEPARATOR_CHARACTER = '\\';
+#else
 constexpr char FS_OSPATH_SEPARATOR_CHARACTER = '/';
+#endif
 
 // Only need these to exist for signature compatibility; the vendored code
 // never dereferences them in the paths BigScreen uses (v1 has no cancellable
@@ -52,10 +67,17 @@ namespace FileSystem {
 
 using FindResultsArray = std::vector<FILESYSTEM_FIND_DATA>;
 
+#ifdef _WIN32
+// One entry per mounted drive letter ("C:\", "D:\", ...) — the file
+// selector's top-level list. Defined in FileSystemCompat.cpp so <windows.h>
+// (needed for GetLogicalDrives()) stays out of every TU including this.
+std::vector<std::string> GetRootDirectoryList();
+#else
 inline std::vector<std::string> GetRootDirectoryList()
 {
     return { "/" };
 }
+#endif
 
 inline bool DirectoryExists(const char* path)
 {

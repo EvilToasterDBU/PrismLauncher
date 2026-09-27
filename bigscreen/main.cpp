@@ -23,10 +23,25 @@
 // (immediate-mode UI — no signal subscriptions needed just to redraw).
 // Accounts/settings/mod browsing are still M3+.
 
+// Our own main() is the real entry point on every platform — without this,
+// SDL.h #defines main to SDL_main on Windows and expects SDL2main to supply
+// the real one. On Windows the WinMain → main() hop comes from Qt instead
+// (Qt6::EntryPointPrivate, pulled in through Launcher_logic's Qt link, the
+// same way the desktop launcher's own WIN32 executable gets it).
+#define SDL_MAIN_HANDLED
 #include <SDL.h>
+#ifndef _WIN32
+// Not on Windows: it drags in <windows.h> (and its min/max/DrawText/...
+// macros) — the few GL calls in this file come from GSTexture.h's
+// GLCompat.h there instead.
 #include <SDL_opengl.h>
+#endif
 
 #include <QTimer>
+
+#ifdef _WIN32
+#include "console/WindowsConsole.h"
+#endif
 
 #include "imgui.h"
 #include "imgui_impl_opengl3.h"
@@ -291,6 +306,26 @@ struct BatteryInfo {
 
 std::optional<BatteryInfo> GetBatteryInfo()
 {
+#ifdef _WIN32
+    // No sysfs on Windows — SDL_GetPowerInfo() reads the same data via the
+    // Win32 power API (Windows handhelds like the ROG Ally/Legion Go are a
+    // real target, not just desktops). Linux keeps the sysfs path below,
+    // which was already verified on real hardware.
+    static std::optional<BatteryInfo> cached;
+    static std::chrono::steady_clock::time_point lastRead;
+    const auto now = std::chrono::steady_clock::now();
+    if (lastRead != std::chrono::steady_clock::time_point{} && now - lastRead < std::chrono::seconds(5))
+        return cached;
+    lastRead = now;
+
+    int percent = -1;
+    const SDL_PowerState state = SDL_GetPowerInfo(nullptr, &percent);
+    if (state == SDL_POWERSTATE_NO_BATTERY || state == SDL_POWERSTATE_UNKNOWN || percent < 0)
+        cached.reset();
+    else
+        cached = BatteryInfo{ percent, state == SDL_POWERSTATE_CHARGING || state == SDL_POWERSTATE_CHARGED };
+    return cached;
+#else
     static bool scanned = false;
     static QString batteryDir;
     if (!scanned) {
@@ -335,6 +370,7 @@ std::optional<BatteryInfo> GetBatteryInfo()
 
     cached = BatteryInfo{ std::clamp(percent, 0, 100), charging };
     return cached;
+#endif
 }
 
 // A persistent status bar (app icon + screen title on the left) drawn above
@@ -771,7 +807,14 @@ MinecraftAccountPtr BlockingReauthenticate(const QString& reason)
 // Returns an empty string if neither finds anything runnable.
 QString FindDesktopLauncherBinary()
 {
-    const QString sibling = QDir(QCoreApplication::applicationDirPath()).filePath(BuildConfig.LAUNCHER_APP_BINARY_NAME);
+#ifdef _WIN32
+    // The sibling check needs the real file name; findExecutable() below
+    // already appends PATHEXT (.exe) itself on Windows.
+    const QString siblingName = BuildConfig.LAUNCHER_APP_BINARY_NAME + ".exe";
+#else
+    const QString siblingName = BuildConfig.LAUNCHER_APP_BINARY_NAME;
+#endif
+    const QString sibling = QDir(QCoreApplication::applicationDirPath()).filePath(siblingName);
     if (QFileInfo(sibling).isExecutable())
         return sibling;
 
@@ -6390,6 +6433,15 @@ static InputLayout DetectGamepadLayout(SDL_GameController* pad)
 
 int main(int argc, char** argv)
 {
+#ifdef _WIN32
+    // Same as the desktop launcher's own main(): a WIN32-subsystem exe has
+    // no console, so this attaches to the parent terminal's one only when
+    // launched from a terminal (logs visible there), and does nothing when
+    // launched from Steam/Explorer (no stray console window stealing focus
+    // from the fullscreen SDL window).
+    console::WindowsConsoleGuard consoleGuard;
+#endif
+
     // EmuFolders::Resources defaults to BIGSCREEN_RESOURCES_DIR — an
     // absolute path baked in at compile time, into *this machine's* source
     // tree (bigscreen/CMakeLists.txt sets it to
@@ -6401,16 +6453,29 @@ int main(int argc, char** argv)
     // "resources" directory exists next to the actual running executable,
     // prefer that instead — CI packaging copies bigscreen/resources/
     // there. No QCoreApplication exists yet this early to ask for
-    // applicationDirPath(), so this reads /proc/self/exe directly — fine
-    // for v1's Linux-only scope.
+    // applicationDirPath(), so this reads /proc/self/exe directly on Linux
+    // (deliberately kept as-is rather than switched to SDL_GetBasePath():
+    // the sharun --hard-links packaging was specifically verified against
+    // /proc/self/exe — see build-bigscreen.yml) and SDL_GetBasePath() on
+    // Windows, which is safe to call before SDL_Init() and returns a UTF-8
+    // path with a trailing separator.
     {
         std::error_code ec;
+#ifdef _WIN32
+        if (char* base = SDL_GetBasePath()) {
+            const std::string candidate = std::string(base) + "resources";
+            SDL_free(base);
+            if (std::filesystem::is_directory(candidate, ec) && !ec)
+                EmuFolders::Resources = candidate;
+        }
+#else
         const std::filesystem::path exePath = std::filesystem::read_symlink("/proc/self/exe", ec);
         if (!ec) {
             const std::filesystem::path candidate = exePath.parent_path() / "resources";
             if (std::filesystem::is_directory(candidate, ec) && !ec)
                 EmuFolders::Resources = candidate.string();
         }
+#endif
     }
 
     // Launcher_logic compiles these Qt resources in (qrc_*.cpp), but a
@@ -6479,6 +6544,19 @@ int main(int argc, char** argv)
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI, "1");
     SDL_SetHint(SDL_HINT_JOYSTICK_HIDAPI_STEAMDECK, "1");
 
+#ifdef _WIN32
+    // Per-monitor DPI awareness, set before SDL creates its window — a window
+    // created DPI-unaware stays that way, and Windows then bitmap-stretches it
+    // (blurry text) on any display scaled above 100%, which is the default on
+    // most laptops and Windows handhelds. The UI already scales itself to the
+    // real window size (UpdateLayoutScale()), so physical-pixel coordinates
+    // are exactly what it wants. Qt later tries to set the same process-wide
+    // awareness itself and finds it already set — harmless.
+    SDL_SetHint(SDL_HINT_WINDOWS_DPI_AWARENESS, "permonitorv2");
+#endif
+    // Required once SDL_MAIN_HANDLED is set (see the #include at the top of
+    // this file); a no-op on platforms where SDL never needed SDL_main.
+    SDL_SetMainReady();
     if (SDL_Init(SDL_INIT_VIDEO | SDL_INIT_GAMECONTROLLER | SDL_INIT_TIMER) != 0) {
         SDL_Log("SDL_Init failed: %s", SDL_GetError());
         return 1;
@@ -6525,11 +6603,26 @@ int main(int argc, char** argv)
     // which Dear ImGui's OpenGL3 backend can't do anyway (IMGUI_IMPL_OPENGL_ES3
     // selects its GL function loader and GLSL dialect at *compile* time,
     // see CMakeLists.txt) — is the simpler, more portable single code path.
+    //
+    // Windows is the exception: desktop GL is universally available there
+    // (every GPU driver ships it; GLES contexts via WGL are driver-dependent),
+    // and none of the ARM/EGL constraint above applies. 3.3 core specifically
+    // so the sampler objects GLCompat.h loads are guaranteed to exist. Must
+    // agree with CMakeLists.txt, which only defines IMGUI_IMPL_OPENGL_ES3 on
+    // non-Windows builds.
+#ifdef _WIN32
+    const char* glsl_version = "#version 330 core";
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_CORE);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
+    SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 3);
+#else
     const char* glsl_version = "#version 300 es";
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_FLAGS, 0);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_PROFILE_MASK, SDL_GL_CONTEXT_PROFILE_ES);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MAJOR_VERSION, 3);
     SDL_GL_SetAttribute(SDL_GL_CONTEXT_MINOR_VERSION, 0);
+#endif
     SDL_GL_SetAttribute(SDL_GL_DOUBLEBUFFER, 1);
     SDL_GL_SetAttribute(SDL_GL_DEPTH_SIZE, 24);
     SDL_GL_SetAttribute(SDL_GL_STENCIL_SIZE, 8);
@@ -6543,8 +6636,14 @@ int main(int argc, char** argv)
     }
 
     SDL_GLContext gl_context = SDL_GL_CreateContext(window);
+    if (!gl_context) {
+        SDL_Log("SDL_GL_CreateContext failed: %s", SDL_GetError());
+        return 1;
+    }
     SDL_GL_MakeCurrent(window, gl_context);
     SDL_GL_SetSwapInterval(1);  // vsync
+    if (!BigScreenGL::LoadExtensions(SDL_GL_GetProcAddress))
+        SDL_Log("[gl] sampler objects unavailable — nearest-neighbor skin/cape previews fall back to per-texture filtering");
 
     IMGUI_CHECKVERSION();
     ImGui::CreateContext();

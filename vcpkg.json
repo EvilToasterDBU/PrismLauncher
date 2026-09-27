@@ -28,5 +28,20 @@
     },
     "tomlplusplus",
     "zlib"
-  ]
+  ],
+  "features": {
+    "bigscreen": {
+      "description": "SDL2 + fmt for the BigScreen front-end (bigscreen/). Windows only: Linux builds use the system packages via pkg-config instead. Enabled with -DVCPKG_MANIFEST_FEATURES=bigscreen, so the regular desktop build never pays for them.",
+      "dependencies": [
+        {
+          "name": "sdl2",
+          "platform": "windows"
+        },
+        {
+          "name": "fmt",
+          "platform": "windows"
+        }
+      ]
+    }
+  }
 }

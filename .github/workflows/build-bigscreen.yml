@@ -31,16 +31,10 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Mandatory for now, per the BigScreen plan's v1 scope (Linux/
-          # SteamOS only) — Windows/macOS need their own SDL2/OpenGL
-          # backend wiring that hasn't been done, and
-          # bigscreen/CMakeLists.txt's pkg-config-based SDL2/fmt/OpenGL
-          # lookup assumes a Linux-like environment. Add matrix entries for
-          # those (mirroring build.yml's os/cmake-preset/qt-version) once
-          # that groundwork exists — the rest of this job (setup, configure
-          # with -DLauncher_BUILD_BIGSCREEN=ON, package) is written to be
-          # platform-agnostic already, only the dependency-install step
-          # below is Linux-specific.
+          # Linux x86_64/aarch64 (the primary SteamOS/handheld targets) and
+          # Windows x64. macOS isn't wired up: bigscreen/CMakeLists.txt only
+          # knows pkg-config (Linux) and vcpkg CONFIG packages (Windows) for
+          # SDL2/fmt, and nothing has been tested there.
           - os: ubuntu-24.04
             artifact-name: Linux
             cmake-preset: linux
@@ -53,7 +47,25 @@ jobs:
             qt-version: 6.10.2
             glibc-arch: aarch64
 
+          # Same toolchain/Qt as build.yml's own Windows-MSVC desktop job
+          # (setup-dependencies handles the VS dev shell, vcpkg triplet and
+          # Qt install for it). x64 only for now: the Steamworks SDK has no
+          # win-arm64 build, and no ARM64 Windows target has been asked for.
+          - os: windows-2022
+            artifact-name: Windows-MSVC
+            cmake-preset: windows_msvc
+            vcvars-arch: amd64
+            qt-version: 6.10.2
+
     runs-on: ${{ matrix.os }}
+
+    # bash on Windows too (Git Bash on the runner), same as build.yml — so
+    # the configure/build steps below stay one shared script. The VS dev
+    # shell environment from setup-dependencies is exported via GITHUB_ENV
+    # and visible here as well.
+    defaults:
+      run:
+        shell: bash
 
     env:
       ARTIFACT_NAME: PrismLauncherBigScreen-${{ matrix.artifact-name }}-Qt6
@@ -81,6 +93,7 @@ jobs:
         with:
           build-type: ${{ env.BUILD_TYPE }}
           artifact-name: ${{ matrix.artifact-name }}
+          vcvars-arch: ${{ matrix.vcvars-arch }}
           qt-version: ${{ matrix.qt-version }}
 
       # Not part of the desktop build's own dependency set — only
@@ -92,7 +105,10 @@ jobs:
       # .pkg.tar.zst, ALARM's are .pkg.tar.xz) — both are near-universally
       # preinstalled on Ubuntu already, but not guaranteed, so listed
       # explicitly rather than assumed.
+      # Linux only — the Windows job gets SDL2/fmt through vcpkg instead
+      # (the "bigscreen" manifest feature, enabled at configure time below).
       - name: Install BigScreen-specific dependencies
+        if: ${{ runner.os == 'Linux' }}
         run: |
           sudo apt-get -y update
           sudo apt-get -y install libsdl2-dev libfmt-dev libgl1-mesa-dev zstd xz-utils
@@ -103,8 +119,12 @@ jobs:
 
       - name: Configure project
         run: |
+          # VCPKG_MANIFEST_FEATURES=bigscreen: SDL2 + fmt from vcpkg. Its
+          # dependencies are platform-gated to Windows in vcpkg.json, so on
+          # Linux (system packages via pkg-config) this adds nothing.
           cmake --preset "$CMAKE_PRESET" \
             -D VCPKG_HOST_TRIPLET="$VCPKG_TRIPLET" -D VCPKG_TARGET_TRIPLET="$VCPKG_TRIPLET" \
+            -D VCPKG_MANIFEST_FEATURES=bigscreen \
             -D Launcher_BUILD_BIGSCREEN=ON
 
       - name: Run build
@@ -121,6 +141,7 @@ jobs:
       # printing, no SQL, no in-app help/designer/qml tooling), so there's
       # no reason to bundle them into the portable package.
       - name: Cleanup Qt installation on Linux
+        if: ${{ runner.os == 'Linux' }}
         run: |
           rm -rf "$QT_PLUGIN_PATH"/printsupport
           rm -rf "$QT_PLUGIN_PATH"/sqldrivers
@@ -161,6 +182,7 @@ jobs:
       # the extra runtime-loaded files some of these libraries need beyond
       # plain link-time dependencies (Qt plugin manifests etc.).
       - name: Package
+        if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
           stage="PrismLauncherBigScreen-${{ matrix.artifact-name }}"
@@ -288,6 +310,7 @@ jobs:
       # here. tar auto-detects the archive's compression (zstd for Arch
       # proper, xz for ALARM) from its content, no extra flag needed.
       - name: Refresh glibc from Arch (${{ matrix.glibc-arch }})
+        if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
           if [ "${{ matrix.glibc-arch }}" = "x86_64" ]; then
@@ -340,6 +363,7 @@ jobs:
       # guaranteed to exist and be complete: prismlauncher_bigscreen's own
       # CMake target depends on all three (bigscreen/CMakeLists.txt).
       - name: Finalize package
+        if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
           cp -r bigscreen/resources "$STAGE/bin/"
@@ -364,6 +388,7 @@ jobs:
           tar -czf "$STAGE.tar.gz" "$STAGE"
 
       - name: Upload artifact
+        if: ${{ runner.os == 'Linux' }}
         uses: actions/upload-artifact@v4
         with:
           name: PrismLauncherBigScreen-${{ matrix.artifact-name }}-Qt6
@@ -386,6 +411,7 @@ jobs:
       # image's entry point (same convention .github/actions/package/linux
       # already uses for the desktop build's own AppImage).
       - name: Package AppImage
+        if: ${{ runner.os == 'Linux' }}
         run: |
           set -euo pipefail
           mkdir -p "$STAGE/share/applications" "$STAGE/share/icons/hicolor/256x256/apps" "$STAGE/share/metainfo"
@@ -402,8 +428,62 @@ jobs:
           echo "APPIMAGE_DEST=$appimage_dest" >> "$GITHUB_ENV"
 
       - name: Upload AppImage
+        if: ${{ runner.os == 'Linux' }}
         uses: actions/upload-artifact@v4
         with:
           name: PrismLauncherBigScreen-${{ matrix.artifact-name }}-AppImage
           path: ${{ env.APPIMAGE_DEST }}
+          if-no-files-found: error
+
+      # Windows: a portable folder — the exe plus everything it needs sitting
+      # next to it. BigScreen has no install() rules (same reason the Linux
+      # sharun step above assembles bin/ by hand), so:
+      #  - windeployqt: Qt DLLs + plugins (platforms/qwindows, tls/schannel
+      #    for every HTTPS request, imageformats incl. webp for modpack icons).
+      #    Same trimming flags as the desktop build's own Qt deploy
+      #    (launcher/CMakeLists.txt, QT_DEPLOY_TOOL_OPTIONS).
+      #  - MSVC runtime DLLs copied app-local from the VS dev shell that
+      #    setup-dependencies entered (VCToolsRedistDir), so it starts on a
+      #    machine without the VC++ redistributable installed.
+      #  - SDL2/fmt/libarchive/zlib/...: nothing to copy — this repo's
+      #    Windows vcpkg triplet links them statically into the exe.
+      #  - steam_api64.dll: already next to the exe (CMake post-build copy),
+      #    plus the same steam_appid.txt the Linux package ships.
+      - name: Package (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = 'Stop'
+          $stage = "PrismLauncherBigScreen-${{ matrix.artifact-name }}"
+          New-Item -ItemType Directory -Force -Path $stage | Out-Null
+          $bin = "build/$env:BUILD_TYPE"
+
+          Copy-Item "$bin/prismlauncher_bigscreen.exe" $stage
+          if (Test-Path "$bin/steam_api64.dll") { Copy-Item "$bin/steam_api64.dll" $stage }
+
+          $windeployqt = Get-Command windeployqt -ErrorAction SilentlyContinue
+          $windeployqt = if ($windeployqt) { $windeployqt.Source } else { Join-Path $env:QT_ROOT_DIR "bin/windeployqt.exe" }
+          $mode = if ($env:BUILD_TYPE -eq 'Debug') { '--debug' } else { '--release' }
+          & $windeployqt $mode --no-opengl-sw --no-quick-import --no-system-d3d-compiler --no-system-dxc-compiler `
+            --skip-plugin-types generic,networkinformation "$stage/prismlauncher_bigscreen.exe"
+          if ($LASTEXITCODE -ne 0) { throw "windeployqt failed with exit code $LASTEXITCODE" }
+
+          $crt = Get-ChildItem (Join-Path $env:VCToolsRedistDir "x64") -Directory -Filter "Microsoft.VC*.CRT" | Select-Object -First 1
+          if (-not $crt) { throw "MSVC CRT redist directory not found under $env:VCToolsRedistDir" }
+          Copy-Item (Join-Path $crt.FullName "*.dll") $stage
+
+          Copy-Item -Recurse bigscreen/resources (Join-Path $stage "resources")
+          Copy-Item -Recurse build/jars (Join-Path $stage "jars")
+          if (Test-Path bigscreen/packaging/steam_appid.txt) { Copy-Item bigscreen/packaging/steam_appid.txt $stage }
+
+          "WINDOWS_STAGE=$stage" | Out-File -Append -Encoding utf8 -FilePath $env:GITHUB_ENV
+
+      # Uploaded as the folder itself (not a pre-made .zip) — GitHub zips
+      # artifacts on download anyway, so this avoids a zip-inside-a-zip.
+      - name: Upload artifact (Windows)
+        if: ${{ runner.os == 'Windows' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: PrismLauncherBigScreen-${{ matrix.artifact-name }}
+          path: ${{ env.WINDOWS_STAGE }}/
           if-no-files-found: error

@@ -1,0 +1,28 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<!--
+  Merged into prismlauncher_bigscreen.exe's embedded manifest by the MSVC
+  toolchain (bigscreen/CMakeLists.txt). No trustInfo/requestedExecutionLevel
+  here on purpose: the linker already emits asInvoker, and a second
+  (conflicting) one is what breaks manifest merging.
+
+  activeCodePage=UTF-8 is the reason this file exists: BigScreen's own code
+  (the vendored PCSX2 toolkit's compat layer) passes UTF-8 std::strings to
+  std::filesystem/std::ifstream as narrow strings, which MSVC interprets in
+  the ANSI code page — so without this, any non-ASCII path (a Cyrillic user
+  name in the resources path, say) silently fails to open. Windows 10 1903+,
+  which Qt 6 requires anyway.
+-->
+<assembly xmlns="urn:schemas-microsoft-com:asm.v1" manifestVersion="1.0">
+  <application xmlns="urn:schemas-microsoft-com:asm.v3">
+    <windowsSettings>
+      <activeCodePage xmlns="http://schemas.microsoft.com/SMI/2019/WindowsSettings">UTF-8</activeCodePage>
+      <longPathAware xmlns="http://schemas.microsoft.com/SMI/2016/WindowsSettings">true</longPathAware>
+    </windowsSettings>
+  </application>
+  <compatibility xmlns="urn:schemas-microsoft-com:compatibility.v1">
+    <application>
+      <!-- Windows 10/11 -->
+      <supportedOS Id="{8e0f7a12-bfb3-4fe8-b9a5-48fd50a15a9a}"/>
+    </application>
+  </compatibility>
+</assembly>
